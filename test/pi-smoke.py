@@ -142,7 +142,8 @@ def main():
         (base / 'node_modules').symlink_to(ROOT / 'node_modules', target_is_directory=True)
 
         def git(*args):
-            return subprocess.check_output(['git', '-C', str(local), *args], text=True).strip()
+            return subprocess.check_output(['git', '-C', str(local), *args], text=True,
+                                           env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'}).strip()
 
         git('init', '-q', '-b', 'main')
         git('config', 'user.name', 'Smoke Test')
@@ -285,6 +286,34 @@ def main():
             assert not second_path.exists()
             assert not (local / 'discard.txt').exists()
             print('real Pi: discarded an unpreviewed task with safe cleanup', flush=True)
+
+        local = base / 'empty-local'
+        local.mkdir()
+        git('init', '-q', '-b', 'main')
+        git('config', 'user.name', 'Smoke Test')
+        git('config', 'user.email', 'smoke@example.invalid')
+        git('commit', '--allow-empty', '-m', 'empty base')
+        head = git('rev-parse', 'HEAD')
+        index = local / '.git/index'
+        index.unlink(missing_ok=True)  # Some Git versions materialize an empty index.
+        (local / 'private.txt').write_text('untracked Local content\n')
+        with Pi(local, agent, provider) as pi:
+            pi.click('[ ] 新建 Worktree')
+            pi.until('[x] 新建 Worktree')
+            pi.send(kickoff.encode() + b'\r')
+            pi.until('Worktree ready.', 40)
+            pi.click('[ 预览到 Local ]')
+            pi.click('[ 执行预览到 Local ]')
+            pi.until('Worktree · 已预览')
+            assert not index.exists()
+            pi.click('[ 确认提交 ]')
+            pi.click('[ 执行确认提交 ]')
+            pi.until('Local · 已交付')
+            assert index.is_file()
+            assert git('rev-parse', 'HEAD^') == head
+            assert git('show', '--format=', '--name-only') == 'task.txt'
+            assert git('status', '--porcelain') == '?? private.txt'
+            print('real Pi: empty initial commit and absent index finalize successfully', flush=True)
 
 
 if __name__ == '__main__':

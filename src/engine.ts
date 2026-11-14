@@ -233,7 +233,7 @@ export interface SessionCheckoutApplyEngine {
     receipt: PreviewReceipt
     commitMessage: string
     /** Commit object 已创建但 branch ref 尚未更新时持久化恢复信息。 */
-    beforeCommit?(commitOid: string, indexBefore: Buffer, indexAfter: Buffer): Promise<void>
+    beforeCommit?(commitOid: string, indexBefore: Buffer | null, indexAfter: Buffer): Promise<void>
   }): Promise<FinishResult>
 }
 
@@ -1088,6 +1088,25 @@ async function resolveIndexPath(checkoutPath: string): Promise<string> {
   )))
 }
 
+// Git can represent the empty index by not having an index file at all.
+// Do not confuse absence with zero bytes or a dangling symlink.
+async function readIndexBytes(path: string): Promise<Buffer | null> {
+  let handle: Awaited<ReturnType<typeof open>>
+  try { handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK) }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    throw error
+  }
+  try {
+    if (!(await handle.stat()).isFile()) throw new Error('Local 的 Git 索引不是普通文件。')
+    return await handle.readFile()
+  } finally { await handle.close() }
+}
+
+function sameIndexBytes(a: Buffer | null, b: Buffer | null): boolean {
+  return a === null || b === null ? a === b : a.equals(b)
+}
+
 async function syncPath(path: string) {
   const handle = await open(path, 'r')
   try { await handle.sync() } finally { await handle.close() }
@@ -1627,7 +1646,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
     localPath: string
     receipt: PreviewReceipt
     commitMessage: string
-    beforeCommit?(commitOid: string, indexBefore: Buffer, indexAfter: Buffer): Promise<void>
+    beforeCommit?(commitOid: string, indexBefore: Buffer | null, indexAfter: Buffer): Promise<void>
   }): Promise<FinishResult> {
     const commitMessage = input.commitMessage.trim()
     if (!isValidCommitMessage(commitMessage)) {
@@ -1654,7 +1673,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         return { status: 'error', error: { code: 'stale_local', message: 'Local 自预览后已变化；停止提交，保留现场。' } }
       }
       const realIndexPath = await resolveIndexPath(localGitRoot)
-      const originalIndexBytes = await readFile(realIndexPath)
+      const originalIndexBytes = await readIndexBytes(realIndexPath)
       const assessment = await prepareFinalizeAssessment(
         tempRoot,
         sourceObjects,
@@ -1746,10 +1765,12 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       if (!branchRef?.startsWith('refs/heads/')) {
         return { status: 'error', error: { code: 'operation_not_allowed', message: hostMessage('localIsNotOnANormalBranchATask') } }
       }
-      backupIndex = `${realIndexPath}.pi-wtp-backup-${randomUUID()}`
-      const backup = await open(backupIndex, 'wx', 0o600)
-      try { await backup.writeFile(originalIndexBytes); await backup.sync() } finally { await backup.close() }
-      await syncPath(dirname(realIndexPath))
+      if (originalIndexBytes !== null) {
+        backupIndex = `${realIndexPath}.pi-wtp-backup-${randomUUID()}`
+        const backup = await open(backupIndex, 'wx', 0o600)
+        try { await backup.writeFile(originalIndexBytes); await backup.sync() } finally { await backup.close() }
+        await syncPath(dirname(realIndexPath))
+      }
       await this.options.beforeFinalLocalValidation?.()
       try {
         // Use Git's canonical index.lock protocol. While this lock exists, concurrent git add/reset
@@ -1767,12 +1788,12 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         objectDirectory,
         sourceObjects,
       )
-      const finalIndexBytes = await readFile(realIndexPath)
+      const finalIndexBytes = await readIndexBytes(realIndexPath)
       if (
         finalLocal.headOid !== current.headOid
         || finalLocal.headRef !== current.headRef
         || finalLocal.fingerprint !== current.fingerprint
-        || !finalIndexBytes.equals(originalIndexBytes)
+        || !sameIndexBytes(finalIndexBytes, originalIndexBytes)
       ) {
         return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedBeforeThePreviewCommitWasWrittenRetry') } }
       }
@@ -1800,14 +1821,14 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
             null,
             null,
           )
-          const committedIndexBytes = await readFile(realIndexPath)
+          const committedIndexBytes = await readIndexBytes(realIndexPath)
           if (
             committed.headOid === commitOid
             && committed.headRef === branchRef
             && committed.indexTreeOid === assessment.finalIndexTreeOid
             && committed.treeOid === assessment.expectedWorkingTreeOid
             && committed.fingerprint === expectedFingerprint
-            && committedIndexBytes.equals(intendedIndexBytes)
+            && sameIndexBytes(committedIndexBytes, intendedIndexBytes)
           ) {
             await removeBestEffort(backupIndex)
             backupIndex = null
@@ -1831,25 +1852,31 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         try {
           await runGit(localGitRoot, ['update-ref', branchRef, current.headOid, commitOid])
           refUpdated = false
-          await removeBestEffort(ownedIndexLock)
+          await unlink(ownedIndexLock)
           ownedIndexLock = null
         } catch (error) {
           rollbackErrors.push(`ref: ${this.errorMessage(error)}`)
         }
-      } else if (refUpdated && indexReplaced && backupIndex) {
-        // Never restore the old backup over an index that changed after our write.
+      } else if (refUpdated && indexReplaced && (backupIndex || originalIndexBytes === null)) {
+        // Never restore over an index that changed after our write. If the
+        // old index was absent, hold its lock while removing our new index.
         try {
-          const backupBytes = await readFile(backupIndex)
-          ownedIndexLock = await writeIndexLock(realIndexPath, backupBytes)
-          const currentIndexBytes = await readFile(realIndexPath)
-          if (!currentIndexBytes.equals(intendedIndexBytes)) {
+          const restoreBytes = backupIndex ? await readFile(backupIndex) : null
+          ownedIndexLock = await writeIndexLock(realIndexPath, restoreBytes ?? Buffer.alloc(0))
+          const currentIndexBytes = await readIndexBytes(realIndexPath)
+          if (!sameIndexBytes(currentIndexBytes, intendedIndexBytes)) {
             rollbackErrors.push(hostMessage('indexLocalIndexChangedAfterPreviewWroteItsChanges'))
           } else {
             await runGit(localGitRoot, ['update-ref', branchRef, current.headOid, commitOid])
             refUpdated = false
-            await rename(ownedIndexLock, realIndexPath)
-            ownedIndexLock = null
+            if (restoreBytes === null) {
+              await unlink(realIndexPath)
+            } else {
+              await rename(ownedIndexLock, realIndexPath)
+              ownedIndexLock = null
+            }
             indexReplaced = false
+            await syncPath(dirname(realIndexPath))
           }
         } catch (error) {
           rollbackErrors.push(`compensation: ${this.errorMessage(error)}`)
@@ -1867,14 +1894,19 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
             null,
             null,
           )
-          const restoredIndexBytes = await readFile(realIndexPath)
+          const restoredIndexBytes = await readIndexBytes(realIndexPath)
           restored = restoredLocal.headOid === current.headOid
             && restoredLocal.headRef === current.headRef
             && restoredLocal.indexTreeOid === current.indexTreeOid
             && restoredLocal.treeOid === current.treeOid
             && restoredLocal.fingerprint === current.fingerprint
-            && restoredIndexBytes.equals(originalIndexBytes)
+            && sameIndexBytes(restoredIndexBytes, originalIndexBytes)
+          if (ownedIndexLock) {
+            await unlink(ownedIndexLock)
+            ownedIndexLock = null
+          }
         } catch (error) {
+          restored = false
           rollbackErrors.push(`verification: ${this.errorMessage(error)}`)
         }
       }

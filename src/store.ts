@@ -19,7 +19,8 @@ export interface Task {
   isolatedSession?: SessionLink
   review?: Review
   receipt?: PreviewReceipt
-  journal?: { operation: 'preview' | 'rollback' | 'finalize' | 'cleanup'; at: number; commitOid?: string; indexBefore?: string; indexAfter?: string }
+  // A null indexBefore explicitly records that no index file existed.
+  journal?: { operation: 'preview' | 'rollback' | 'finalize' | 'cleanup'; at: number; commitOid?: string; indexBefore?: string | null; indexAfter?: string }
   cleanup?: { status: 'done' | 'retained'; reason?: string }
   commitOid?: string | null
 }
@@ -247,9 +248,9 @@ export class TaskStore {
           const done = await engine.finalize({ localPath: task.local.root, receipt: task.receipt, commitMessage: task.review.message, beforeCommit: async (commitOid, before, after) => {
             await this.validateLocal(task)
             const prefix = join(this.directory, `${task.id}-${task.receipt!.previewId}`)
-            const indexBefore = `${prefix}.index-before`
+            const indexBefore = before === null ? null : `${prefix}.index-before`
             const indexAfter = `${prefix}.index-after`
-            await saveArtifact(indexBefore, before)
+            if (before !== null && indexBefore !== null) await saveArtifact(indexBefore, before)
             await saveArtifact(indexAfter, after)
             task.journal = { operation: 'finalize', at: Date.now(), commitOid, indexBefore, indexAfter }
             await save()

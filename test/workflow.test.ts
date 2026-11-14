@@ -10,7 +10,7 @@ const git = async (cwd: string, ...args: string[]) => (await runGit(cwd, args)).
 const content = async (cwd: string, file: string) => readFile(join(cwd, file), 'utf8')
 const exists = (path: string) => stat(path).then(() => true, () => false)
 
-async function fixture(t: TestContext, engine?: typeof createSessionCheckoutApplyEngine) {
+async function fixture(t: TestContext, engine?: typeof createSessionCheckoutApplyEngine, empty = false) {
   const dir = await realpath(await mkdtemp(join(tmpdir(), 'pi-wtp-test-')))
   t.after(() => rm(dir, { recursive: true, force: true }))
   const local = join(dir, 'Local with spaces')
@@ -18,10 +18,15 @@ async function fixture(t: TestContext, engine?: typeof createSessionCheckoutAppl
   await git(local, 'init', '-b', 'main')
   await git(local, 'config', 'user.name', 'Test')
   await git(local, 'config', 'user.email', 'test@localhost')
-  for (const file of ['task.txt', 'staged.txt', 'unstaged.txt']) await writeFile(join(local, file), `${file} base\n`)
-  await writeFile(join(local, '.gitignore'), 'cache/\n')
-  await git(local, 'add', '.')
-  await git(local, 'commit', '-m', 'base')
+  if (!empty) {
+    for (const file of ['task.txt', 'staged.txt', 'unstaged.txt']) await writeFile(join(local, file), `${file} base\n`)
+    await writeFile(join(local, '.gitignore'), 'cache/\n')
+    await git(local, 'add', '.')
+  }
+  await git(local, 'commit', '--allow-empty', '-m', 'base')
+  // Git versions that materialize an empty index on commit need this to
+  // reproduce repositories where no index file was ever written.
+  if (empty) await rm(join(local, '.git/index'), { force: true })
   const base = await git(local, 'rev-parse', 'HEAD')
   const store = new TaskStore(join(dir, 'state'), engine)
   const task = await store.create(await checkout(local), { cwd: local, id: 'local', file: join(dir, 'local.jsonl') },
@@ -266,6 +271,64 @@ test('finalize journals both index images before the ref/index CAS and retains t
   assert.equal(await content(f.local, 'staged.txt'), 'concurrent user edit\n')
   assert.match(await git(f.local, 'diff', '--cached'), /concurrent user edit/)
   assert.equal(await exists(f.isolated), true)
+})
+
+test('finalize from an empty commit without an index commits only the task', async t => {
+  const f = await fixture(t, undefined, true)
+  const index = join(f.task.local.gitDir, 'index')
+  await writeFile(join(f.isolated, 'README.md'), 'new readme\n')
+  await writeFile(join(f.local, 'private.txt'), 'Local only\n')
+  await f.ready()
+  await f.act('preview', await f.latest())
+  assert.equal(await exists(index), false)
+  const delivered = await f.act('finalize', await f.latest())
+  assert.equal(delivered.phase, 'delivered')
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD^'), f.base)
+  assert.equal(await git(f.local, 'show', '--format=', '--name-only'), 'README.md\n')
+  assert.equal(await git(f.local, 'status', '--porcelain'), '?? private.txt\n')
+  assert.equal(await exists(index), true)
+})
+
+test('finalize compensates to an absent index after a post-write error', async t => {
+  let fail = false
+  const f = await fixture(t, () => createSessionCheckoutApplyEngine({ afterLocalWriteBeforeVerification: async () => {
+    if (!fail) return
+    const journal = (await f.latest()).journal
+    assert.equal(journal?.operation, 'finalize')
+    assert.equal(journal?.indexBefore, null)
+    assert.ok(journal?.indexAfter && await exists(journal.indexAfter))
+    assert.equal(await exists(join(f.task.local.gitDir, 'index')), true)
+    throw new Error('simulated post-write failure')
+  } }), true)
+  await writeFile(join(f.isolated, 'README.md'), 'previewed readme\n')
+  await f.ready()
+  await f.act('preview', await f.latest())
+  fail = true
+  await assert.rejects(f.act('finalize', await f.latest()), /simulated post-write failure/)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+  assert.equal(await content(f.local, 'README.md'), 'previewed readme\n')
+  assert.equal(await exists(join(f.task.local.gitDir, 'index')), false)
+  assert.equal(await exists(join(f.task.local.gitDir, 'index.lock')), false)
+})
+
+test('finalize detects an index created after journaling even when it is logically empty', async t => {
+  let createIndex = false
+  const f = await fixture(t, () => createSessionCheckoutApplyEngine({ beforeFinalLocalValidation: async () => {
+    if (!createIndex) return
+    assert.equal((await f.latest()).journal?.indexBefore, null)
+    await git(f.local, 'read-tree', '--empty')
+  } }), true)
+  const index = join(f.task.local.gitDir, 'index')
+  await writeFile(join(f.isolated, 'README.md'), 'previewed readme\n')
+  await f.ready()
+  await f.act('preview', await f.latest())
+  assert.equal(await exists(index), false)
+  createIndex = true
+  await assert.rejects(f.act('finalize', await f.latest()), /恢复记录/)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+  assert.equal(await git(f.local, 'ls-files'), '')
+  assert.equal(await exists(index), true)
+  assert.equal(await content(f.local, 'README.md'), 'previewed readme\n')
 })
 
 test('discard removes a verified dirty worktree but preserves ignored data', async t => {
