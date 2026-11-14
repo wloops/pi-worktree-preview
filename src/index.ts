@@ -4,7 +4,7 @@ import { Type } from 'typebox'
 import { createHash, randomUUID } from 'node:crypto'
 import { link, lstat, mkdir, mkdtemp, open, realpath, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { checkout, shortSessionName, TaskStore, type Action, type SessionLink, type Task } from './store.ts'
+import { checkout, PreviewConflict, shortSessionName, TaskStore, type Action, type SessionLink, type Task } from './store.ts'
 
 const NAME = 'worktree-preview'
 const TOOL = 'worktree_ready_for_review'
@@ -14,7 +14,7 @@ const HISTORY_DIR = 'history-views'
 const HISTORY_HINT = '历史对话 · 发送后在新 Worktree 继续'
 const guardedTools = new Set(['edit', 'write', 'bash', 'powershell', TOOL])
 const labels: Record<Action, string> = { preview: '预览到 Local', rollback: '撤回预览', finalize: '确认提交', discard: '放弃任务' }
-type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'close'
+type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'recover' | 'close'
 const phases = { creating: '创建中断', working: '进行中', ready: '待验收', previewed: '已预览', delivered: '已交付', discarded: '已放弃' }
 const clean = (s: string) => s.replace(/[\p{Cc}\p{Cf}]/gu, '?')
 const message = (e: unknown) => clean(e instanceof Error ? e.message : String(e))
@@ -38,6 +38,11 @@ function deliveryChoices(task: Task | undefined, allowed: boolean): Choice<Actio
 const localCheck = { label: '打开 Local 检查', value: 'return' } as const
 const retainedChoice = { label: '已保留的 Worktree', value: 'retained' } as const
 const historyChoice = { label: '任务历史', value: 'history' } as const
+const recoverChoice = { label: '让 Agent 继续解决冲突', value: 'recover' } as const
+
+function conflictPrompt(recovery: NonNullable<Task['recovery']>) {
+  return `只在当前 detached Worktree 解决冲突，不写 Local。若未开始，先将已验收改动提交为 checkpoint，再运行 git -c core.hooksPath=/dev/null -c rerere.enabled=false -c merge.renames=false -c merge.directoryRenames=false merge --no-edit --no-autostash --no-overwrite-ignore ${recovery.localHeadOid}。已在合并中就继续，已合并就不要重做。只解决 Git 报出的冲突，保留其余自动合并结果；提交时禁用 Git hooks。只跑相关测试，再调用 ${TOOL}；有歧义就停下问我，不要预览。`
+}
 const historyTasks = (tasks: Task[]) => tasks.filter(task =>
   ['delivered', 'discarded'].includes(task.phase) && !task.journal && task.isolatedSession?.cwd === task.isolatedPath)
 const retainedTasks = (tasks: Task[]) => tasks.filter(task =>
@@ -350,6 +355,8 @@ export default function extension(pi: ExtensionAPI) {
     const active = currentTask(state.isolated, state.tasks)
     const direct: Choice<MenuAction>[] = deliveryChoices(active, !state.isolated || isBoundSession(ctx, state.isolated.isolatedSession))
     if (state.isolated && active?.phase === 'previewed' && !active.journal) direct.unshift(localCheck)
+    if (active?.phase === 'working' && active.recovery && !active.journal &&
+        (!state.isolated || isBoundSession(ctx, active.isolatedSession))) direct.push(recoverChoice)
     if (retainedTasks(state.tasks).length) direct.push(retainedChoice)
     const scope = state.isolated ? 'Worktree' : 'Local'
     const status = active ? ` · ${active.journal ? '恢复记录：已停止' : phases[active.phase]}` : ''
@@ -666,6 +673,7 @@ export default function extension(pi: ExtensionAPI) {
         if (!local && !isolated) throw new Error('请从有初始提交的 Git checkout 打开 Pi。')
         const mayDeliver = !isolated || isBoundSession(ctx, isolated.isolatedSession)
         const choices: Choice<MenuAction>[] = [...deliveryChoices(task, mayDeliver)]
+        if (mayDeliver && task?.phase === 'working' && task.recovery && !task.journal) choices.push(recoverChoice)
         const details = [`${isolated ? 'Worktree' : 'Local'}${task ? ` · ${phases[task.phase]}${task.review ? ` · ${task.review.message}（${task.review.files.length} 个文件）` : ''}` : ''}`]
         if (task) {
           if (task.journal || task.phase === 'creating') details.push(`已停止自动操作 · ${data.statePath}`, task.isolatedPath)
@@ -744,6 +752,26 @@ export default function extension(pi: ExtensionAPI) {
           await data.validateIsolatedIdentity(target)
           const moved = await switchTo(ctx, target.isolatedSession, async () => { switching = true })
           if (moved.cancelled) throw new Error('Pi 取消了切换。')
+        } else if (choice === 'recover' && task?.recovery) {
+          const target = task.isolatedSession
+          if (!target) throw new Error('找不到任务的 Worktree 会话。')
+          await data.validateIsolatedIdentity(task)
+          const resume = async (next: ExtensionContext, send: (text: string) => unknown) => {
+            const latest = (await data.read()).tasks.find(item => item.id === task.id)
+            if (!isBoundSession(next, target) || !next.isIdle() || latest?.phase !== 'working' || latest.journal ||
+                JSON.stringify(latest.recovery) !== JSON.stringify(task.recovery)) throw new Error('冲突恢复状态已变化。')
+            await data.validateIsolatedIdentity(latest)
+            await send(conflictPrompt(task.recovery!))
+          }
+          if (isolated) await resume(ctx, text => pi.sendUserMessage(text))
+          else {
+            const moved = await switchTo(ctx, target, async next => {
+              switching = true
+              try { await resume(next, text => next.sendUserMessage(text)) }
+              catch (error) { next.ui.notify(message(error), 'error') }
+            })
+            if (moved.cancelled) throw new Error('Pi 取消了切换。')
+          }
         } else if (choice === 'mark' && isolated) {
           const link = sessionLink(ctx)
           if (!link) throw new Error('没有可保存的 Pi 会话。')
@@ -771,6 +799,38 @@ export default function extension(pi: ExtensionAPI) {
             { label: '取消', value: undefined },
           ])
           if (!decision || !ctx.isIdle()) return
+          const recoverConflict = async (conflict: PreviewConflict) => {
+            const plan = conflict.plan
+            const target = task.isolatedSession
+            const canRecover = !!target && !!task.review && !!plan.cleanEntries && plan.committedConflictingFiles.length > 0
+            const paths = plan.conflictingFiles.slice(0, 6).map(path => `• ${JSON.stringify(path)}`)
+            if (plan.conflictingFiles.length > paths.length) paths.push(`… 共 ${plan.conflictingFiles.length} 个冲突文件`)
+            const recover = await pick(ctx, '预览冲突 · Local 未修改', [
+              !plan.committedConflictingFiles.length ? '请先处理这些 Local 未提交改动，再重新预览。' :
+                canRecover ? `只在 Worktree 合并 Local ${plan.localHeadOid.slice(0, 12)}，生成新验收。` : '这组冲突不能安全地自动交给 Agent。',
+              ...(canRecover && plan.dirtyConflict ? ['冲突路径也有 Local 未提交的改动，不会带入 Worktree。'] : []),
+              ...paths,
+            ], [...(canRecover ? [{ label: '让 Agent 解决冲突', value: true }] : []), { label: '关闭', value: false }])
+            if (!recover || !target || !task.review || !ctx.isIdle()) return
+            const reviewId = task.review.id
+            const begin = async (next: ExtensionContext, send: (text: string) => unknown) => {
+              if (!isBoundSession(next, target) || !next.isIdle()) throw new Error('未进入预期的空闲 Worktree 会话。')
+              const recovery = await data.beginConflictRecovery(task.id, target, reviewId, plan)
+              await send(conflictPrompt(recovery))
+            }
+            if (isolated) await begin(ctx, text => pi.sendUserMessage(text))
+            else {
+              const moved = await switchTo(ctx, target, async next => {
+                switching = true
+                try { await begin(next, text => next.sendUserMessage(text)) }
+                catch (error) { next.ui.notify(message(error), 'error') }
+                finally {
+                  if (next.isIdle()) await next.sendUserMessage(`/${NAME} refresh`, { expandPromptTemplates: true }).catch(() => {})
+                }
+              })
+              if (moved.cancelled) throw new Error('Pi 取消了切换；未开始处理冲突。')
+            }
+          }
           const execute = async (activeCtx: ExtensionContext) => {
             if (decision === 'keep') {
               if (!task.isolatedSession || task.isolatedSession.cwd !== task.isolatedPath) throw new Error('找不到可保留的 Worktree 会话，未提交。')
@@ -811,7 +871,13 @@ export default function extension(pi: ExtensionAPI) {
               }
             })
             if (moved.cancelled) throw new Error('Pi 取消了切换，未提交。')
-          } else await execute(ctx)
+          } else {
+            try { await execute(ctx) }
+            catch (error) {
+              if (act !== 'preview' || !(error instanceof PreviewConflict)) throw error
+              await recoverConflict(error)
+            }
+          }
         }
       } catch (error) {
         if (!switching) {

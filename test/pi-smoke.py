@@ -38,19 +38,23 @@ export default function(pi) {
       const tool = (name, args = {}) => ({type:"toolCall",id:`test_${name}`,name,arguments:args});
       const say = (text) => [{type:"text",text}];
       const revision = text?.startsWith("Revise ");
+      const recover = text?.startsWith("只在当前 detached Worktree 解决冲突") && text.match(/--no-overwrite-ignore ([0-9a-f]{40,64})/);
       const revise = () => tool("worktree_begin_revision");
       const badWrite = () => tool("write", {path:"forbidden.txt",content:"must not be written"});
       const edit = () => tool("bash", {command:`printf '${revision ? (text === "Revise before preview." ? "ready revision" : "previewed revision") : "task edit"}\\\\n' > task.txt`});
       let content;
       if (last?.role === "toolResult") {
         switch (last.toolName) {
-          case "bash": content = [tool("worktree_ready_for_review", {commitMessage:"Isolated smoke change"})]; break;
+          case "bash": content = last.isError ? say("Worktree command failed.") : [tool("worktree_ready_for_review", {commitMessage:"Isolated smoke change"})]; break;
           case "read": content = say("Explained without edits."); break;
           case "write": content = say(last.isError ? "Write was blocked." : "Unexpected write."); break;
           case "worktree_begin_revision": content = last.isError ? say(text === "Revise after Local drift." ? "Revision blocked by Local drift." : "Revision stopped.") : [edit()]; break;
-          default: content = say(revision ? "Revision ready." : "Worktree ready.");
+          default: content = say(last.isError ? "Review failed." : recover ? "Conflict resolved in Worktree." : revision ? "Revision ready." : "Worktree ready.");
         }
-      } else if (revision) content = [revise()];
+      } else if (recover) content = [tool('bash', {command: `git add -- task.txt && git commit -m checkpoint &&
+        (git -c merge.renames=false -c merge.directoryRenames=false merge --no-edit --no-overwrite-ignore ${recover[1]}; test $? -eq 1) &&
+        test "$(git rev-parse MERGE_HEAD)" = ${recover[1]} && printf 'merged task\\\\n' > task.txt && git add -- task.txt && git commit -m resolve`})];
+      else if (revision) content = [revise()];
       else if (text === "Try a parallel write.") content = [revise(), badWrite()];
       else if (text === "Try to write during review.") content = [badWrite()];
       else if (text === "Explain the change.") content = [tool("read", {path:"task.txt"})];
@@ -532,6 +536,49 @@ def main():
             pi.click('[ 返回 Local ]')
             pi.until('Local · 已交付')
             print('real Pi: explicit retention with absent Local index; environment and session reopen after restart', flush=True)
+
+        local = base / 'conflict-local'
+        local.mkdir()
+        git('init', '-q', '-b', 'main')
+        git('config', 'user.name', 'Smoke Test')
+        git('config', 'user.email', 'smoke@example.invalid')
+        (local / 'task.txt').write_text('base\n')
+        git('add', '.')
+        git('commit', '-m', 'base')
+        with Pi(local, agent, provider) as pi:
+            pi.click('[ ] 新建 Worktree')
+            pi.until('[x] 新建 Worktree')
+            pi.send(kickoff.encode() + b'\r')
+            pi.until('Worktree ready.', 40)
+            previous = task()['review']['id']
+            (local / 'task.txt').write_text('committed upstream\n')
+            git('commit', '-am', 'upstream')
+            head = git('rev-parse', 'HEAD')
+            (local / 'untracked.txt').write_text('private\n')
+            pi.click('[ 预览到 Local ]')
+            pi.click('[ 执行预览到 Local ]')
+            pi.until('预览冲突 · Local 未修改')
+            pi.click('[ 关闭 ]')
+            assert task()['review']['id'] == previous
+            assert git('status', '--porcelain') == '?? untracked.txt'
+            pi.click('[ 工作树操作 ]')
+            pi.click('[ 返回 Local ]')
+            pi.until('Local · 待验收')
+            pi.click('[ 预览到 Local ]')
+            pi.click('[ 执行预览到 Local ]')
+            pi.click('[ 让 Agent 解决冲突 ]')
+            pi.until('Conflict resolved in Worktree.', 45)
+            assert task()['phase'] == 'ready'
+            assert task()['review']['id'] != previous
+            assert task()['baseOid'] == head
+            assert git('rev-parse', 'HEAD') == head
+            assert git('status', '--porcelain') == '?? untracked.txt'
+            assert (local / 'task.txt').read_text() == 'committed upstream\n'
+            pi.click('[ 预览到 Local ]')
+            pi.click('[ 执行预览到 Local ]')
+            pi.until('Worktree · 已预览')
+            assert (local / 'task.txt').read_text() == 'merged task\n'
+            print('real Pi: cancelled conflict recovery, then approved from Local; Agent resolved in original Worktree and re-reviewed', flush=True)
 
 
 if __name__ == '__main__':

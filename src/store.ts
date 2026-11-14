@@ -2,12 +2,19 @@ import { createHash, randomUUID } from 'node:crypto'
 import { constants, type BigIntStats } from 'node:fs'
 import { lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
-import { createSessionCheckoutApplyEngine, runGit, type FrozenReview, type PreviewReceipt } from './engine.ts'
+import { createSessionCheckoutApplyEngine, runGit, type ApplyConflictPlanResult, type FrozenReview, type PreviewReceipt } from './engine.ts'
 
 export interface Checkout { root: string; gitDir: string; commonDir: string; rootIdentity: string; gitIdentity: string; commonIdentity: string }
 export interface SessionLink { id: string; file: string; cwd: string }
 type Phase = 'creating' | 'working' | 'ready' | 'previewed' | 'delivered' | 'discarded'
 interface Review { id: string; fingerprint: string; files: string[]; message: string; snapshot?: FrozenReview }
+interface ConflictRecovery {
+  localHeadOid: string
+  isolatedHeadOid: string
+  reviewedTreeOid: string
+  conflictingFiles: string[]
+  cleanEntries: { path: string; entry: string | null }[]
+}
 export interface Task {
   id: string
   phase: Phase
@@ -20,6 +27,7 @@ export interface Task {
   isolatedSession?: SessionLink
   followUpOf?: string
   review?: Review
+  recovery?: ConflictRecovery
   receipt?: PreviewReceipt
   // A null indexBefore explicitly records that no index file existed.
   journal?: { operation: 'preview' | 'rollback' | 'finalize' | 'cleanup'; at: number; commitOid?: string; indexBefore?: string | null; indexAfter?: string }
@@ -88,6 +96,16 @@ function boundIsolatedSession(task: Task, session: SessionLink) {
   return !!bound && bound.id === session.id && bound.file === session.file && bound.cwd === session.cwd
 }
 class CleanupDataLoss extends Error {}
+export class PreviewConflict extends Error {
+  constructor(readonly plan: ApplyConflictPlanResult) {
+    const paths = plan.conflictingFiles.map(path => JSON.stringify(path)).join('、')
+    super(plan.committedConflictingFiles.length ? `预览冲突，Local 未写入：${paths}` :
+      `Local 未提交的改动挡住预览，Local 未写入：${paths}`)
+  }
+}
+async function isAncestor(root: string, older: string, newer: string) {
+  return (await runGit(root, ['merge-base', '--is-ancestor', older, newer], { allowedExitCodes: [0, 1] })).exitCode === 0
+}
 function engineError(result: { error: { message: string } }): never { throw new Error(result.error.message) }
 
 /** A single durable registry/lock per Pi profile. No automatic lock stealing or journal replay. */
@@ -183,6 +201,55 @@ export class TaskStore {
 
   private input(task: Task) { return { localPath: task.local.root, isolatedPath: task.isolatedPath, baseOid: task.baseOid } }
 
+  async beginConflictRecovery(id: string, session: SessionLink, reviewId: string, shown: ApplyConflictPlanResult): Promise<ConflictRecovery> {
+    return this.locked(async (state, save) => {
+      const task = state.tasks.find(t => t.id === id)
+      if (!task || task.phase !== 'ready' || task.review?.id !== reviewId || task.receipt || task.journal || task.recovery ||
+          !boundIsolatedSession(task, session)) throw new Error('待验收状态或隔离会话已变化，请重新预览。')
+      await this.validateLocal(task)
+      await this.validateIsolated(task)
+      const engine = this.engineFactory()
+      const input = this.input(task)
+      const current = await engine.inspectReview(input)
+      if (current.status === 'error') engineError(current)
+      const latest = await engine.plan(input, task.review)
+      if (latest.status === 'error') engineError(latest)
+      if (latest.status !== 'conflict' || latest.localFingerprint !== shown.localFingerprint || latest.dirtyConflict !== shown.dirtyConflict ||
+          latest.localHeadOid !== shown.localHeadOid || latest.localHeadRef !== task.localHeadRef ||
+          latest.isolatedHeadOid !== shown.isolatedHeadOid || latest.reviewedTreeOid !== shown.reviewedTreeOid ||
+          JSON.stringify(latest.conflictingFiles) !== JSON.stringify(shown.conflictingFiles) ||
+          JSON.stringify(latest.committedConflictingFiles) !== JSON.stringify(shown.committedConflictingFiles)) {
+        throw new Error('Local 或冲突情况已变化，请重新预览。')
+      }
+      if (!latest.committedConflictingFiles.length || !latest.cleanEntries) throw new Error('无法安全合并这组冲突；Local 未修改。')
+      const { isolatedHeadOid, localHeadOid, reviewedTreeOid, committedConflictingFiles, cleanEntries } = latest
+      // Agent can checkpoint the exact reviewed tree without picking up later files or
+      // flattening a staged version different from both HEAD and the reviewed content.
+      const [headTree, mergeBase] = await Promise.all([
+        out(task.isolatedPath, ['rev-parse', `${isolatedHeadOid}^{tree}`]),
+        out(task.isolatedPath, ['merge-base', '--all', isolatedHeadOid, localHeadOid]),
+      ])
+      if (current.isolatedHeadRef || current.isolatedHeadOid !== isolatedHeadOid || current.isolatedTreeOid !== reviewedTreeOid ||
+          (current.isolatedIndexTreeOid !== reviewedTreeOid && current.isolatedIndexTreeOid !== headTree) ||
+          mergeBase !== task.baseOid || !await isAncestor(task.local.root, task.baseOid, localHeadOid)) {
+        throw new Error('Worktree 有未验收的改动、独立暂存内容或不同的 Git 历史，无法安全交给 Agent 合并。')
+      }
+      await this.validateLocal(task)
+      await this.validateIsolated(task)
+      // Only detached HEAD can move during recovery. Do not give the Agent an
+      // attached branch whose ref (possibly shared with Local) could change.
+      const symbolic = await runGit(task.isolatedPath, ['symbolic-ref', '--quiet', 'HEAD'], { allowedExitCodes: [0, 1] })
+      if (symbolic.exitCode !== 1 || await out(task.local.root, ['rev-parse', 'HEAD']) !== localHeadOid ||
+          await out(task.isolatedPath, ['rev-parse', 'HEAD']) !== isolatedHeadOid) throw new Error('合并目标已变化，请重新预览。')
+      const recovery: ConflictRecovery = { localHeadOid, isolatedHeadOid, reviewedTreeOid, conflictingFiles: committedConflictingFiles, cleanEntries }
+      task.recovery = recovery
+      delete task.review
+      task.phase = 'working'
+      await save()
+      return recovery
+    })
+  }
+
   async markReady(id: string, session: SessionLink, message: string): Promise<Review> {
     const title = message.trim()
     if (!title || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) throw new Error('请提供 1–200 字符的单行提交说明。')
@@ -192,9 +259,34 @@ export class TaskStore {
         throw new Error('当前不是可标记待验收的隔离会话。')
       }
       await this.validateIsolated(task)
-      const inspected = await this.engineFactory().inspectReview(this.input(task))
+      const recovery = task.recovery
+      const baseOid = recovery?.localHeadOid ?? task.baseOid
+      const inspected = await this.engineFactory().inspectReview({ ...this.input(task), baseOid })
       if (inspected.status === 'error') engineError(inspected)
-      if (!inspected.changedFiles.length) throw new Error('没有可验收的 Git 改动。')
+      if (recovery) {
+        const [firstParent, mergedParent, ...others] = (await out(task.isolatedPath,
+          ['show', '-s', '--format=%P', inspected.isolatedHeadOid])).split(' ')
+        if (inspected.isolatedHeadRef || !oid.test(firstParent) || mergedParent !== baseOid || others.length ||
+            !await isAncestor(task.isolatedPath, recovery.isolatedHeadOid, firstParent) ||
+            await out(task.isolatedPath, ['rev-parse', `${firstParent}^{tree}`]) !== recovery.reviewedTreeOid ||
+            await out(task.isolatedPath, ['rev-parse', 'HEAD']) !== inspected.isolatedHeadOid ||
+            await out(task.isolatedPath, ['rev-parse', `${inspected.isolatedHeadOid}^{tree}`]) !== inspected.isolatedTreeOid ||
+            inspected.isolatedIndexTreeOid !== inspected.isolatedTreeOid) {
+          throw new Error(`请先在当前 Worktree 完成与 ${baseOid.slice(0, 12)} 的合并提交，再标记待验收。`)
+        }
+        const expected = new Map(recovery.cleanEntries.map(({ path, entry }) => [path, entry]))
+        const conflicts = new Set(recovery.conflictingFiles)
+        const actual = new Map(inspected.snapshot.entries.map(({ path, working }) => [path, working]))
+        if ([...expected].some(([path, entry]) => !actual.has(path) || actual.get(path) !== entry) ||
+            [...actual].some(([path]) => !conflicts.has(path) && !expected.has(path))) {
+          throw new Error('合并结果改动了冲突范围外的内容；请保留 Git 自动合并的结果后再标记待验收。')
+        }
+        await this.validateLocal(task)
+        if (!await isAncestor(task.local.root, baseOid, 'HEAD')) throw new Error('Local 已不包含合并目标，无法生成新验收。')
+        task.baseOid = baseOid
+        delete task.recovery
+      }
+      if (!inspected.changedFiles.length) throw new Error(recovery ? '合并后无需交付：任务改动已在 Local HEAD 中。可返回 Local 放弃此任务。' : '没有可验收的 Git 改动。')
       const review = { id: randomUUID(), fingerprint: inspected.isolatedFingerprint, files: inspected.changedFiles, message: title, snapshot: inspected.snapshot }
       task.review = review
       task.phase = 'ready'
@@ -245,8 +337,11 @@ export class TaskStore {
           await this.validateIsolated(task)
           const res = await engine.plan(this.input(task), task.review)
           if (res.status === 'error') engineError(res)
-          if (res.status === 'conflict') throw new Error(`预览冲突，Local 未写入：${res.conflictingFiles.map(s => JSON.stringify(s)).join('、')}`)
-          if (res.plan.localHeadRef !== task.localHeadRef) throw new Error('计算预览时 Local 分支已变化。')
+          const localPlan = res.status === 'conflict' ? res : res.plan
+          if (localPlan.localHeadRef !== task.localHeadRef || !await isAncestor(task.local.root, task.baseOid, localPlan.localHeadOid)) {
+            throw new Error('Local 分支或历史已变化；未写入 Local。')
+          }
+          if (res.status === 'conflict') throw new PreviewConflict(res)
           const applied = await engine.preview(res.plan, {
             previewId: randomUUID(), reviewId: task.review.id, iteration: 1,
             beforeWrite: async receipt => {
@@ -331,6 +426,7 @@ export class TaskStore {
           await this.unpin(task).catch(() => {})
         } else throw new Error('当前阶段不允许此操作。')
       } catch (error) {
+        if (error instanceof PreviewConflict) throw error
         throw new Error(task.journal ? `${errText(error)}；已停用自动操作，恢复记录：${this.statePath}` : errText(error), { cause: error })
       }
       return task

@@ -49,6 +49,10 @@ export interface ApplyPlan {
 export interface ReviewSnapshotResult {
   status: 'ready'
   isolatedFingerprint: string
+  isolatedHeadOid: string
+  isolatedHeadRef: string | null
+  isolatedTreeOid: string
+  isolatedIndexTreeOid: string
   changedFiles: string[]
   snapshot: FrozenReview
 }
@@ -67,10 +71,15 @@ export interface ApplyConflictPlanResult {
   isolatedFingerprint: string
   effectiveBaseOid: string
   baseStrategy: ApplyBaseStrategy
-  /** 冲突计算时的真实 Local HEAD，供 Isolated Agent 在当前 Worktree 内同步并解决冲突。 */
   localHeadOid: string
+  localHeadRef: string | null
   isolatedHeadOid: string
   conflictingFiles: string[]
+  committedConflictingFiles: string[]
+  dirtyConflict: boolean
+  reviewedTreeOid: string
+  /** Stage-zero deltas relative to Local HEAD on other reviewed paths; absent for ambiguous Git paths. */
+  cleanEntries?: { path: string; entry: string | null }[]
 }
 
 export interface ApplyPlanErrorResult {
@@ -278,6 +287,8 @@ interface MergeReadyResult {
 interface MergeConflictResult {
   status: 'conflict'
   conflictingFiles: string[]
+  rawConflicts?: string[]
+  cleanEntries?: { path: string; entry: string | null }[]
 }
 
 type MergeResult = MergeReadyResult | MergeConflictResult
@@ -684,10 +695,11 @@ async function computeMerge(
   checkoutPath: string,
   projectPathPrefix: string,
   reviewedPaths: ReadonlySet<string>,
+  committedOnly = false,
 ): Promise<MergeResult> {
   const localCommit = await createSnapshotCommit(
     checkoutPath,
-    local.treeOid,
+    committedOnly ? local.headTreeOid : local.treeOid,
     baseOid,
     objectDirectory,
     sourceObjects,
@@ -701,7 +713,7 @@ async function computeMerge(
     sourceObjects,
     'Reviewed Isolated snapshot',
   )
-  const mergePath = join(tempRoot, 'merge checkout')
+  const mergePath = join(tempRoot, committedOnly ? 'committed merge checkout' : 'merge checkout')
   const hooksPath = join(tempRoot, 'disabled hooks')
   await mkdir(mergePath, { recursive: true })
   await mkdir(hooksPath, { recursive: true })
@@ -718,13 +730,23 @@ async function computeMerge(
 
   if (merge.exitCode === 1) {
     const conflicts = await runGit(mergePath, ['diff', '--name-only', '--diff-filter=U', '-z'], { env: mergeEnv })
-    const conflictingFiles = parseNullSeparated(conflicts.stdout)
-      .filter((path) => isProjectPath(path, projectPathPrefix))
-      .map((path) => toProjectPath(path, projectPathPrefix))
-      .sort()
+    const rawConflicts = parseNullSeparated(conflicts.stdout)
+    const conflictingFiles = rawConflicts.filter(path => isProjectPath(path, projectPathPrefix))
+      .map(path => toProjectPath(path, projectPathPrefix)).sort()
     if (conflictingFiles.length === 0) throw new GitCommandFailure(['merge'], merge)
-    return { status: 'conflict', conflictingFiles }
+    const result: MergeConflictResult = { status: 'conflict', conflictingFiles, rawConflicts }
+    if ((committedOnly || local.headTreeOid === local.treeOid) && rawConflicts.every(path => reviewedPaths.has(path))) {
+      const conflicted = new Set(rawConflicts)
+      const cleanPaths = new Set([...reviewedPaths].filter(path => !conflicted.has(path)))
+      const entries = entryMap((await runGit(mergePath, ['ls-files', '--stage', '-z'], { env: mergeEnv })).stdout, 'index', cleanPaths)
+      const upstream = entryMap((await runGit(mergePath, ['ls-tree', '-rz', local.headTreeOid], { env: mergeEnv })).stdout, 'tree', cleanPaths)
+      result.cleanEntries = [...cleanPaths].filter(path => entries.get(path) !== upstream.get(path))
+        .map(path => ({ path, entry: entries.get(path) ?? null }))
+    }
+    return result
   }
+  // This second merge is diagnostic only; don't create a patch using the dirty tree.
+  if (committedOnly) return { status: 'ready', changedFiles: [], patch: Buffer.alloc(0), mergedTreeOid: local.headTreeOid }
 
   const mergedTree = stdoutText(await runGit(mergePath, ['write-tree'], { env: mergeEnv }))
   const changed = await runGit(
@@ -1266,6 +1288,8 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       return {
         status: 'ready',
         isolatedFingerprint: legacy?.fingerprint ?? isolated.fingerprint,
+        isolatedHeadOid: isolated.headOid, isolatedHeadRef: isolated.headRef,
+        isolatedTreeOid: isolated.treeOid, isolatedIndexTreeOid: isolated.indexTreeOid,
         changedFiles: changedFiles.map((path) => toProjectPath(path, localPrefix)).sort(),
         snapshot,
       }
@@ -1321,12 +1345,27 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         objectDirectory,
         localObjects,
       )
+      const reviewedPaths = new Set(review.entries.map(entry => entry.path))
       const merge = await computeMerge(
-        tempRoot, localObjects, objectDirectory, input.baseOid, local, isolatedTreeOid, localGitRoot, localPrefix,
-        new Set(review.entries.map(entry => entry.path)),
+        tempRoot, localObjects, objectDirectory, input.baseOid, local, isolatedTreeOid, localGitRoot, localPrefix, reviewedPaths,
       )
       const revision = randomUUID()
       if (merge.status === 'conflict') {
+        const committed = local.headOid !== input.baseOid && local.headTreeOid !== local.treeOid
+          ? await computeMerge(tempRoot, localObjects, objectDirectory, input.baseOid, local, isolatedTreeOid, localGitRoot, localPrefix, reviewedPaths, true)
+          : undefined
+        const committedConflictingFiles = local.headOid === input.baseOid ? []
+          : !committed ? merge.conflictingFiles : committed.status === 'conflict' ? committed.conflictingFiles : []
+        // On a clean Local tree the first merge is already the committed-only result.
+        // Reuse its staged entries rather than attributing that conflict to dirty files.
+        const recovery = committed ?? (local.headOid === input.baseOid ? undefined : merge)
+        const dirtyPaths = local.headTreeOid === local.indexTreeOid && local.indexTreeOid === local.treeOid ? [] : [
+          ...await changedTreePaths(localGitRoot, local.headTreeOid, local.indexTreeOid, objectDirectory, localObjects),
+          ...await changedTreePaths(localGitRoot, local.indexTreeOid, local.treeOid, objectDirectory, localObjects),
+        ]
+        const dirtyConflict = merge.conflictingFiles.some(path => !committedConflictingFiles.includes(path)) ||
+          dirtyPaths.some(path => merge.rawConflicts?.some(conflict =>
+            path === conflict || path.startsWith(`${conflict}/`) || conflict.startsWith(`${path}/`)))
         return {
           status: 'conflict',
           revision,
@@ -1335,8 +1374,13 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
           effectiveBaseOid: input.baseOid,
           baseStrategy: 'recorded_base',
           localHeadOid: local.headOid,
+          localHeadRef: local.headRef,
           isolatedHeadOid,
           conflictingFiles: merge.conflictingFiles,
+          committedConflictingFiles,
+          dirtyConflict,
+          reviewedTreeOid: isolatedTreeOid,
+          cleanEntries: recovery?.status === 'conflict' ? recovery.cleanEntries : undefined,
         }
       }
 
