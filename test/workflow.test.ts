@@ -84,6 +84,41 @@ test('journaled preview, rollback, re-preview and task-only commit preserve Loca
   assert.equal(await exists(store.lockPath), false)
 })
 
+test('follow-up requires closed history for the same Local and takes the current branch HEAD', async t => {
+  const f = await fixture(t)
+  const fork = async (cwd: string, task: Task, prior?: Task) => {
+    assert.equal(prior?.id, f.task.id)
+    assert.equal(await exists(cwd), false, 'validate the source session before creating a worktree')
+    return { cwd, id: task.id, file: join(f.dir, `${task.id}.jsonl`) }
+  }
+  await assert.rejects(f.store.create(await checkout(f.local), f.task.localSession, fork, f.task.id), /已有未完成/)
+  await writeFile(join(f.isolated, 'discarded.txt'), 'not carried forward\n')
+  const closed = await f.act('discard', await f.latest())
+  assert.equal(closed.cleanup?.status, 'done')
+  assert.equal(await exists(f.isolated), false)
+  const other = join(f.dir, 'other-local')
+  await git(f.local, 'worktree', 'add', '-b', 'other-local', other)
+  await assert.rejects(f.store.create(await checkout(other), f.task.localSession, fork, closed.id), /不属于同一个 Local/)
+  await assert.rejects(f.store.create(await checkout(f.local), f.task.localSession, fork, 'no-such-task'), /原任务不可续接/)
+  await assert.rejects(f.store.create(await checkout(f.local), f.task.localSession, async () => { throw new Error('missing session') }, closed.id), /missing session/)
+  assert.deepEqual((await f.store.read()).tasks, [closed])
+
+  await git(f.local, 'switch', '-c', 'later-branch')
+  await writeFile(join(f.local, 'latest.txt'), 'new base\n')
+  await git(f.local, 'add', 'latest.txt')
+  await git(f.local, 'commit', '-m', 'new tip')
+  await writeFile(join(f.local, 'task.txt'), 'uncommitted Local\n')
+  const next = await f.store.create(await checkout(f.local), f.task.localSession, fork, closed.id)
+  assert.equal(next.followUpOf, closed.id)
+  assert.equal(next.phase, 'working')
+  assert.equal(next.localHeadRef, 'refs/heads/later-branch')
+  assert.equal(next.baseOid, (await git(f.local, 'rev-parse', 'HEAD')).trim())
+  assert.equal(await content(next.isolatedPath, 'latest.txt'), 'new base\n')
+  assert.equal(await content(next.isolatedPath, 'task.txt'), 'task.txt base\n')
+  assert.equal(await exists(join(next.isolatedPath, 'discarded.txt')), false)
+  assert.deepEqual(await f.latest(), closed)
+})
+
 test('continuing edits invalidates only the matching review, with or without a prior preview', async t => {
   const f = await fixture(t)
   const session = f.task.isolatedSession!

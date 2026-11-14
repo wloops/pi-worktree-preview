@@ -17,6 +17,8 @@ pi --tui-mode fullscreen -e /path/to/pi-worktree-preview/src/index.ts
 4. 想返修时，在原 Worktree 会话直接发送修改要求。未预览时，Agent 开始返修前会作废旧验收，无需确认。已预览时，Agent 会显示 **撤回预览，继续返修**；点一次，Local 撤回成功后 Agent 会接着处理刚才的要求，无需重发。取消或撤回失败则不开始修改；单纯提问不会作废验收。若只想恢复 Local、不需要返修，两边的 **撤回预览** 仍可单独执行，保留旧验收。
 5. 两边都能直接点击 **确认提交**。确认框默认提供 **提交并清理 Worktree**，也可选 **提交并保留 Worktree**，提交内容相同，只包含任务改动，保留 Local 原有改动。从 Worktree 确认提交时，会先切到原 Local 会话；切换被取消则不提交。主动保留或未通过清理检查的环境，可以在 Local 点 **已保留的 Worktree** 恢复会话检查或发起清理；任务已结束，不会继续交付，也不会定时删除。尚未预览的任务仍可在 Local 菜单里放弃。
 
+6. 任务已交付或放弃后，在 Local 点击 **任务历史** 并选中任务，Pi 消息区会立即显示旧对话。此时只是查看历史，不创建 Worktree；不想继续可点击 **返回 Local**。发送第一条后续要求时，才从 Local 当前分支的 `HEAD` 新建隔离目录并继承对话。不带入旧任务的未提交改动，也不改动原会话。旧 Worktree 已清理仍可续接，只要原 Pi 会话文件还在。
+
 每次写入或放弃都需要单独确认。也可用方向键与 Enter 操作；`/worktree-preview` 是菜单的键盘备用入口。若希望始终启用，可运行 `pi install /path/to/pi-worktree-preview`，再用 `pi --tui-mode fullscreen` 启动。
 
 ## 安全边界与限制
@@ -38,4 +40,4 @@ npm test
 python3 test/pi-smoke.py
 ```
 
-`test/pi-smoke.py` 在临时 Git 仓库和临时 Pi 配置中运行，使用离线测试模型，无需 API 密钥；覆盖鼠标创建、恢复、取消确认、预览、撤回、同一轮对话中的返修、提交、放弃，以及保留后强删和双 Pi 会话占用保护。Git 合并与验收引擎移植自 [`dsh-git-worktree`](https://github.com/wloops/dsh-git-worktree)，保留 MIT 许可。
+`test/pi-smoke.py` 在临时 Git 仓库和临时 Pi 配置中运行，使用离线测试模型，无需 API 密钥；覆盖鼠标创建、恢复、取消确认、预览、撤回、同一轮对话中的返修、提交、放弃、从已结束会话续接新任务，以及保留后强删和双 Pi 会话占用保护。Git 合并与验收引擎移植自 [`dsh-git-worktree`](https://github.com/wloops/dsh-git-worktree)，保留 MIT 许可。

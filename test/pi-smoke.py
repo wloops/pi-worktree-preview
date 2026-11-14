@@ -54,6 +54,14 @@ export default function(pi) {
       else if (text === "Try a parallel write.") content = [revise(), badWrite()];
       else if (text === "Try to write during review.") content = [badWrite()];
       else if (text === "Explain the change.") content = [tool("read", {path:"task.txt"})];
+      else if (text?.startsWith("Follow up from ")) {
+        const previous = text.endsWith("delivery.") ? "Edit task.txt and mark ready." : "Open a task to discard.";
+        const inherited = context.messages.some(message => message.role === 'user' &&
+          (typeof message.content === 'string' ? message.content === previous : message.content.some(part => part.type === 'text' && part.text === previous)));
+        const boundary = context.messages.some(message => message.role === 'user' &&
+          Array.isArray(message.content) && message.content.some(part => part.type === 'text' && part.text.includes('Only conversation history was inherited')));
+        content = say(inherited && boundary ? "Received follow-up with original context." : "Missing inherited context.");
+      }
       else if (text === "Local only." || text === "Open a task to discard.") content = say("Acknowledged without edits.");
       else content = [edit()];
       const tools = content[0].type === "toolCall";
@@ -184,8 +192,11 @@ def main():
         (local / 'user.txt').write_text('edited by user\n')
         state_path = agent / 'worktree-preview/tasks.json'
 
+        def tasks():
+            return json.loads(state_path.read_text())['tasks']
+
         def task():
-            return json.loads(state_path.read_text())['tasks'][-1]
+            return tasks()[-1]
 
         kickoff = 'Edit task.txt and mark ready.'
         git('switch', '--detach', '--quiet')
@@ -372,6 +383,50 @@ def main():
             assert not first_path.exists()
             assert git('rev-parse', 'HEAD') == delivered_head and git('status', '--porcelain') == baseline
             print('real Pi: protected retention, blocked removal while another Pi used it, then explicit force removal', flush=True)
+
+            first = task()
+            first_history = isolated_session.read_bytes()
+            history_views = agent / 'worktree-preview/history-views'
+            pi.click('[ 任务历史 ]')
+            pi.click(f'[ {first_id} · 已交付 · Isolated smoke change ]')
+            pi.until('历史对话 · 发送后在新 Worktree 继续')
+            pi.until('Revise after preview.')  # actually rendered by Pi, before the next send
+            pi.until('Revision ready.')
+            assert tasks() == [first] and not first_path.exists()
+            assert len(list(history_views.glob('*.jsonl'))) == 1
+            assert isolated_session.read_bytes() == first_history
+            assert git('rev-parse', 'HEAD') == delivered_head and git('status', '--porcelain') == baseline
+            # Advance Local while viewing: the new base must be resolved on send.
+            (local / 'new-base.txt').write_text('current Local commit\n')
+            git('add', 'new-base.txt')
+            git('commit', '--only', '-m', 'Advance Local before follow-up', '--', 'new-base.txt')
+            follow_head = git('rev-parse', 'HEAD')
+            pi.send(b'Follow up from delivery.\r')
+            pi.until('Received follow-up with original context.', 35)
+            follow = task()
+            assert not list(history_views.glob('*.jsonl'))
+            follow_path = Path(follow['isolatedPath'])
+            child = Path(follow['isolatedSession']['file'])
+            header = json.loads(child.read_text().splitlines()[0])
+            assert len(tasks()) == 2 and tasks()[0] == first and follow['followUpOf'] == first['id']
+            assert header['parentSession'] == str(isolated_session) and header['cwd'] == str(follow_path)
+            assert header['id'] != first['isolatedSession']['id'] and isolated_session.read_bytes() == first_history
+            assert child.read_text().count('Follow up from delivery.') == 1
+            assert 'Follow up from delivery.' not in Path(follow['localSession']['file']).read_text()
+            assert follow['baseOid'] == follow_head and follow_path != first_path
+            assert (follow_path / 'task.txt').read_text() == 'previewed revision\n'
+            assert (follow_path / 'new-base.txt').read_text() == 'current Local commit\n'
+            assert (follow_path / 'user.txt').read_text() == 'original\n' and not (follow_path / '.pi/loops.json').exists()
+            pi.click('[ 工作树操作 ]')
+            pi.click('[ 返回 Local ]')
+            pi.until('Local · 进行中')
+            pi.click('[ 工作树操作 ]')
+            pi.click('[ 放弃任务 ]')
+            pi.click('[ 执行放弃任务 ]')
+            pi.until('Local · 已放弃')
+            assert not follow_path.exists()
+            print('real Pi: history rendered before creating a Worktree; follow-up used HEAD at send time', flush=True)
+
             pi.click('[ ] 新建 Worktree')
             pi.until('[x] 新建 Worktree')
             pi.send(b'Open a task to discard.\r')
@@ -389,6 +444,48 @@ def main():
             assert not second_path.exists()
             assert not (local / 'discard.txt').exists()
             print('real Pi: discarded an unpreviewed task with safe cleanup', flush=True)
+
+            discarded = task()
+            discarded_id = discarded['id'][:8]
+            old_file = Path(discarded['isolatedSession']['file'])
+            old_history = old_file.read_bytes()
+            before = tasks()
+            pi.click('[ 任务历史 ]')
+            pi.click(f'[ {discarded_id} · 已放弃 · Worktree ]')
+            pi.until('历史对话 · 发送后在新 Worktree 继续')
+            pi.until('Open a task to discard.')
+            pi.send(b'!touch shell-from-history.txt\r')
+            pi.until('此处只查看历史')
+            assert not (local / 'shell-from-history.txt').exists() and tasks() == before
+            pi.click('[ 返回 Local ]')
+            pi.until('[ ] 新建 Worktree')
+            assert tasks() == before and old_file.read_bytes() == old_history
+            assert not list(history_views.glob('*.jsonl'))
+            pi.click('[ 任务历史 ]')
+            pi.click(f'[ {discarded_id} · 已放弃 · Worktree ]')
+            pi.until('历史对话 · 发送后在新 Worktree 继续')
+            old_file.unlink()
+            pi.send(b'Follow up from discard.\r')
+            pi.until('原 Pi 会话文件已不存在')
+            pi.until('Follow up from discard.')  # original draft restored
+            pi.until('历史对话 · 发送后在新 Worktree 继续')
+            assert tasks() == before
+            damaged = old_history + b'{partial record'
+            old_file.write_bytes(damaged)
+            pi.send(b'\r')
+            pi.until('原 Pi 会话内容已损坏')
+            assert tasks() == before and old_file.read_bytes() == damaged
+            without_newline = old_history.rstrip(b'\n')
+            old_file.write_bytes(without_newline)
+            pi.send(b'\r')
+            pi.until('Received follow-up with original context.', 35)
+            next_task = task()
+            assert tasks()[:-1] == before and next_task['followUpOf'] == discarded['id']
+            assert next_task['baseOid'] == follow_head and git('rev-parse', 'HEAD') == follow_head
+            assert old_file.read_bytes() == without_newline and not second_path.exists()
+            assert not (Path(next_task['isolatedPath']) / 'discard.txt').exists()
+            assert 'Follow up from discard.' not in Path(next_task['localSession']['file']).read_text()
+            print('real Pi: discarded history survived cleanup; missing source stopped safely and retried without sending to Local', flush=True)
 
         local = base / 'empty-local'
         local.mkdir()

@@ -18,6 +18,7 @@ export interface Task {
   isolated?: Checkout
   localSession: SessionLink
   isolatedSession?: SessionLink
+  followUpOf?: string
   review?: Review
   receipt?: PreviewReceipt
   // A null indexBefore explicitly records that no index file existed.
@@ -125,10 +126,15 @@ export class TaskStore {
     } finally { await rm(this.lockPath, { recursive: true }); await syncDir(this.directory) }
   }
 
-  async create(local: Checkout, localSession: SessionLink, createSession: (cwd: string, id: string) => Promise<SessionLink>): Promise<Task> {
+  async create(local: Checkout, localSession: SessionLink, createSession: (cwd: string, task: Task, prior?: Task) => Promise<SessionLink>, followUpOf?: string): Promise<Task> {
     return this.locked(async (state, save) => {
       if (!same(await checkout(local.root), local)) throw new Error('Local 身份已经变化。')
       if (state.tasks.some(t => t.local.root === local.root && (!terminal(t) || t.journal))) throw new Error('这个 Local 已有未完成的任务或恢复记录。')
+      const prior = followUpOf ? state.tasks.find(t => t.id === followUpOf) : undefined
+      if (followUpOf && (!prior || !terminal(prior) || prior.journal || !same(prior.local, local) ||
+          prior.isolatedSession?.cwd !== prior.isolatedPath || !prior.isolatedSession)) {
+        throw new Error('原任务不可续接，或不属于同一个 Local checkout。')
+      }
       await assertOrdinary(local)
       const localHeadRef = await normalRef(local.root)
       const baseOid = await out(local.root, ['rev-parse', '--verify', 'HEAD^{commit}'])
@@ -138,11 +144,17 @@ export class TaskStore {
       if (isolatedPath.startsWith(local.root + '/') || isolatedPath === local.root) throw new Error('Pi 数据目录不能位于当前仓库内。')
       await mkdir(this.worktrees, { recursive: true, mode: 0o700 })
       const task: Task = { id, phase: 'creating', baseOid, localHeadRef, local, isolatedPath, localSession }
+      if (prior) {
+        task.followUpOf = prior.id
+        // Pi can fork into a logical cwd that does not exist yet. If the source
+        // session is missing, fail before reserving the slot or creating a Worktree.
+        task.isolatedSession = await createSession(isolatedPath, task, prior)
+      }
       state.tasks.push(task)
       await save()
       await runGit(local.root, ['worktree', 'add', '--detach', '--', isolatedPath, baseOid])
       task.isolated = await checkout(isolatedPath)
-      task.isolatedSession = await createSession(isolatedPath, id)
+      task.isolatedSession ??= await createSession(isolatedPath, task)
       task.phase = 'working'
       await save()
       return task
