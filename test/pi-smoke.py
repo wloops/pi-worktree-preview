@@ -26,6 +26,9 @@ import { fileURLToPath } from 'node:url';
 export default function(pi) {
   const veto = fileURLToPath(new URL('./veto-switch', import.meta.url));
   pi.on('session_before_switch', () => existsSync(veto) ? { cancel: true } : undefined);
+  pi.registerCommand('smoke-session-id', {
+    handler: async (_args, ctx) => ctx.ui.notify(`Smoke session ${ctx.sessionManager.getSessionId()}`, 'info'),
+  });
   pi.registerProvider("wtp-smoke", {
     baseUrl: "http://127.0.0.1:1", apiKey: "offline-test", api: "wtp-stub",
     models: [{ id: "model", name: "Offline Smoke", reasoning: false, input: ["text"],
@@ -82,7 +85,7 @@ export default function(pi) {
 
 
 class Pi:
-    def __init__(self, cwd, agent, provider, theme='dark', cols=COLS, rows=ROWS):
+    def __init__(self, cwd, agent, provider, theme='dark', cols=COLS, rows=ROWS, session=None):
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         (agent / 'settings.json').write_text(json.dumps({'theme': theme}))
@@ -91,7 +94,8 @@ class Pi:
             os.chdir(cwd)
             os.environ.update(PI_CODING_AGENT_DIR=str(agent), TERM='xterm-256color', COLORTERM='truecolor')
             os.execvp('pi', ['pi', '--tui-mode', 'fullscreen', '-ne', '--no-mcp', '-ns', '-np', '-na',
-                             '--provider', 'wtp-smoke', '--model', 'model', '-e', str(ROOT / 'src/index.ts'), '-e', str(provider)])
+                             '--provider', 'wtp-smoke', '--model', 'model', '-e', str(ROOT / 'src/index.ts'), '-e', str(provider),
+                             *(['--session', str(session)] if session else [])])
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 
     def dump(self):
@@ -146,6 +150,10 @@ class Pi:
         self.send(f'\x1b[<0;{x};{y}M'.encode())
         time.sleep(.04)
         self.send(f'\x1b[<0;{x};{y}m'.encode())
+
+    def resize(self, cols, rows):
+        self.screen.resize(lines=rows, columns=cols)
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 
     def __enter__(self):
         return self
@@ -240,9 +248,39 @@ def main():
             assert (first_path / 'task.txt').read_text() == 'task edit\n'
             assert (local / 'task.txt').read_text() == 'base\n'
         print('real Pi: checkbox delayed creation; unchecked send stayed Local; checked draft sent only once in Worktree', flush=True)
+        origin = task()['localSession']['file']
+        with Pi(local, agent, provider) as unrelated:
+            before = tasks()
+            unrelated.until('[ ] 新建 Worktree')
+            assert '待验收' not in unrelated.dump() and '[ 预览到 Local ]' not in unrelated.dump()
+            unrelated.click('[ ] 新建 Worktree')
+            unrelated.until('[x] 新建 Worktree')
+            assert tasks() == before
+            unrelated.click('[x] 新建 Worktree')
+            unrelated.until('[ ] 新建 Worktree')
+            unrelated.send(b'/worktree-preview\r')
+            unrelated.until('Worktree 预览工作台')
+            assert '待验收' not in unrelated.dump() and '[ 进入 / 恢复 Worktree ]' not in unrelated.dump()
+            assert '[ 预览到 Local ]' not in unrelated.dump() and '[ 放弃任务 ]' not in unrelated.dump()
+            unrelated.until('[ 下次发送时新建 Worktree ]')
+            unrelated.send(b'\x1b')
+            unrelated.until_gone('Worktree 预览工作台')
+            unrelated.send(b'Local only.\r')
+            unrelated.until('Acknowledged without edits.')
+            assert tasks() == before
+        print('real Pi: fresh Local shows the create checkbox without exposing another session’s active task', flush=True)
         for theme, cols, rows in [('light', 110, 35), ('dark', 42, 11)]:
-            with Pi(local, agent, provider, theme, cols, rows) as pi:
-                pi.until('Local · 待验收')
+            with Pi(local, agent, provider, theme, cols, rows, session=origin) as pi:
+                pi.until('Local · Worktree 待验收')
+                action_x, action_y = pi.until('[ 预览到 Local ]')
+                assert '预览只写入 Local' not in pi.dump()
+                primary = pi.screen.buffer[action_y - 1][action_x - 1]
+                assert primary.bold and primary.bg == {'light': '274c97', 'dark': '305ba6'}[theme]
+                pi.click('[ 工作树操作 ]')
+                pi.until('Worktree 预览工作台')
+                pi.send(b'\r')  # Enter closes the menu by default.
+                pi.until_gone('Worktree 预览工作台')
+                assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'ready'
                 pi.click('[ 工作树操作 ]')
                 _, border_y = pi.until('╭───')
                 border_x = pi.screen.display[border_y - 1].index('╭')
@@ -254,14 +292,29 @@ def main():
                 cancel = pi.screen.buffer[cancel_y - 1]
                 assert cancel[border_x + 1].bg == cancel[right_x - 1].bg != 'default'
                 assert cancel[border_x + 1].bg != title[title_x - 1].bg
-                pi.click_at(border_x + 1, cancel_y)  # clicking the frame must not close the panel
-                pi.send(b'\x1b[A\x1b[A\r')
+                if cols == 42:
+                    pi.until('详情 1–')
+                    pi.click('详情 1–')
+                    pi.until_gone('详情 1–')
+                    pi.send(b'\x1b[5~')  # Page Up scrolls detail without moving the action selection.
+                    pi.until('详情 1–')
+                    pi.until('▸ [ 关闭 ]')
+                pi.click_at(border_x + 1, cancel_y)  # the frame is not a button
+                pi.click_at(right_x - 1, cancel_y)  # neither is the trailing space
+                for _ in range(3):
+                    pi.send(b'\x1b[A')
+                    pi.read()
+                    if '▸ [ 预览到 Local ]' in pi.dump():
+                        break
+                pi.until('▸ [ 预览到 Local ]')
+                pi.send(b'\r')
                 pi.until('确认：预览到 Local')
-                pi.click('[ 取消 ]')
+                pi.send(b'\r')  # Enter also cancels a confirmation by default.
+                pi.until_gone('确认：预览到 Local')
                 assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'ready'
-        print('real Pi: opaque framed panels with highlighted selection in light and narrow dark terminals', flush=True)
-        with Pi(local, agent, provider) as pi:
-            pi.until('Local · 待验收')
+        print('real Pi: phase and primary-action contrast, hit targets and keyboard cancellation in light and narrow dark terminals', flush=True)
+        with Pi(local, agent, provider, session=origin) as pi:
+            pi.until('Local · Worktree 待验收')
             pi.click('[ 工作树操作 ]')
             pi.click('[ 进入 / 恢复 Worktree ]')
             pi.until('Worktree · 待验收')
@@ -339,7 +392,7 @@ def main():
             pi.click('[ 执行预览到 Local ]')
             pi.until('Worktree · 已预览')
             pi.click('[ 打开 Local 检查 ]')
-            pi.until('Local · 已预览')
+            pi.until('Local · Worktree 已预览')
             pi.until('[ 撤回预览 ]')
             pi.until('[ 确认提交 ]')
             pi.click('[ 工作树操作 ]')
@@ -357,7 +410,7 @@ def main():
             pi.click('[ 提交并清理 Worktree（默认） ]')
             pi.until('未能安全清理 Worktree')
             pi.click('[ 保留 Worktree ]')
-            pi.until('Local · 已交付')
+            pi.until('Local · Worktree 已交付')
             assert git('show', '--format=', '--name-only') == 'task.txt'
             assert git('status', '--porcelain') == baseline
             assert task()['cleanup']['status'] == 'retained' and not task()['cleanup'].get('requested')
@@ -366,11 +419,18 @@ def main():
             delivered_head = git('rev-parse', 'HEAD')
             first_id = task()['id'][:8]
             def inspect_removal():
+                pi.click('[ 工作树操作 ]')
                 pi.click('[ 已保留的 Worktree ]')
                 pi.click(f'[ {first_id} · Isolated smoke change ]')
                 pi.click('[ 检查并清理… ]')
 
+            assert '[ 已保留的 Worktree ]' not in pi.dump()
+            pi.click('[ ] 新建 Worktree')
+            pi.until('[x] 新建 Worktree')
+            pi.click('[x] 新建 Worktree')
+            pi.until('[ ] 新建 Worktree')
             with Pi(local, agent, provider) as other:
+                other.click('[ 工作树操作 ]')
                 other.click('[ 已保留的 Worktree ]')
                 other.click(f'[ {first_id} · Isolated smoke change ]')
                 other.click('[ 恢复会话检查 ]')
@@ -380,8 +440,27 @@ def main():
                 assert first_path.is_dir()
                 other.click('[ 工作树操作 ]')
                 other.click('[ 返回 Local ]')
-                other.until('Local · 已交付')
+                other.until('Local · Worktree 已交付')
                 inspect_removal()
+                pi.until('强删将永久移除此目录')
+                pi.until('目标目录：')
+                pi.until(str(first_path)[:24])
+                pi.until('[ 确认强删 Worktree ]')
+                pi.resize(42, 8)
+                pi.until('终端太小 · Esc 关闭')
+                assert '[ 确认强删 Worktree ]' not in pi.dump()
+                pi.send(b'\x1b[A\r')  # Up + Enter cannot bypass a hidden warning/target.
+                pi.until_gone('终端太小 · Esc 关闭')
+                assert first_path.is_dir()
+                pi.resize(COLS, ROWS)
+                inspect_removal()
+                x, y = pi.until('[ 确认强删 Worktree ]')
+                pi.send(f'\x1b[<0;{x};{y}M'.encode())
+                pi.read(.2)
+                assert first_path.is_dir()
+                pi.send(f'\x1b[<32;{x};{y + 1}M\x1b[<0;{x};{y + 1}m'.encode())
+                pi.read(.2)
+                assert first_path.is_dir()
                 pi.click('[ 确认强删 Worktree ]')
             pi.until('Worktree 已删除')
             assert not first_path.exists()
@@ -423,11 +502,11 @@ def main():
             assert (follow_path / 'user.txt').read_text() == 'original\n' and not (follow_path / '.pi/loops.json').exists()
             pi.click('[ 工作树操作 ]')
             pi.click('[ 返回 Local ]')
-            pi.until('Local · 进行中')
+            pi.until('Local · Worktree 进行中')
             pi.click('[ 工作树操作 ]')
             pi.click('[ 放弃任务 ]')
             pi.click('[ 执行放弃任务 ]')
-            pi.until('Local · 已放弃')
+            pi.until('Local · Worktree 已放弃')
             assert not follow_path.exists()
             print('real Pi: history rendered before creating a Worktree; follow-up used HEAD at send time', flush=True)
 
@@ -440,11 +519,11 @@ def main():
             (second_path / 'discard.txt').write_text('discarded')
             pi.click('[ 工作树操作 ]')
             pi.click('[ 返回 Local ]')
-            pi.until('Local · 进行中')
+            pi.until('Local · Worktree 进行中')
             pi.click('[ 工作树操作 ]')
             pi.click('[ 放弃任务 ]')
             pi.click('[ 执行放弃任务 ]')
-            pi.until('Local · 已放弃')
+            pi.until('Local · Worktree 已放弃')
             assert not second_path.exists()
             assert not (local / 'discard.txt').exists()
             print('real Pi: discarded an unpreviewed task with safe cleanup', flush=True)
@@ -502,17 +581,34 @@ def main():
         index.unlink(missing_ok=True)  # Some Git versions materialize an empty index.
         (local / 'private.txt').write_text('untracked Local content\n')
         with Pi(local, agent, provider) as pi:
+            pi.until('[ ] 新建 Worktree')
+            pi.send(b'/smoke-session-id\r')
+            pi.until('Smoke session ')
+            original_id = re.search(r'Smoke session ([a-f0-9-]+)', pi.dump()).group(1)
+            before = tasks()
+            assert not list(agent.rglob(f'*{original_id}*.jsonl'))
+            veto = base / 'veto-switch'
+            veto.touch()
             pi.click('[ ] 新建 Worktree')
             pi.until('[x] 新建 Worktree')
             pi.send(kickoff.encode() + b'\r')
+            pi.until('Pi 取消了保存原 Local 会话')
+            assert tasks() == before and not list(agent.rglob(f'*{original_id}*.jsonl'))
+            assert kickoff in pi.dump()
+            veto.unlink()
+            pi.click('[ ] 新建 Worktree')
+            pi.until('[x] 新建 Worktree')
+            pi.send(b'\r')
             pi.until('Worktree ready.', 40)
+            assert task()['localSession']['id'] == original_id
+            assert kickoff not in Path(task()['localSession']['file']).read_text()
             pi.click('[ 预览到 Local ]')
             pi.click('[ 执行预览到 Local ]')
             pi.until('Worktree · 已预览')
             assert not index.exists()
             pi.click('[ 确认提交 ]')
             pi.click('[ 提交并保留 Worktree ]')
-            pi.until('Local · 已交付')
+            pi.until('Local · Worktree 已交付')
             assert index.is_file()
             assert git('rev-parse', 'HEAD^') == head
             assert git('show', '--format=', '--name-only') == 'task.txt'
@@ -527,6 +623,7 @@ def main():
         isolated_git_dir = Path(task()['isolated']['gitDir'])
         (isolated_git_dir / 'CHERRY_PICK_HEAD').write_text(head + '\n')
         with Pi(local, agent, provider) as pi:
+            pi.click('[ 工作树操作 ]')
             pi.click('[ 已保留的 Worktree ]')
             pi.click(f'[ {task_id} · Isolated smoke change ]')
             pi.click('[ 恢复会话检查 ]')
@@ -534,7 +631,7 @@ def main():
             pi.until('Worktree ready.')
             pi.click('[ 工作树操作 ]')
             pi.click('[ 返回 Local ]')
-            pi.until('Local · 已交付')
+            pi.until('Local · Worktree 已交付')
             print('real Pi: explicit retention with absent Local index; environment and session reopen after restart', flush=True)
 
         local = base / 'conflict-local'
@@ -563,7 +660,7 @@ def main():
             assert git('status', '--porcelain') == '?? untracked.txt'
             pi.click('[ 工作树操作 ]')
             pi.click('[ 返回 Local ]')
-            pi.until('Local · 待验收')
+            pi.until('Local · Worktree 待验收')
             pi.click('[ 预览到 Local ]')
             pi.click('[ 执行预览到 Local ]')
             pi.click('[ 让 Agent 解决冲突 ]')
@@ -579,6 +676,48 @@ def main():
             pi.until('Worktree · 已预览')
             assert (local / 'task.txt').read_text() == 'merged task\n'
             print('real Pi: cancelled conflict recovery, then approved from Local; Agent resolved in original Worktree and re-reviewed', flush=True)
+
+        local = base / 'parallel-local'
+        local.mkdir()
+        git('init', '-q', '-b', 'main')
+        git('config', 'user.name', 'Smoke Test')
+        git('config', 'user.email', 'smoke@example.invalid')
+        (local / 'task.txt').write_text('base\n')
+        git('add', '.')
+        git('commit', '-m', 'base')
+        with Pi(local, agent, provider) as first:
+            first.click('[ ] 新建 Worktree')
+            first.until('[x] 新建 Worktree')
+            first.send(kickoff.encode() + b'\r')
+            first.until('Worktree ready.', 40)
+            first_task = task()
+            first.click('[ 预览到 Local ]')
+            first.click('[ 执行预览到 Local ]')
+            first.until('Worktree · 已预览')
+            with Pi(local, agent, provider) as second:
+                second.click('[ ] 新建 Worktree')
+                second.until('[x] 新建 Worktree')
+                second.send(kickoff.encode() + b'\r')
+                second.until('Worktree ready.', 40)
+                second_task = task()
+                assert first_task['localSession']['id'] != second_task['localSession']['id']
+                assert first_task['isolatedPath'] != second_task['isolatedPath']
+                assert (local / 'task.txt').read_text() == 'task edit\n'
+                before = tasks()
+                second.click('[ 预览到 Local ]')
+                second.click('[ 执行预览到 Local ]')
+                second.until('正在预览另一个任务')
+                assert tasks() == before
+                first.click('[ 撤回预览 ]')
+                first.click('[ 执行撤回预览 ]')
+                first.until('Worktree · 待验收')
+                assert (local / 'task.txt').read_text() == 'base\n'
+                second.click('[ 预览到 Local ]')
+                second.click('[ 执行预览到 Local ]')
+                second.until('Worktree · 已预览')
+                assert task()['phase'] == 'previewed'
+                assert (local / 'task.txt').read_text() == 'task edit\n'
+        print('real Pi: parallel Worktrees from different Local sessions; Local preview held and released independently', flush=True)
 
 
 if __name__ == '__main__':

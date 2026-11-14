@@ -91,9 +91,21 @@ async function normalRef(root: string) {
 }
 
 function terminal(task: Task) { return task.phase === 'delivered' || task.phase === 'discarded' }
-function boundIsolatedSession(task: Task, session: SessionLink) {
-  const bound = task.isolatedSession
+function sameSession(bound: SessionLink | undefined, session: SessionLink) {
   return !!bound && bound.id === session.id && bound.file === session.file && bound.cwd === session.cwd
+}
+function boundIsolatedSession(task: Task, session: SessionLink) {
+  return sameSession(task.isolatedSession, session)
+}
+function assertLocalAcceptanceAvailable(state: State, task: Task, statePath: string) {
+  const peers = state.tasks.filter(peer => peer.id !== task.id &&
+    (peer.local.root === task.local.root || peer.local.gitDir === task.local.gitDir))
+  if (peers.some(peer => peer.journal && peer.journal.operation !== 'cleanup')) {
+    throw new Error(`此 Local 有未解决的写入恢复记录；已停止验收。检查 ${statePath}`)
+  }
+  if (peers.some(peer => peer.phase === 'previewed')) {
+    throw new Error('此 Local 正在预览另一个任务；请先在原任务会话撤回或确认提交，再重试。')
+  }
 }
 class CleanupDataLoss extends Error {}
 export class PreviewConflict extends Error {
@@ -147,7 +159,9 @@ export class TaskStore {
   async create(local: Checkout, localSession: SessionLink, createSession: (cwd: string, task: Task, prior?: Task) => Promise<SessionLink>, followUpOf?: string): Promise<Task> {
     return this.locked(async (state, save) => {
       if (!same(await checkout(local.root), local)) throw new Error('Local 身份已经变化。')
-      if (state.tasks.some(t => t.local.root === local.root && (!terminal(t) || t.journal))) throw new Error('这个 Local 已有未完成的任务或恢复记录。')
+      if (state.tasks.some(t => sameSession(t.localSession, localSession) && (!terminal(t) || t.journal))) {
+        throw new Error('此 Local 会话已有未完成的任务或恢复记录；可新开 Local 会话并行开发。')
+      }
       const prior = followUpOf ? state.tasks.find(t => t.id === followUpOf) : undefined
       if (followUpOf && (!prior || !terminal(prior) || prior.journal || !same(prior.local, local) ||
           prior.isolatedSession?.cwd !== prior.isolatedPath || !prior.isolatedSession)) {
@@ -165,7 +179,7 @@ export class TaskStore {
       if (prior) {
         task.followUpOf = prior.id
         // Pi can fork into a logical cwd that does not exist yet. If the source
-        // session is missing, fail before reserving the slot or creating a Worktree.
+        // session is missing, fail before recording the task or creating a Worktree.
         task.isolatedSession = await createSession(isolatedPath, task, prior)
       }
       state.tasks.push(task)
@@ -206,6 +220,7 @@ export class TaskStore {
       const task = state.tasks.find(t => t.id === id)
       if (!task || task.phase !== 'ready' || task.review?.id !== reviewId || task.receipt || task.journal || task.recovery ||
           !boundIsolatedSession(task, session)) throw new Error('待验收状态或隔离会话已变化，请重新预览。')
+      assertLocalAcceptanceAvailable(state, task, this.statePath)
       await this.validateLocal(task)
       await this.validateIsolated(task)
       const engine = this.engineFactory()
@@ -326,6 +341,9 @@ export class TaskStore {
       if (!task || task.journal || task.phase !== expected.phase || task.review?.id !== expected.reviewId || task.receipt?.previewId !== expected.previewId) {
         throw new Error(`任务状态已变化或存在恢复记录；操作已停止。${this.statePath}`)
       }
+      // The register lock covers this check through the Local write and receipt.
+      // Working/ready siblings and isolated-only cleanup never own this slot.
+      if (action !== 'discard') assertLocalAcceptanceAvailable(state, task, this.statePath)
       await this.validateLocal(task)
       const engine = this.engineFactory()
       try {

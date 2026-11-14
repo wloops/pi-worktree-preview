@@ -84,6 +84,46 @@ test('journaled preview, rollback, re-preview and task-only commit preserve Loca
   assert.equal(await exists(store.lockPath), false)
 })
 
+test('separate Local sessions develop in parallel but share one Local preview', async t => {
+  const f = await fixture(t)
+  const local = await checkout(f.local)
+  const secondSession = { cwd: f.local, id: 'second-local', file: join(f.dir, 'second-local.jsonl') }
+  const createSession = async (cwd: string, task: Task) => ({ cwd, id: task.id, file: join(f.dir, `${task.id}.jsonl`) })
+  await writeFile(join(f.isolated, 'task.txt'), 'first task\n')
+  await f.ready()
+  await f.act('preview', await f.latest())
+  // Creation and editing are independent of the current Local preview.
+  const second = await f.store.create(local, secondSession, createSession)
+  assert.notEqual(second.isolatedPath, f.isolated)
+  assert.equal(await content(second.isolatedPath, 'task.txt'), 'task.txt base\n')
+  await assert.rejects(f.store.create(local, secondSession, createSession), /此 Local 会话已有未完成/)
+  await writeFile(join(second.isolatedPath, 'second.txt'), 'second task\n')
+  const reviewed = await f.store.markReady(second.id, second.isolatedSession!, 'Second task only')
+  const secondPreview = () => f.store.act(second.id, 'preview', { phase: 'ready', reviewId: reviewed.id })
+  const state = await f.store.read()
+  await assert.rejects(secondPreview(), /正在预览另一个任务/)
+  assert.deepEqual(await f.store.read(), state)
+  assert.equal(await exists(join(f.local, 'second.txt')), false)
+  assert.equal(await content(f.local, 'task.txt'), 'first task\n')
+
+  // Both rollback and finalize release the slot for the next session.
+  await f.act('rollback', await f.latest())
+  const preview = await secondPreview()
+  await assert.rejects(f.act('preview', await f.latest()), /正在预览另一个任务/)
+  await f.act('discard', await f.latest()) // Does not alter the second preview.
+  assert.equal(await content(f.local, 'second.txt'), 'second task\n')
+  assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
+  await f.store.act(second.id, 'finalize', { phase: 'previewed', reviewId: reviewed.id, previewId: preview.receipt?.previewId })
+  assert.equal(await git(f.local, 'show', '--format=', '--name-only'), 'second.txt\n')
+
+  const third = await f.store.create(local, f.task.localSession, createSession)
+  assert.equal(await content(third.isolatedPath, 'second.txt'), 'second task\n')
+  await writeFile(join(third.isolatedPath, 'task.txt'), 'third task\n')
+  const thirdReview = await f.store.markReady(third.id, third.isolatedSession!, 'Third task only')
+  await f.store.act(third.id, 'preview', { phase: 'ready', reviewId: thirdReview.id })
+  assert.equal(await content(f.local, 'task.txt'), 'third task\n')
+})
+
 test('follow-up requires closed history for the same Local and takes the current branch HEAD', async t => {
   const f = await fixture(t)
   const fork = async (cwd: string, task: Task, prior?: Task) => {
@@ -483,6 +523,15 @@ test('durable pending write is seen before final revalidation and blocks auto-re
   const reopened = new TaskStore(f.store.directory)
   const blocked = (await reopened.read()).tasks[0]
   await assert.rejects(reopened.act(blocked.id, 'preview', { phase: 'ready', reviewId: blocked.review?.id }), /恢复记录/)
+  const sibling = await reopened.create(await checkout(f.local), { cwd: f.local, id: 'sibling', file: join(f.dir, 'sibling.jsonl') },
+    async cwd => ({ cwd, id: 'sibling-worktree', file: join(f.dir, 'sibling-worktree.jsonl') }))
+  await writeFile(join(sibling.isolatedPath, 'sibling.txt'), 'independent task\n')
+  const review = await reopened.markReady(sibling.id, sibling.isolatedSession!, 'Sibling change')
+  const before = await reopened.read()
+  await assert.rejects(reopened.act(sibling.id, 'preview', { phase: 'ready', reviewId: review.id }), /未解决的写入恢复记录/)
+  assert.deepEqual(await reopened.read(), before)
+  assert.equal(await exists(join(f.local, 'sibling.txt')), false)
+  assert.equal(await content(f.local, 'task.txt'), 'external edit before write\n')
 })
 
 test('nested patch paths cannot alias a root path even with diff.noPrefix', async t => {
