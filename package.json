@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Review isolated Git worktree changes in your original checkout from Pi",
   "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/wloops/pi-worktree-preview.git" },
   "type": "module",
   "keywords": ["pi-package", "git", "worktree"],
   "engines": { "node": ">=22.19.0" },

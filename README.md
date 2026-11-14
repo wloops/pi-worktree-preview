@@ -1,18 +1,22 @@
 # pi-worktree-preview
 
-在隔离的 Git Worktree 里用 Pi 完成任务，直接预览到原 checkout，再检查和验收。不需要复制文件、切换 Local 分支或手动暂存。
+在隔离的 Git Worktree 里用 Pi 并行开发，把改动直接预览到原 checkout，运行测试后再撤回或提交。不需要复制文件、切换 Local 分支或手动暂存。
+
+A Pi fullscreen extension for parallel Git worktrees and reversible previews in your original checkout. Develop in separate sessions, review one task at a time, and commit only its changes.
 
 ## 安装与试用
 
 需要 Pi 1.5.2 或兼容版本、较新的 Git（已验证 2.55）、支持鼠标的终端，以及有初始提交、位于普通分支的 Git checkout。请先配置 Git 提交身份（`user.name`、`user.email`）和 Pi 模型。
 
-从 npm 安装：
+从 GitHub 安装：
 
 ```sh
-pi install npm:pi-worktree-preview
+pi install git:github.com/wloops/pi-worktree-preview@v0.1.0
 cd /path/to/your/repo
 pi --tui-mode fullscreen
 ```
+
+该命令固定在 `v0.1.0`。想跟随默认分支，可去掉 `@v0.1.0`，后续通过 `pi update --extensions` 更新。当前尚未发布到 npm。
 
 若已经从源码目录安装过，请先用 `pi list` 和 `pi remove /path/to/pi-worktree-preview` 移除旧入口，避免同时加载两份扩展。源码开发时也可直接运行 `pi --tui-mode fullscreen -e /path/to/pi-worktree-preview/src/index.ts`。
 
