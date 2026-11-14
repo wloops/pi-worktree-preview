@@ -3,11 +3,13 @@ import { rgbColor, truncateToWidth, visibleWidth, type TuiMouseEvent } from '@ea
 import { Type } from 'typebox'
 import { randomUUID } from 'node:crypto'
 import { lstat, open, realpath } from 'node:fs/promises'
-import { isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { checkout, shortSessionName, TaskStore, type Action, type SessionLink, type Task } from './store.ts'
 
 const NAME = 'worktree-preview'
 const TOOL = 'worktree_ready_for_review'
+const REVISE = 'worktree_begin_revision'
+const guardedTools = new Set(['edit', 'write', 'bash', 'powershell', TOOL])
 const labels: Record<Action, string> = { preview: '预览到 Local', rollback: '撤回预览', finalize: '确认提交', discard: '放弃任务' }
 type MenuAction = Action | 'arm' | 'resume' | 'retained' | 'return' | 'mark' | 'close'
 const phases = { creating: '创建中断', working: '进行中', ready: '待验收', previewed: '已预览', delivered: '已交付', discarded: '已放弃' }
@@ -37,6 +39,32 @@ const retainedTasks = (tasks: Task[]) => tasks.filter(task =>
 const taskVersion = (task?: Task) => task && JSON.stringify([task.id, task.phase, task.review?.id, task.receipt?.previewId])
 async function existing(file: string) {
   try { return (await lstat(file)).isFile() } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false; throw e }
+}
+async function isWorktreePath(root: string, path: string) {
+  const within = (target: string) => {
+    const name = relative(root, target)
+    return !!name && name !== '..' && !name.startsWith(`..${sep}`) && !isAbsolute(name) && !name.toLowerCase().split(sep).includes('.git')
+  }
+  // Match Pi's leading @ and Unicode-space handling. Require a path rather
+  // than Pi's optional home-relative or file-URL forms for mutators.
+  const normalized = path.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, ' ').replace(/^@/, '')
+  if (normalized === '~' || normalized.startsWith('~/') || normalized.startsWith('file://')) return false
+  let target = resolve(root, normalized)
+  if (!within(target)) return false
+  let checkingParent = false
+  for (;;) {
+    try {
+      const actual = await realpath(target)
+      return (checkingParent && actual === root) || within(actual)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      // A dangling symlink is not a new file. Never authorize writes through it.
+      try { await lstat(target); return false } catch (e) { if ((e as NodeJS.ErrnoException).code !== 'ENOENT') throw e }
+      if (target === root) return false
+      target = dirname(target)
+      checkingParent = true
+    }
+  }
 }
 async function newSession(cwd: string, name: string, sessionDir?: string): Promise<SessionLink> {
   // Native Pi creates files lazily. Reserve its allocated path and let SessionManager.open
@@ -81,8 +109,19 @@ const darkPanel = {
 const selectedFg = rgbColor(255, 255, 255)
 
 interface Choice<T> { label: string; value: T }
-async function pick<T>(ctx: ExtensionContext, title: string, detail: string[], choices: Choice<T>[]): Promise<T | undefined> {
+async function pick<T>(ctx: ExtensionContext, title: string, detail: string[], choices: Choice<T>[], signal?: AbortSignal): Promise<T | undefined> {
+  if (signal?.aborted) return
   return ctx.ui.custom<T | undefined>((tui, theme, keys, done) => {
+    let finished = false
+    const finish = (value: T | undefined) => {
+      if (finished) return
+      finished = true
+      signal?.removeEventListener('abort', cancel)
+      done(value)
+    }
+    const cancel = () => finish(undefined)
+    signal?.addEventListener('abort', cancel, { once: true })
+    if (signal?.aborted) cancel()
     // Paint the whole card, including padding, so transcript tool backgrounds never
     // show through. Use paired colors that remain readable in both Pi appearances.
     const palette = () => theme.appearance === 'light' ? lightPanel : darkPanel
@@ -94,6 +133,7 @@ async function pick<T>(ctx: ExtensionContext, title: string, detail: string[], c
     let hitInset = 0
     const move = (delta: number) => { selected = (selected + delta + choices.length) % choices.length; tui.requestRender() }
     return {
+      dispose: cancel,
       invalidate() {},
       render(width: number) {
         const { surface, header, edge, text, secondary, selectedBg } = palette()
@@ -137,17 +177,17 @@ async function pick<T>(ctx: ExtensionContext, title: string, detail: string[], c
         return lines
       },
       handleInput(data: string) {
-        if (keys.matches(data, 'tui.select.cancel')) done(undefined)
+        if (keys.matches(data, 'tui.select.cancel')) cancel()
         else if (keys.matches(data, 'tui.select.up')) move(-1)
         else if (keys.matches(data, 'tui.select.down')) move(1)
-        else if (keys.matches(data, 'tui.select.confirm')) done(choices[selected].value)
+        else if (keys.matches(data, 'tui.select.confirm')) finish(choices[selected].value)
       },
       handleMouse(event: TuiMouseEvent) {
         if (event.type === 'wheel' && event.wheelDelta) { move(Math.sign(event.wheelDelta)); return { handled: true } }
         const index = event.y - start
         if (event.button !== 'left' || index < 0 || index >= rows || event.x < hitInset || event.x >= hitWidth - hitInset) return
         if (event.type === 'press') return { handled: true, render: false }
-        if (event.type === 'click') { done(choices[first + index].value); return { handled: true } }
+        if (event.type === 'click') { finish(choices[first + index].value); return { handled: true } }
       },
     }
   }, { overlay: true, overlayOptions: { anchor: 'center', width: 76, margin: 1 }, blocked: { kind: 'question', message: clean(title) } })
@@ -187,6 +227,7 @@ export default function extension(pi: ExtensionAPI) {
   let activeHold: { data: TaskStore; id: string } | undefined
   let pendingHold: { data: TaskStore; id: string } | undefined
   let incomingHoldFailed = false
+  let revisionStopped = false
 
   async function context(ctx: ExtensionContext) {
     const data = store ??= new TaskStore(join(await realpath(getAgentDir()), NAME))
@@ -206,7 +247,7 @@ export default function extension(pi: ExtensionAPI) {
     const state = await context(ctx)
     if (!state.local && !state.isolated) { ctx.ui.setWidget(NAME, undefined); return }
     const active = currentTask(state.isolated, state.tasks)
-    const direct: Choice<MenuAction>[] = deliveryChoices(active, !state.isolated || isBoundSession(ctx, active?.isolatedSession))
+    const direct: Choice<MenuAction>[] = deliveryChoices(active, !state.isolated || isBoundSession(ctx, state.isolated.isolatedSession))
     if (state.isolated && active?.phase === 'previewed' && !active.journal) direct.unshift(localCheck)
     if (retainedTasks(state.tasks).length) direct.push(retainedChoice)
     const scope = state.isolated ? 'Worktree' : 'Local'
@@ -327,18 +368,85 @@ export default function extension(pi: ExtensionAPI) {
     return { action: 'handled' }
   })
   pi.on('before_agent_start', async (event, ctx) => {
+    revisionStopped = false
     const state = await context(ctx).catch(() => undefined)
     const task = state?.isolated
-    if (!task || task.isolatedSession?.id !== ctx.sessionManager.getSessionId()) return
-    const guidance = task.phase === 'previewed'
-      ? 'Local has an active preview. Discuss the changes without modifying files. If more edits are needed, ask the user to click 撤回预览 first; do not roll back yourself.'
-      : task.phase === 'delivered' || task.phase === 'discarded'
-        ? 'This task is closed. Use this environment for inspection only; do not mark it ready again. Ask the user to start a new task from Local for further edits.'
-        : `After completing and verifying the requested task, call ${TOOL} with a short commit title. After marking ready, do not modify the worktree unless the user asks for more work.`
-    return { systemPrompt: `${event.systemPrompt}\n\nThis is a managed isolated Git worktree. Work only in the active cwd; do not write to Local or deliver changes yourself. ${guidance} The user alone controls preview, rollback, delivery and discard.` }
+    if (!task) return
+    const canWork = isBoundSession(ctx, task.isolatedSession) && !task.journal && ['working', 'ready', 'previewed'].includes(task.phase)
+    const guidance = canWork
+      ? `Status at the start of this request: ${task.phase}. For questions, explanations, and discussion, use read-only tools; do not invalidate a review or ask to roll back. If the user actually requests changes after a review was marked ready (including when a Local preview is active), call ${REVISE} alone before editing or running shell commands. The tool handles any required user confirmation. Wait for its success, then implement the existing request yourself in this Worktree, in the same turn, without asking the user to repeat it. If cancelled or unsuccessful, do not edit or retry unless asked again. After completing and verifying the edits, call ${TOOL} with a short commit title and stop editing.`
+      : 'This session or task is not editable. Use it for inspection only; do not modify files or mark it ready.'
+    return { systemPrompt: `${event.systemPrompt}\n\nThis is a managed isolated Git worktree. Work only in the active Worktree cwd. ${guidance} Do not write to Local yourself; the user alone controls preview, rollback, delivery and discard.` }
+  })
+  // Shell cannot be reliably classified as read-only. Keep built-in mutators
+  // behind the revision step, including sibling calls while confirmation is open.
+  pi.on('tool_call', async (event, ctx) => {
+    if ((!guardedTools.has(event.toolName) && event.toolName !== REVISE) || (!activeHold && !incomingHoldFailed)) return
+    const assistant = ctx.sessionManager.getBranch().reverse().find(entry => entry.type === 'message' && entry.message.role === 'assistant')
+    const calls = assistant?.type === 'message' && assistant.message.role === 'assistant'
+      ? assistant.message.content.filter(part => part.type === 'toolCall') : []
+    if ((calls.length > 1 && calls.some(call => call.name === TOOL || call.name === REVISE)) ||
+        (event.parentToolCallId && (event.toolName === TOOL || event.toolName === REVISE))) {
+      return { block: true, reason: `${REVISE} 和 ${TOOL} 都必须单独调用，不可与其他工具批量执行。` }
+    }
+    if (event.toolName === REVISE) return
+    const state = await context(ctx)
+    const task = state.isolated
+    if (task?.phase === 'working' && !task.journal && !revisionStopped && !incomingHoldFailed && isBoundSession(ctx, task.isolatedSession)) {
+      if ((event.toolName === 'edit' || event.toolName === 'write') &&
+          (typeof event.input.path !== 'string' || !await isWorktreePath(task.isolatedPath, event.input.path))) {
+        return { block: true, reason: '只允许编辑当前 Worktree 内的文件。' }
+      }
+      return
+    }
+    const reason = !revisionStopped && task && !task.journal && isBoundSession(ctx, task.isolatedSession) && ['ready', 'previewed'].includes(task.phase)
+      ? `当前处于验收阶段。如果用户要求改动，先单独调用 ${REVISE}；如果只是讨论，请用只读工具。`
+      : '当前会话不允许编辑或执行 shell；请勿绕过。'
+    return { block: true, reason }
   })
   pi.registerTool({
-    name: TOOL, label: '标记待验收', description: 'Mark the current managed Worktree ready for user review. Does not write to Local or commit. Call after edits and tests.',
+    name: REVISE, label: '开始返修', executionMode: 'sequential',
+    description: 'Only when the user requests edits to a reviewed Worktree, call this alone before changing files or using shell. If there is a Local preview, wait for a user click to roll it back. On success continue the existing request in the same turn; on failure do not edit or ask again. Not for discussion.',
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _update, ctx) {
+      const result = (ok: boolean, text: string) => ({ content: [{ type: 'text' as const, text }], details: { ok }, isError: !ok })
+      if (busy || revisionStopped) return result(false, '不能开始返修。请勿编辑，也不要在本轮重试。')
+      busy = true
+      try {
+        signal?.throwIfAborted()
+        const { isolated: task, data } = await context(ctx)
+        const link = sessionLink(ctx)
+        if (incomingHoldFailed || !task || !link || !isBoundSession(ctx, task.isolatedSession) || task.journal ||
+            !task.review || (task.phase !== 'ready' && (task.phase !== 'previewed' || !task.receipt))) {
+          throw new Error('当前不在可返修的 Worktree 验收状态。')
+        }
+        if (task.phase === 'ready') {
+          await data.continueEditing(task.id, link, task.review.id, signal)
+        } else {
+          if (ctx.mode !== 'tui' || !ctx.hasUI) throw new Error('需要在 Pi TUI 由用户确认撤回。')
+          const confirmed = await pick(ctx, '返修前需撤回 Local 预览', [
+            '恢复 Local 的预览改动后，Agent 会接着处理刚才的要求。',
+            '如 Local 的预览文件已被修改，将停止并保留现场。',
+            ...pathLines(task.local.root),
+          ], [{ label: '撤回预览，继续返修', value: true }, { label: '取消', value: false }], signal)
+          signal?.throwIfAborted()
+          if (!confirmed) throw new Error('用户取消了撤回，预览保留。')
+          await data.act(task.id, 'rollback', {
+            phase: task.phase, reviewId: task.review.id, previewId: task.receipt?.previewId, revision: { session: link, signal },
+          })
+        }
+        return result(true, '已进入返修。请现在继续处理用户刚才的修改要求，只改本 Worktree，验证后重新标记待验收。')
+      } catch (error) {
+        revisionStopped = true
+        return result(false, `${message(error)} 不要编辑，也不要在本轮重试。`)
+      } finally {
+        busy = false
+        await refresh(ctx).catch(() => {})
+      }
+    },
+  })
+  pi.registerTool({
+    name: TOOL, label: '标记待验收', executionMode: 'sequential', description: 'Mark the current managed Worktree ready for user review. Does not write to Local or commit. Call after edits and tests.',
     parameters: Type.Object({ commitMessage: Type.String({ description: 'A one-line commit title (1–200 characters).' }) }),
     async execute(_id, params, signal, _update, ctx) {
       if (signal?.aborted) throw new Error('已取消。')

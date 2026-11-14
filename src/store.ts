@@ -82,6 +82,10 @@ async function normalRef(root: string) {
 }
 
 function terminal(task: Task) { return task.phase === 'delivered' || task.phase === 'discarded' }
+function boundIsolatedSession(task: Task, session: SessionLink) {
+  const bound = task.isolatedSession
+  return !!bound && bound.id === session.id && bound.file === session.file && bound.cwd === session.cwd
+}
 class CleanupDataLoss extends Error {}
 function engineError(result: { error: { message: string } }): never { throw new Error(result.error.message) }
 
@@ -172,8 +176,7 @@ export class TaskStore {
     if (!title || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) throw new Error('请提供 1–200 字符的单行提交说明。')
     return this.locked(async (state, save) => {
       const task = state.tasks.find(t => t.id === id)
-      if (!task || task.journal || !['working', 'ready'].includes(task.phase) || !task.isolatedSession ||
-          task.isolatedSession.id !== session.id || task.isolatedSession.file !== session.file || task.isolatedSession.cwd !== session.cwd) {
+      if (!task || task.journal || !['working', 'ready'].includes(task.phase) || !boundIsolatedSession(task, session)) {
         throw new Error('当前不是可标记待验收的隔离会话。')
       }
       await this.validateIsolated(task)
@@ -188,6 +191,20 @@ export class TaskStore {
     })
   }
 
+  async continueEditing(id: string, session: SessionLink, reviewId: string, signal?: AbortSignal): Promise<void> {
+    await this.locked(async (state, save) => {
+      const task = state.tasks.find(t => t.id === id)
+      if (!task || task.phase !== 'ready' || task.review?.id !== reviewId || task.receipt || task.journal || !boundIsolatedSession(task, session)) {
+        throw new Error('待验收状态或隔离会话已变化，不能继续修改。')
+      }
+      await this.validateIsolated(task)
+      signal?.throwIfAborted()
+      delete task.review
+      task.phase = 'working'
+      await save()
+    })
+  }
+
   async discardFingerprint(task: Task): Promise<string> {
     await this.validateIsolated(task)
     const inspected = await this.engineFactory().inspectReview(this.input(task))
@@ -198,6 +215,7 @@ export class TaskStore {
   /** Expected tokens tie the confirmation to the state that the user actually saw. */
   async act(id: string, action: Action, expected: {
     phase: Phase; reviewId?: string; previewId?: string; discardFingerprint?: string; keepWorktree?: boolean
+    revision?: { session: SessionLink; signal?: AbortSignal }
   }): Promise<Task> {
     return this.locked(async (state, save) => {
       const task = state.tasks.find(t => t.id === id)
@@ -243,15 +261,28 @@ export class TaskStore {
           delete task.journal
           await save()
         } else if (action === 'rollback' && task.phase === 'previewed' && task.receipt) {
+          const revision = expected.revision
+          if (revision) {
+            if (!task.review || !boundIsolatedSession(task, revision.session)) throw new Error('待验收状态或隔离会话已变化，不能继续修改。')
+            await this.validateIsolated(task)
+            revision.signal?.throwIfAborted()
+          }
           const rolled = await engine.rollback({ localPath: task.local.root, receipt: task.receipt, beforeWrite: async () => {
             await this.validateLocal(task)
+            if (revision) {
+              await this.validateIsolated(task)
+              revision.signal?.throwIfAborted()
+            }
             task.journal = { operation: 'rollback', at: Date.now() }
             await save()
           } })
           if (rolled.status === 'error') engineError(rolled)
           delete task.receipt
           delete task.journal
-          task.phase = 'ready'
+          if (revision) {
+            delete task.review
+            task.phase = 'working'
+          } else task.phase = 'ready'
           await save()
           await this.unpin(task).catch(() => {})
         } else if (action === 'finalize' && task.phase === 'previewed' && task.receipt && task.review) {

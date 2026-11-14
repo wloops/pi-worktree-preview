@@ -33,8 +33,8 @@ async function fixture(t: TestContext, engine?: typeof createSessionCheckoutAppl
     async cwd => ({ cwd, id: 'isolated', file: join(dir, 'isolated.jsonl') }))
   const isolated = task.isolatedPath
   const latest = async () => (await store.read()).tasks[0]
-  const act = async (action: Parameters<TaskStore['act']>[1], current: Task) => store.act(task.id, action, {
-    phase: current.phase, reviewId: current.review?.id, previewId: current.receipt?.previewId,
+  const act = async (action: Parameters<TaskStore['act']>[1], current: Task, revision?: Parameters<TaskStore['act']>[2]['revision']) => store.act(task.id, action, {
+    phase: current.phase, reviewId: current.review?.id, previewId: current.receipt?.previewId, revision,
     discardFingerprint: action === 'discard' ? await store.discardFingerprint(current) : undefined,
   })
   const ready = () => store.markReady(task.id, task.isolatedSession!, 'Task only')
@@ -64,7 +64,9 @@ test('journaled preview, rollback, re-preview and task-only commit preserve Loca
   assert.equal(await content(local, 'task.txt'), 'task change\n')
   assert.deepEqual(await readFile(join(local, 'bin.dat')), Buffer.from([0, 1, 0xff, 0x80]))
   assert.match(await git(local, 'for-each-ref', 'refs/pi-worktree-preview'), /snapshot-0/)
-  await act('rollback', await latest())
+  const rolled = await act('rollback', await latest())
+  assert.equal(rolled.phase, 'ready')
+  assert.equal(rolled.review?.id, preview.review?.id)
   assert.equal(await git(local, 'status', '--porcelain=v1'), status)
   assert.equal(await git(local, 'diff'), unstaged)
   assert.equal(await git(local, 'diff', '--cached'), staged)
@@ -80,6 +82,50 @@ test('journaled preview, rollback, re-preview and task-only commit preserve Loca
   assert.equal(await git(local, 'diff'), unstaged)
   assert.equal(await content(local, 'user.txt'), 'untracked content\n')
   assert.equal(await exists(store.lockPath), false)
+})
+
+test('continuing edits invalidates only the matching review, with or without a prior preview', async t => {
+  const f = await fixture(t)
+  const session = f.task.isolatedSession!
+  await writeFile(join(f.isolated, 'task.txt'), 'first revision\n')
+  const old = await f.ready()
+  const ready = await f.latest()
+  await assert.rejects(f.store.continueEditing(f.task.id, f.task.localSession, old.id), /不能继续修改/)
+  await assert.rejects(f.store.continueEditing(f.task.id, session, 'stale'), /不能继续修改/)
+  const signal = AbortSignal.abort(new Error('cancelled revision'))
+  await assert.rejects(f.store.continueEditing(f.task.id, session, old.id, signal), /cancelled revision/)
+  assert.equal((await f.latest()).review?.id, old.id)
+  await f.store.continueEditing(f.task.id, session, old.id)
+  assert.equal((await f.latest()).phase, 'working')
+  assert.equal((await f.latest()).review, undefined)
+  assert.equal(await content(f.isolated, 'task.txt'), 'first revision\n')
+  assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
+  await assert.rejects(f.act('preview', ready), /任务状态已变化/)
+
+  await writeFile(join(f.isolated, 'task.txt'), 'second revision\n')
+  const current = await f.ready()
+  assert.notEqual(current.id, old.id)
+  const preview = await f.act('preview', await f.latest())
+  await assert.rejects(f.store.continueEditing(f.task.id, session, current.id), /不能继续修改/)
+  await assert.rejects(f.act('rollback', preview, { session: f.task.localSession }), /不能继续修改/)
+  await assert.rejects(f.act('rollback', preview, { session, signal }), /cancelled revision/)
+  assert.equal(await content(f.local, 'task.txt'), 'second revision\n')
+  assert.equal((await f.latest()).journal, undefined)
+  await writeFile(join(f.local, 'task.txt'), 'user edit after preview\n')
+  await assert.rejects(f.act('rollback', preview, { session }), /预览路径自预览后已变化.*task\.txt/)
+  assert.equal((await f.latest()).phase, 'previewed')
+  assert.equal((await f.latest()).review?.id, current.id)
+  assert.equal((await f.latest()).receipt?.previewId, preview.receipt?.previewId)
+  assert.equal(await content(f.local, 'task.txt'), 'user edit after preview\n')
+  await writeFile(join(f.local, 'task.txt'), 'second revision\n')
+  const working = await f.act('rollback', await f.latest(), { session })
+  assert.equal(working.phase, 'working')
+  assert.equal(working.review, undefined)
+  assert.equal(working.receipt, undefined)
+  assert.equal(working.journal, undefined)
+  assert.equal(await content(f.isolated, 'task.txt'), 'second revision\n')
+  assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
 })
 
 test('conflict and stale ready snapshot do not change Local', async t => {

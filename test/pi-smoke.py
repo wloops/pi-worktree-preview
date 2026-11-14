@@ -35,14 +35,32 @@ export default function(pi) {
       const last = context.messages.at(-1);
       const task = context.messages.findLast(message => message.role === "user")?.content;
       const text = typeof task === "string" ? task : task?.find(part => part.type === "text")?.text;
-      const step = last?.role !== "toolResult" ? (text === "Local only." || text === "Open a task to discard." ? 3 : 0) : last.toolName === "bash" ? 1 : 2;
-      const tool = step === 0 ? {type:"toolCall",id:"test_bash",name:"bash",arguments:{command:"printf 'task edit\\\\n' > task.txt"}} :
-        {type:"toolCall",id:"test_ready",name:"worktree_ready_for_review",arguments:{commitMessage:"Isolated smoke change"}};
-      const msg = {role:"assistant", content: step < 2 ? [tool] : [{type:"text",text:step === 3 ? "Acknowledged without edits." : "Worktree ready."}],
-        api:model.api, provider:model.provider, model:model.id, stopReason:step < 2 ? "toolUse" : "stop",
+      const tool = (name, args = {}) => ({type:"toolCall",id:`test_${name}`,name,arguments:args});
+      const say = (text) => [{type:"text",text}];
+      const revision = text?.startsWith("Revise ");
+      const revise = () => tool("worktree_begin_revision");
+      const badWrite = () => tool("write", {path:"forbidden.txt",content:"must not be written"});
+      const edit = () => tool("bash", {command:`printf '${revision ? (text === "Revise before preview." ? "ready revision" : "previewed revision") : "task edit"}\\\\n' > task.txt`});
+      let content;
+      if (last?.role === "toolResult") {
+        switch (last.toolName) {
+          case "bash": content = [tool("worktree_ready_for_review", {commitMessage:"Isolated smoke change"})]; break;
+          case "read": content = say("Explained without edits."); break;
+          case "write": content = say(last.isError ? "Write was blocked." : "Unexpected write."); break;
+          case "worktree_begin_revision": content = last.isError ? say(text === "Revise after Local drift." ? "Revision blocked by Local drift." : "Revision stopped.") : [edit()]; break;
+          default: content = say(revision ? "Revision ready." : "Worktree ready.");
+        }
+      } else if (revision) content = [revise()];
+      else if (text === "Try a parallel write.") content = [revise(), badWrite()];
+      else if (text === "Try to write during review.") content = [badWrite()];
+      else if (text === "Explain the change.") content = [tool("read", {path:"task.txt"})];
+      else if (text === "Local only." || text === "Open a task to discard.") content = say("Acknowledged without edits.");
+      else content = [edit()];
+      const tools = content[0].type === "toolCall";
+      const msg = {role:"assistant", content, api:model.api, provider:model.provider, model:model.id, stopReason:tools ? "toolUse" : "stop",
         usage:{input:1,output:1,cacheRead:0,cacheWrite:0,totalTokens:2,cost:{input:0,output:0,cacheRead:0,cacheWrite:0,total:0}},timestamp:Date.now()};
       queueMicrotask(() => { stream.push({type:"start",partial:msg});
-        if (step < 2) stream.push({type:"toolcall_end",contentIndex:0,toolCall:tool,partial:msg});
+        if (tools) content.forEach((toolCall,contentIndex) => stream.push({type:"toolcall_end",contentIndex,toolCall,partial:msg}));
         stream.push({type:"done",reason:msg.stopReason,message:msg}); stream.end(); });
       return stream;
     }
@@ -227,16 +245,66 @@ def main():
                 pi.click('[ 取消 ]')
                 assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'ready'
         print('real Pi: opaque framed panels with highlighted selection in light and narrow dark terminals', flush=True)
-        for root, value in [(local, 'Local loop'), (first_path, 'Worktree loop')]:
-            (root / '.pi').mkdir(exist_ok=True)
-            (root / '.pi/loops.json').write_text(value)
-        baseline = git('status', '--porcelain')
         with Pi(local, agent, provider) as pi:
             pi.until('Local · 待验收')
             pi.click('[ 工作树操作 ]')
             pi.click('[ 进入 / 恢复 Worktree ]')
             pi.until('Worktree · 待验收')
             pi.until('Worktree ready.')
+            review_id = task()['review']['id']
+            isolated_session = Path(task()['isolatedSession']['file'])
+            pi.send(b'Explain the change.\r')
+            pi.until('Explained without edits.')
+            assert task()['review']['id'] == review_id
+            pi.send(b'Try a parallel write.\r')
+            pi.until('Write was blocked.')
+            assert task()['review']['id'] == review_id and not (first_path / 'forbidden.txt').exists()
+            pi.send(b'Revise before preview.\r')
+            pi.until('Revision ready.')
+            assert '返修前需撤回 Local 预览' not in pi.dump()
+            assert task()['phase'] == 'ready' and task()['review']['id'] != review_id
+            assert (first_path / 'task.txt').read_text() == 'ready revision\n'
+            assert (local / 'task.txt').read_text() == 'base\n'
+            pi.click('[ 预览到 Local ]')
+            pi.click('[ 执行预览到 Local ]')
+            pi.until('Worktree · 已预览')
+            preview_task = task()
+            pi.send(b'Try to write during review.\r')
+            pi.until('Write was blocked.')
+            assert task() == preview_task and not (first_path / 'forbidden.txt').exists()
+
+            pi.send(b'Revise but cancel.\r')
+            pi.until('返修前需撤回 Local 预览')
+            assert task() == preview_task and (local / 'task.txt').read_text() == 'ready revision\n'
+            pi.click('[ 取消 ]')
+            pi.until('Revision stopped.')
+            assert task() == preview_task and (first_path / 'task.txt').read_text() == 'ready revision\n'
+
+            (local / 'task.txt').write_text('Local user edit\n')
+            pi.send(b'Revise after Local drift.\r')
+            pi.click('[ 撤回预览，继续返修 ]')
+            pi.until('Revision blocked by Local drift.')
+            assert task() == preview_task and (first_path / 'task.txt').read_text() == 'ready revision\n'
+            assert (local / 'task.txt').read_text() == 'Local user edit\n'
+            (local / 'task.txt').write_text('ready revision\n')
+
+            pi.send(b'Revise after preview.\r')
+            pi.click('[ 撤回预览，继续返修 ]')
+            # No second user message: the blocked tool returns to the same agent run.
+            pi.until('Worktree · 待验收', 35)
+            assert task()['review']['id'] != preview_task['review']['id'] and 'receipt' not in task()
+            assert (local / 'task.txt').read_text() == 'base\n'
+            assert (first_path / 'task.txt').read_text() == 'previewed revision\n'
+            requests = [entry['message'] for line in isolated_session.read_text().splitlines()
+                        if (entry := json.loads(line)).get('message', {}).get('role') == 'user']
+            assert [m['content'][0]['text'] for m in requests].count('Revise after preview.') == 1
+            assert requests[-1]['content'][0]['text'] == 'Revise after preview.'
+            print('real Pi: discussion keeps review; revisions resume the same agent turn; rollback cancellation preserves preview', flush=True)
+
+            for root, value in [(local, 'Local loop'), (first_path, 'Worktree loop')]:
+                (root / '.pi').mkdir(exist_ok=True)
+                (root / '.pi/loops.json').write_text(value)
+            baseline = git('status', '--porcelain')
             pi.click('[ 预览到 Local ]')
             pi.until('确认：预览到 Local')
             pi.click('[ 取消 ]')
@@ -245,7 +313,7 @@ def main():
             pi.click('[ 预览到 Local ]')
             pi.click('[ 执行预览到 Local ]')
             pi.until('Worktree · 已预览')
-            assert (local / 'task.txt').read_text() == 'task edit\n'
+            assert (local / 'task.txt').read_text() == 'previewed revision\n'
             assert git('rev-parse', 'HEAD') == head
             (local / '.pi/loops.json').write_text('Local loop edited after preview')
             pi.click('[ 撤回预览 ]')
