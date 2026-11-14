@@ -21,7 +21,11 @@ COLS, ROWS = 110, 35
 # Use a deterministic offline provider, but run the real agent, bash tool, and review tool.
 PROVIDER = '''
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 export default function(pi) {
+  const veto = fileURLToPath(new URL('./veto-switch', import.meta.url));
+  pi.on('session_before_switch', () => existsSync(veto) ? { cancel: true } : undefined);
   pi.registerProvider("wtp-smoke", {
     baseUrl: "http://127.0.0.1:1", apiKey: "offline-test", api: "wtp-stub",
     models: [{ id: "model", name: "Offline Smoke", reasoning: false, input: ["text"],
@@ -51,11 +55,12 @@ class Pi:
     def __init__(self, cwd, agent, provider, theme='dark', cols=COLS, rows=ROWS):
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
+        (agent / 'settings.json').write_text(json.dumps({'theme': theme}))
         self.pid, self.fd = pty.fork()
         if not self.pid:
             os.chdir(cwd)
             os.environ.update(PI_CODING_AGENT_DIR=str(agent), TERM='xterm-256color', COLORTERM='truecolor')
-            os.execvp('pi', ['pi', '--tui-mode', 'fullscreen', '--theme', theme, '-ne', '--no-mcp', '-ns', '-np', '-na',
+            os.execvp('pi', ['pi', '--tui-mode', 'fullscreen', '-ne', '--no-mcp', '-ns', '-np', '-na',
                              '--provider', 'wtp-smoke', '--model', 'model', '-e', str(ROOT / 'src/index.ts'), '-e', str(provider)])
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 
@@ -73,9 +78,25 @@ class Pi:
         while time.monotonic() < end:
             for y, line in enumerate(self.screen.display):
                 if text in line:
-                    return line.index(text) + 1, y + 1
+                    # pyte.display omits trailing cells of wide glyphs. Translate
+                    # the string index back to a terminal column for SGR mouse events.
+                    remaining = line.index(text)
+                    for x in range(self.screen.columns):
+                        cell = self.screen.buffer[y][x].data
+                        if remaining == 0 and cell:
+                            return x + 1, y + 1
+                        remaining -= len(cell)
+                    raise AssertionError(f'No terminal cell for {text!r}')
             self.read()
         raise AssertionError(f'Missing {text!r}:\n{self.dump()}')
+
+    def until_gone(self, text, timeout=20):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if text not in self.dump():
+                return
+            self.read()
+        raise AssertionError(f'Still showing {text!r}:\n{self.dump()}')
 
     def send(self, data):
         os.write(self.fd, data)
@@ -134,7 +155,6 @@ def main():
         (local / 'user.txt').write_text('staged by user\n')
         git('add', 'user.txt')
         (local / 'user.txt').write_text('edited by user\n')
-        baseline = git('status', '--porcelain')
         state_path = agent / 'worktree-preview/tasks.json'
 
         def task():
@@ -187,7 +207,7 @@ def main():
                 right_x = pi.screen.display[border_y - 1].index('╮', border_x)
                 title_x, title_y = pi.until('Worktree 预览工作台')
                 title = pi.screen.buffer[title_y - 1]
-                assert title[title_x - 1].bold and title[title_x - 1].bg != 'default'
+                assert title[title_x - 1].bold and title[title_x - 1].bg == {'light': 'dee8fa', 'dark': '253651'}[theme]
                 _, cancel_y = pi.until('[ 关闭 ]')
                 cancel = pi.screen.buffer[cancel_y - 1]
                 assert cancel[border_x + 1].bg == cancel[right_x - 1].bg != 'default'
@@ -198,42 +218,56 @@ def main():
                 pi.click('[ 取消 ]')
                 assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'ready'
         print('real Pi: opaque framed panels with highlighted selection in light and narrow dark terminals', flush=True)
+        for root, value in [(local, 'Local loop'), (first_path, 'Worktree loop')]:
+            (root / '.pi').mkdir(exist_ok=True)
+            (root / '.pi/loops.json').write_text(value)
+        baseline = git('status', '--porcelain')
         with Pi(local, agent, provider) as pi:
             pi.until('Local · 待验收')
             pi.click('[ 工作树操作 ]')
             pi.click('[ 进入 / 恢复 Worktree ]')
             pi.until('Worktree · 待验收')
             pi.until('Worktree ready.')
-            pi.click('[ 工作树操作 ]')
-            pi.click('[ 返回 Local ]')
-            pi.until('Local · 待验收')
-            pi.click('[ 工作树操作 ]')
             pi.click('[ 预览到 Local ]')
+            pi.until('确认：预览到 Local')
             pi.click('[ 取消 ]')
+            pi.until_gone('确认：预览到 Local')
             assert (local / 'task.txt').read_text() == 'base\n'
-            pi.click('[ 工作树操作 ]')
             pi.click('[ 预览到 Local ]')
             pi.click('[ 执行预览到 Local ]')
-            pi.until('Local · 已预览')
+            pi.until('Worktree · 已预览')
             assert (local / 'task.txt').read_text() == 'task edit\n'
             assert git('rev-parse', 'HEAD') == head
-            pi.click('[ 工作树操作 ]')
             pi.click('[ 撤回预览 ]')
             pi.click('[ 执行撤回预览 ]')
-            pi.until('Local · 待验收')
+            pi.until('Worktree · 待验收')
             assert git('status', '--porcelain') == baseline
-            pi.click('[ 工作树操作 ]')
             pi.click('[ 预览到 Local ]')
             pi.click('[ 执行预览到 Local ]')
+            pi.until('Worktree · 已预览')
+            pi.click('[ 打开 Local 检查 ]')
             pi.until('Local · 已预览')
+            pi.until('[ 撤回预览 ]')
+            pi.until('[ 确认提交 ]')
             pi.click('[ 工作树操作 ]')
+            pi.click('[ 进入 / 恢复 Worktree ]')
+            pi.until('Worktree · 已预览')
+            veto = base / 'veto-switch'
+            veto.touch()
+            pi.click('[ 确认提交 ]')
+            pi.click('[ 执行确认提交 ]')
+            pi.until('Pi 取消了切换，未提交。')
+            assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'previewed' and first_path.is_dir()
+            veto.unlink()
             pi.click('[ 确认提交 ]')
             pi.click('[ 执行确认提交 ]')
             pi.until('Local · 已交付')
             assert git('show', '--format=', '--name-only') == 'task.txt'
             assert git('status', '--porcelain') == baseline
-            assert not first_path.exists()
-            print('real Pi: resumed transcript, canceled, previewed, rolled back, re-previewed and committed only task', flush=True)
+            assert task()['cleanup']['status'] == 'retained'
+            assert (first_path / '.pi/loops.json').read_text() == 'Worktree loop'
+            assert (local / '.pi/loops.json').read_text() == 'Local loop'
+            print('real Pi: Worktree preview and rollback stay put; vetoed switch; task-only commit preserves both late .pi/loops.json files', flush=True)
             pi.click('[ ] 新建 Worktree')
             pi.until('[x] 新建 Worktree')
             pi.send(b'Open a task to discard.\r')

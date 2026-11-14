@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { createSessionCheckoutApplyEngine, runGit, type PreviewReceipt } from './engine.ts'
+import { createSessionCheckoutApplyEngine, runGit, type FrozenReview, type PreviewReceipt } from './engine.ts'
 
 export interface Checkout { root: string; gitDir: string; commonDir: string; rootIdentity: string; gitIdentity: string; commonIdentity: string }
 export interface SessionLink { id: string; file: string; cwd: string }
 type Phase = 'creating' | 'working' | 'ready' | 'previewed' | 'delivered' | 'discarded'
-interface Review { id: string; fingerprint: string; files: string[]; message: string }
+interface Review { id: string; fingerprint: string; files: string[]; message: string; snapshot?: FrozenReview }
 export interface Task {
   id: string
   phase: Phase
@@ -171,7 +171,7 @@ export class TaskStore {
       const inspected = await this.engineFactory().inspectReview(this.input(task))
       if (inspected.status === 'error') engineError(inspected)
       if (!inspected.changedFiles.length) throw new Error('没有可验收的 Git 改动。')
-      const review = { id: randomUUID(), fingerprint: inspected.isolatedFingerprint, files: inspected.changedFiles, message: title }
+      const review = { id: randomUUID(), fingerprint: inspected.isolatedFingerprint, files: inspected.changedFiles, message: title, snapshot: inspected.snapshot }
       task.review = review
       task.phase = 'ready'
       await save()
@@ -202,10 +202,9 @@ export class TaskStore {
           await this.cleanup(task, expected.discardFingerprint!, save)
         } else if (action === 'preview' && task.phase === 'ready' && task.review) {
           await this.validateIsolated(task)
-          const res = await engine.plan(this.input(task))
+          const res = await engine.plan(this.input(task), task.review)
           if (res.status === 'error') engineError(res)
           if (res.status === 'conflict') throw new Error(`预览冲突，Local 未写入：${res.conflictingFiles.map(s => JSON.stringify(s)).join('、')}`)
-          if (res.plan.isolatedFingerprint !== task.review.fingerprint) throw new Error('Worktree 自「待验收」后已变化。请返回 Worktree 重新标记。')
           if (res.plan.localHeadRef !== task.localHeadRef) throw new Error('计算预览时 Local 分支已变化。')
           const applied = await engine.preview(res.plan, {
             previewId: randomUUID(), reviewId: task.review.id, iteration: 1,
@@ -218,7 +217,16 @@ export class TaskStore {
               await this.pin(task, [receipt.localHeadOid, receipt.localWorkingTreeOid, receipt.localIndexTreeOid, receipt.previewWorkingTreeOid, receipt.isolatedSnapshotOid, receipt.isolatedHeadOid])
             },
           })
-          if (applied.status === 'error') engineError(applied)
+          if (applied.status === 'error') {
+            // This engine result is only emitted before any Local file/index/ref write.
+            if (applied.error.code === 'stale_isolated' && task.journal) {
+              delete task.journal
+              delete task.receipt
+              await save()
+              await this.unpin(task).catch(() => {})
+            }
+            engineError(applied)
+          }
           task.receipt = applied.receipt
           task.phase = 'previewed'
           delete task.journal
@@ -257,7 +265,11 @@ export class TaskStore {
           for (const file of [journal?.indexBefore, journal?.indexAfter]) {
             if (file) await rm(file, { force: true }).catch(() => {})
           }
-          await this.cleanup(task, task.receipt.isolatedFingerprint, save)
+          try {
+            await this.cleanup(task, task.receipt.isolatedFingerprint, save)
+          } catch (error) {
+            throw new Error(`已提交 ${done.commitOid}，但未能确认 Worktree 清理完成：${errText(error)}`, { cause: error })
+          }
           await this.unpin(task).catch(() => {})
         } else throw new Error('当前阶段不允许此操作。')
       } catch (error) {
@@ -285,6 +297,10 @@ export class TaskStore {
     const retained = async (reason: string) => { task.cleanup = { status: 'retained', reason }; await save() }
     await save() // The confirmed terminal phase is durable even if cleanup is skipped.
     try {
+      const processCwd = await realpath(process.cwd())
+      if (processCwd === task.isolatedPath || processCwd.startsWith(task.isolatedPath + '/')) {
+        throw new Error('Pi 进程仍从此 Worktree 启动，保留目录。')
+      }
       await this.validateLocal(task)
       await this.validateIsolated(task)
       const listed = (await runGit(task.local.root, ['worktree', 'list', '--porcelain', '-z'])).stdout.toString('utf8')
@@ -298,7 +314,9 @@ export class TaskStore {
       const marker = await lstat(join(task.isolatedPath, '.git'))
       if (!marker.isFile()) throw new Error('不是受管的 linked Worktree。')
       const visit = async (dir: string) => {
-        for (const child of await readdir(dir, { withFileTypes: true })) {
+        const children = await readdir(dir, { withFileTypes: true })
+        if (!children.length) throw new Error('隔离 Worktree 有 Git 无法快照的空目录；保留整个 Worktree。')
+        for (const child of children) {
           if (child.name.toLowerCase() === '.git') {
             if (dir === task.isolatedPath && child.name === '.git') continue
             throw new Error('Worktree 中有嵌套的 Git 元数据。')

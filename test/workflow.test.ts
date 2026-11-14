@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
@@ -81,13 +81,111 @@ test('conflict and stale ready snapshot do not change Local', async t => {
   const { local, isolated, latest, act, ready } = await fixture(t)
   await writeFile(join(isolated, 'task.txt'), 'task edit\n')
   await ready()
-  await writeFile(join(isolated, 'other.txt'), 'later\n')
-  await assert.rejects(act('preview', await latest()), /待验收.*变化/)
-  await ready()
+  await writeFile(join(isolated, 'task.txt'), 'later task edit\n')
   await writeFile(join(local, 'task.txt'), 'my edit\n')
+  await assert.rejects(act('preview', await latest()), /待验收文件已变化.*task.txt/)
+  await ready()
   await assert.rejects(act('preview', await latest()), /预览冲突/)
   assert.equal(await content(local, 'task.txt'), 'my edit\n')
   assert.equal((await latest()).journal, undefined)
+})
+
+test('only frozen review paths reach Local; later ancillary edits and commits are kept', async t => {
+  const f = await fixture(t)
+  await writeFile(join(f.isolated, 'task.txt'), 'task only\n')
+  assert.deepEqual((await f.ready()).files, ['task.txt'])
+  await writeFile(join(f.local, 'staged.txt'), 'my staged\n')
+  await git(f.local, 'add', 'staged.txt')
+  for (const [root, bytes] of [[f.local, 'Local loops\n'], [f.isolated, 'isolated loops\n']]) {
+    await mkdir(join(root, '.pi'))
+    await writeFile(join(root, '.pi/loops.json'), bytes)
+  }
+  await writeFile(join(f.isolated, 'unstaged.txt'), 'unrelated isolated commit\n')
+  await git(f.isolated, 'add', 'unstaged.txt')
+  await git(f.isolated, 'commit', '-m', 'late ancillary commit')
+  await f.act('preview', await f.latest())
+  assert.equal(await content(f.local, 'task.txt'), 'task only\n')
+  assert.equal(await content(f.local, '.pi/loops.json'), 'Local loops\n')
+  assert.equal(await content(f.local, 'unstaged.txt'), 'unstaged.txt base\n')
+  await f.act('rollback', await f.latest())
+  assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
+  await f.act('preview', await f.latest())
+  const done = await f.act('finalize', await f.latest())
+  assert.equal(done.cleanup?.status, 'retained')
+  assert.equal(await content(f.isolated, '.pi/loops.json'), 'isolated loops\n')
+  assert.equal(await content(f.isolated, 'unstaged.txt'), 'unrelated isolated commit\n')
+  assert.equal(await git(f.local, 'show', '--format=', '--name-only'), 'task.txt\n')
+  assert.equal(await git(f.local, 'diff', '--cached', '--name-only'), 'staged.txt\n')
+})
+
+test('legacy review with later unrelated untracked file migrates only from a matching fingerprint', async t => {
+  const f = await fixture(t)
+  await writeFile(join(f.isolated, 'task.txt'), 'reviewed\n')
+  await f.ready()
+  const state = await f.store.read()
+  delete state.tasks[0].review?.snapshot
+  await writeFile(f.store.statePath, JSON.stringify(state))
+  await writeFile(join(f.isolated, 'other.txt'), 'late\n')
+  await writeFile(join(f.isolated, 'task.txt'), 'changed\n')
+  await assert.rejects(f.act('preview', await f.latest()), /无法核验此前的待验收记录/)
+  await writeFile(join(f.isolated, 'task.txt'), 'reviewed\n')
+  await f.act('preview', await f.latest())
+  assert.equal(await content(f.local, 'task.txt'), 'reviewed\n')
+  assert.equal(await exists(join(f.local, 'other.txt')), false)
+})
+
+test('staged-only drift and last-minute reviewed-path drift fail before touching Local', async t => {
+  let changeReviewed = true
+  const f = await fixture(t, () => createSessionCheckoutApplyEngine({ beforeFinalLocalValidation: async () => {
+    assert.equal((await f.latest()).journal?.operation, 'preview')
+    if (changeReviewed) await writeFile(join(f.isolated, 'task.txt'), 'after journal\n')
+    else await writeFile(join(f.isolated, 'other.txt'), 'after journal, unrelated\n')
+  } }))
+  await writeFile(join(f.isolated, 'task.txt'), 'reviewed\n')
+  await f.ready()
+  await git(f.isolated, 'add', 'task.txt')
+  await assert.rejects(f.act('preview', await f.latest()), /待验收文件已变化/)
+  await git(f.isolated, 'reset', '--', 'task.txt')
+  await assert.rejects(f.act('preview', await f.latest()), /待验收文件已变化/)
+  assert.equal((await f.latest()).journal, undefined)
+  assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
+  changeReviewed = false
+  await f.ready()
+  await f.act('preview', await f.latest())
+  assert.equal(await content(f.local, 'task.txt'), 'after journal\n')
+  assert.equal(await exists(join(f.local, 'other.txt')), false)
+})
+
+test('the frozen manifest handles a reviewed deletion, nested addition, symlink and executable mode', async t => {
+  const f = await fixture(t)
+  await rm(join(f.isolated, 'task.txt'))
+  await mkdir(join(f.isolated, 'task.txt'))
+  await symlink('../staged.txt', join(f.isolated, 'task.txt/link'))
+  await chmod(join(f.isolated, 'staged.txt'), 0o755)
+  assert.deepEqual((await f.ready()).files, ['staged.txt', 'task.txt', 'task.txt/link'])
+  await chmod(join(f.isolated, 'staged.txt'), 0o644)
+  await assert.rejects(f.act('preview', await f.latest()), /待验收文件已变化.*staged.txt/)
+  await chmod(join(f.isolated, 'staged.txt'), 0o755)
+  await f.act('preview', await f.latest())
+  assert.equal(await readlink(join(f.local, 'task.txt/link')), '../staged.txt')
+  assert.equal((await stat(join(f.local, 'staged.txt'))).mode & 0o100, 0o100)
+  await f.act('rollback', await f.latest())
+  assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
+  assert.equal((await stat(join(f.local, 'staged.txt'))).mode & 0o100, 0)
+})
+
+test('ignored Local obstructions are rejected before any preview write', async t => {
+  const f = await fixture(t)
+  await writeFile(join(f.isolated, 'task.txt'), 'task change\n')
+  await writeFile(join(f.isolated, 'obstruction'), 'new file\n')
+  await mkdir(join(f.local, 'obstruction'))
+  await writeFile(join(f.local, 'obstruction/private'), 'do not touch\n')
+  await writeFile(join(f.task.local.gitDir, 'info/exclude'), '/obstruction/private\n')
+  await f.ready()
+  await assert.rejects(f.act('preview', await f.latest()), /Local 路径与预览改动冲突/)
+  assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
+  assert.equal(await content(f.local, 'obstruction/private'), 'do not touch\n')
+  assert.equal((await f.latest()).journal, undefined)
 })
 
 test('both post-preview actions fail closed on drift, including unrelated staged edits', async t => {

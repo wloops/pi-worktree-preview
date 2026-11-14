@@ -3,8 +3,8 @@ import { createTranslator } from './i18n/core.ts'
 import { hostMessages } from './i18n/host-messages.ts'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { realpathSync } from 'node:fs'
-import { lstat, mkdir, mkdtemp, open, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises'
+import { constants, realpathSync } from 'node:fs'
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 const hostMessage = createTranslator(hostMessages, 'zh')
@@ -14,6 +14,23 @@ export interface ApplyPlanInput {
   baseOid: string
   isolatedPath: string
   localPath: string
+}
+
+interface ReviewedEntry {
+  path: string
+  working: string | null
+  index: string | null
+}
+
+export interface FrozenReview {
+  version: 1
+  entries: ReviewedEntry[]
+}
+
+interface ExpectedReview {
+  files: string[]
+  fingerprint: string
+  snapshot?: FrozenReview
 }
 
 export interface ApplyPlan {
@@ -32,8 +49,8 @@ export interface ApplyPlan {
 export interface ReviewSnapshotResult {
   status: 'ready'
   isolatedFingerprint: string
-  isolatedHeadOid: string
   changedFiles: string[]
+  snapshot: FrozenReview
 }
 
 export type InspectReviewResult = ReviewSnapshotResult | ApplyPlanErrorResult
@@ -195,8 +212,8 @@ export type ApplyError =
 
 export interface SessionCheckoutApplyEngine {
   inspectReview(input: ApplyPlanInput): Promise<InspectReviewResult>
-  /** 复用真实 Apply merge 计算，但不持久化可执行 plan，也不修改任一 checkout。 */
-  plan(input: ApplyPlanInput): Promise<ApplyPlanResult>
+  /** Merge only the frozen review scope; do not modify either checkout. */
+  plan(input: ApplyPlanInput, review: ExpectedReview): Promise<ApplyPlanResult>
   preview(plan: ApplyPlan, options: {
     previewId: string
     reviewId: string
@@ -255,6 +272,7 @@ interface StoredPlan {
   patch: Buffer
   plan: ApplyPlan
   scope: ApplyScope
+  review: FrozenReview
 }
 
 interface MergeReadyResult {
@@ -404,11 +422,6 @@ function toProjectPath(repoPath: string, prefix: string): string {
   return prefix ? repoPath.slice(prefix.length + 1) : repoPath
 }
 
-interface EffectiveApplyBase {
-  oid: string
-  strategy: ApplyBaseStrategy
-}
-
 async function isAncestor(checkoutPath: string, olderOid: string, newerOid: string): Promise<boolean> {
   const result = await runGit(
     checkoutPath,
@@ -416,29 +429,6 @@ async function isAncestor(checkoutPath: string, olderOid: string, newerOid: stri
     { allowedExitCodes: [0, 1] },
   )
   return result.exitCode === 0
-}
-
-async function selectEffectiveApplyBase(
-  checkoutPath: string,
-  recordedBaseOid: string,
-  localHeadOid: string,
-  isolatedHeadOid: string,
-): Promise<EffectiveApplyBase> {
-  // recorded base 必须能证明位于两侧真实提交历史中，才允许利用 ancestry 前移。
-  // 上次 Apply 的内部 snapshot 通常不在任一分支历史中，因此第二次 Apply 会保守使用 recorded base。
-  const recordedInLocal = await isAncestor(checkoutPath, recordedBaseOid, localHeadOid)
-  const recordedInIsolated = await isAncestor(checkoutPath, recordedBaseOid, isolatedHeadOid)
-  if (!recordedInLocal || !recordedInIsolated) {
-    return { oid: recordedBaseOid, strategy: 'recorded_base' }
-  }
-
-  if (await isAncestor(checkoutPath, localHeadOid, isolatedHeadOid)) {
-    return { oid: localHeadOid, strategy: 'isolated_contains_local_head' }
-  }
-  if (await isAncestor(checkoutPath, isolatedHeadOid, localHeadOid)) {
-    return { oid: isolatedHeadOid, strategy: 'local_contains_isolated_head' }
-  }
-  return { oid: recordedBaseOid, strategy: 'recorded_base' }
 }
 
 async function changedTreePaths(
@@ -454,6 +444,111 @@ async function changedTreePaths(
     { env: objectDirectory && sourceObjects ? gitObjectEnvironment(objectDirectory, sourceObjects) : undefined },
   )
   return parseNullSeparated(result.stdout)
+}
+
+// Git mode + blob ID (or absence) for exact paths. ls-tree uses a type token;
+// ls-files --stage instead has a stage number, which must be zero for reviewed paths.
+function entryMap(raw: Buffer, kind: 'tree' | 'index', paths: ReadonlySet<string>): Map<string, string> {
+  const entries = new Map<string, string>()
+  for (const record of parseNullSeparated(raw)) {
+    const tab = record.indexOf('\t')
+    const path = record.slice(tab + 1)
+    if (!paths.has(path)) continue
+    const [mode, second, third] = record.slice(0, tab).split(' ')
+    const object = kind === 'tree' ? third : second
+    if (tab < 0 || !/^(100644|100755|120000)$/.test(mode) || !OID_PATTERN.test(object) ||
+        (kind === 'tree' ? second !== 'blob' : third !== '0') || entries.has(path)) {
+      throw new Error(`无法核验待验收文件的 Git 条目：${JSON.stringify(path)}`)
+    }
+    entries.set(path, `${mode} ${object}`)
+  }
+  return entries
+}
+
+function reviewEntryPath(path: string, prefix: string): boolean {
+  return isProjectPath(path, prefix) && path.split('/').every(part =>
+    !!part && part !== '.' && part !== '..' && part.toLowerCase() !== '.git' && !part.includes('\0'))
+}
+
+class StaleReviewError extends Error {
+  constructor(path?: string) {
+    super(path === undefined ? '无法核验此前的待验收记录，请重新标记待验收。' :
+      `待验收文件已变化：${JSON.stringify(path)}。请重新标记待验收。`)
+  }
+}
+
+async function readReviewFile(path: string) {
+  const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const info = await fd.stat()
+    if (!info.isFile()) throw new Error(`待验收路径不是普通文件：${JSON.stringify(path)}`)
+    return { bytes: await fd.readFile(), mode: (info.mode & 0o100) ? '100755' : '100644' }
+  } finally { await fd.close() }
+}
+
+async function reviewWorkingEntry(root: string, path: string): Promise<{ bytes: Buffer; mode: string } | null> {
+  const parts = path.split('/')
+  let current = root
+  for (let i = 0; i < parts.length; i++) {
+    const parent = current
+    current = join(parent, parts[i])
+    const info = await lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error
+      return undefined
+    })
+    if (!info) return null
+    // Git paths are exact; do not accept a differently spelled file through a
+    // case-insensitive or Unicode-normalizing filesystem lookup.
+    if (!(await readdir(parent)).includes(parts[i])) throw new StaleReviewError(path)
+    if (i < parts.length - 1) {
+      if (!info.isDirectory()) return null
+      continue
+    }
+    if (info.isDirectory()) return null
+    if (!info.isFile() && !info.isSymbolicLink()) throw new StaleReviewError(path)
+    return info.isSymbolicLink() ? { bytes: await readlink(current, { encoding: 'buffer' }), mode: '120000' } : readReviewFile(current)
+  }
+  throw new StaleReviewError(path)
+}
+
+async function verifyReview(root: string, review: FrozenReview, objectEnv?: NodeJS.ProcessEnv, write = false) {
+  const paths = new Set(review.entries.map(entry => entry.path))
+  const index = entryMap((await runGit(root, ['ls-files', '--stage', '-z'])).stdout, 'index', paths)
+  for (const entry of review.entries) {
+    if ((index.get(entry.path) ?? null) !== entry.index) throw new StaleReviewError(entry.path)
+    const file = await reviewWorkingEntry(root, entry.path)
+    if (!file && entry.working === null) continue
+    if (!file || !entry.working) throw new StaleReviewError(entry.path)
+    const [, oid] = entry.working.split(' ')
+    const object = createHash(oid.length === 64 ? 'sha256' : 'sha1')
+      .update(`blob ${file.bytes.length}\0`).update(file.bytes).digest('hex')
+    if (`${file.mode} ${object}` !== entry.working) throw new StaleReviewError(entry.path)
+    if (write) {
+      const written = stdoutText(await runGit(root, ['hash-object', '-w', '--stdin'], { input: file.bytes, env: objectEnv }))
+      if (written !== object) throw new StaleReviewError(entry.path)
+    }
+  }
+}
+
+async function reviewedTree(root: string, indexPath: string, baseOid: string, review: FrozenReview,
+  objectDirectory?: string, sourceObjects?: string): Promise<string> {
+  const env = {
+    ...(objectDirectory && sourceObjects ? gitObjectEnvironment(objectDirectory, sourceObjects) : {}),
+    GIT_INDEX_FILE: indexPath,
+  }
+  const zero = '0'.repeat(baseOid.length)
+  // Remove first so reviewed file <-> directory replacements are explicit and
+  // cannot implicitly replace entries from the recorded base outside the review.
+  const removals = review.entries.map(entry => `0 ${zero}\t${entry.path}\0`)
+  const updates = review.entries.flatMap(entry => entry.working === null ? [] : [`${entry.working}\t${entry.path}\0`])
+  await runGit(root, ['read-tree', baseOid], { env })
+  await runGit(root, ['update-index', '-z', '--index-info'], { env, input: [...removals, ...updates].join('') })
+  const tree = stdoutText(await runGit(root, ['write-tree'], { env }))
+  const actual = new Set(await changedTreePaths(root, baseOid, tree, objectDirectory ?? null, sourceObjects ?? null))
+  if (actual.size !== review.entries.length || review.entries.some(entry => !actual.has(entry.path))) {
+    throw new Error('无法将预览限制在待验收文件内；Local 未写入。')
+  }
+  return tree
 }
 
 function snapshotFingerprint(
@@ -597,9 +692,10 @@ async function computeMerge(
   objectDirectory: string,
   baseOid: string,
   local: CheckoutSnapshot,
-  isolated: CheckoutSnapshot,
+  isolatedTreeOid: string,
   checkoutPath: string,
   projectPathPrefix: string,
+  reviewedPaths: ReadonlySet<string>,
 ): Promise<MergeResult> {
   const localCommit = await createSnapshotCommit(
     checkoutPath,
@@ -611,11 +707,11 @@ async function computeMerge(
   )
   const isolatedCommit = await createSnapshotCommit(
     checkoutPath,
-    isolated.treeOid,
+    isolatedTreeOid,
     baseOid,
     objectDirectory,
     sourceObjects,
-    'Isolated snapshot',
+    'Reviewed Isolated snapshot',
   )
   const mergePath = join(tempRoot, 'merge checkout')
   const hooksPath = join(tempRoot, 'disabled hooks')
@@ -627,7 +723,7 @@ async function computeMerge(
     GIT_ALTERNATE_OBJECT_DIRECTORIES: [objectDirectory, sourceObjects].map(gitAlternate).join(delimiter),
   }
   await runGit(mergePath, ['checkout', '--detach', localCommit], { env: mergeEnv })
-  const merge = await runGit(mergePath, ['merge', '--no-commit', '--no-ff', isolatedCommit], {
+  const merge = await runGit(mergePath, ['-c', 'merge.renames=false', '-c', 'merge.directoryRenames=false', 'merge', '--no-commit', '--no-ff', isolatedCommit], {
     env: mergeEnv,
     allowedExitCodes: [0, 1],
   })
@@ -665,10 +761,11 @@ async function computeMerge(
       { env: mergeEnv },
     )
   ).stdout
-  const changedFiles = parseNullSeparated(changed.stdout)
-    .filter((path) => isProjectPath(path, projectPathPrefix))
-    .map((path) => toProjectPath(path, projectPathPrefix))
-    .sort()
+  const changedPaths = parseNullSeparated(changed.stdout)
+  if (changedPaths.some(path => !reviewedPaths.has(path))) {
+    throw new Error('合并结果包含待验收清单之外的文件；Local 未写入。')
+  }
+  const changedFiles = changedPaths.map(path => toProjectPath(path, projectPathPrefix)).sort()
   const centralIndex = join(tempRoot, 'merged-central.index')
   const centralEnv: NodeJS.ProcessEnv = {
     ...gitObjectEnvironment(objectDirectory, sourceObjects),
@@ -1017,6 +1114,58 @@ async function syncPatchedPaths(root: string, paths: string[]) {
   for (const dir of [...dirs].sort((a, b) => b.length - a.length)) await syncPath(dir)
 }
 
+// Check the real filesystem, not just Git's visible snapshot. In particular
+// git apply --check accepts replacing some nonempty directories with a file.
+async function checkPreviewPatch(root: string, patch: Buffer, changedPaths: string[],
+  beforeTreeOid: string, afterTreeOid: string, env?: NodeJS.ProcessEnv) {
+  const paths = new Set(changedPaths)
+  const [before, after] = await Promise.all([beforeTreeOid, afterTreeOid].map(async tree =>
+    entryMap((await runGit(root, ['ls-tree', '-rz', tree], { env })).stdout, 'tree', paths)))
+  const stop = (path: string): never => { throw new Error(`Local 路径与预览改动冲突，Local 未写入：${JSON.stringify(path)}`) }
+  const statAt = (path: string) => lstat(join(root, path)).catch((err: NodeJS.ErrnoException) => {
+    if (err.code !== 'ENOENT') throw err
+    return undefined
+  })
+  const checkDirectory = async (path: string) => {
+    const contents = await readdir(join(root, path), { withFileTypes: true })
+    if (!contents.length) stop(path)
+    for (const child of contents) {
+      const name = `${path}/${child.name}`
+      if (child.isDirectory()) await checkDirectory(name)
+      else if (!before.has(name) || after.has(name)) stop(name)
+    }
+  }
+  for (const path of changedPaths) {
+    const parts = path.split('/')
+    let parent = ''
+    for (let i = 0; i < parts.length; i++) {
+      const name = parent ? `${parent}/${parts[i]}` : parts[i]
+      const st = await statAt(name)
+      if (!st) break
+      if (!(await readdir(join(root, parent))).includes(parts[i])) stop(name)
+      if (i < parts.length - 1) {
+        if (!st.isDirectory()) {
+          if (!before.has(name) || after.has(name)) stop(name)
+          break
+        }
+      } else if (!before.has(path) && after.has(path)) {
+        if (!st.isDirectory()) stop(path)
+        await checkDirectory(path)
+      }
+      parent = name
+    }
+  }
+  // An ignored task addition would be invisible to the post-write fingerprint.
+  const additions = [...after.keys()].filter(path => !before.has(path))
+  if (additions.length) {
+    const ignored = await runGit(root, ['check-ignore', '-z', '--stdin'], {
+      input: additions.join('\0') + '\0', allowedExitCodes: [0, 1],
+    })
+    if (ignored.stdout.length) stop(parseNullSeparated(ignored.stdout)[0])
+  }
+  await runGit(root, ['apply', '--check', '-p1', '--binary', '--whitespace=nowarn'], { input: patch })
+}
+
 async function removeBestEffort(path: string | null): Promise<void> {
   if (!path) return
   try {
@@ -1063,7 +1212,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
     return captureSnapshot(checkoutPath, indexPath, objectDirectory, sourceObjects)
   }
 
-  async inspectReview(input: ApplyPlanInput): Promise<InspectReviewResult> {
+  async inspectReview(input: ApplyPlanInput, legacy?: ExpectedReview): Promise<InspectReviewResult> {
     if (!OID_PATTERN.test(input.baseOid)) {
       return { status: 'error', error: { code: 'invalid_input', message: hostMessage('invalidSessionBaseOIDFormat') } }
     }
@@ -1091,34 +1240,46 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         objectDirectory,
         localObjects,
       )
-      const changedFiles = await changedTreePaths(
-        isolatedGitRoot,
-        input.baseOid,
-        isolated.treeOid,
-        objectDirectory,
-        localObjects,
-      )
+      const changedFiles = legacy
+        ? legacy.files.map(path => localPrefix ? `${localPrefix}/${path}` : path)
+        : await changedTreePaths(isolatedGitRoot, input.baseOid, isolated.treeOid, objectDirectory, localObjects)
       if (changedFiles.some((path) => !isProjectPath(path, localPrefix))) {
         return { status: 'error', error: { code: 'invalid_input', message: hostMessage('isolatedContainsChangesOutsideTheProjectRootAReview') } }
       }
+      if (changedFiles.some(path => !reviewEntryPath(path, localPrefix))) throw new Error('待验收文件包含无效 Git 路径。')
+      const paths = new Set(changedFiles)
+      const working = entryMap((await runGit(isolatedGitRoot, ['ls-tree', '-rz', isolated.treeOid], {
+        env: gitObjectEnvironment(objectDirectory, localObjects),
+      })).stdout, 'tree', paths)
+      const index = entryMap(isolated.indexEntries, 'index', paths)
+      const snapshot: FrozenReview = {
+        version: 1,
+        entries: changedFiles.map(path => ({ path, working: working.get(path) ?? null, index: index.get(path) ?? null })),
+      }
+      if (legacy) {
+        // Prove that the reconstructed tree plus the exact old HEAD and index
+        // hash to the existing receipt. Later *unstaged* unrelated paths can
+        // be ignored even for an old review; anything unprovable needs re-review.
+        const projected = await reviewedTree(localGitRoot, join(tempRoot, 'legacy-review.index'), input.baseOid, snapshot,
+          objectDirectory, localObjects).catch(() => { throw new StaleReviewError() })
+        if (snapshotFingerprint(isolated.headOid, isolated.headRef, isolated.indexEntries, projected) !== legacy.fingerprint) {
+          throw new StaleReviewError()
+        }
+      }
       return {
         status: 'ready',
-        isolatedFingerprint: isolated.fingerprint,
-        isolatedHeadOid: isolated.headOid,
+        isolatedFingerprint: legacy?.fingerprint ?? isolated.fingerprint,
         changedFiles: changedFiles.map((path) => toProjectPath(path, localPrefix)).sort(),
+        snapshot,
       }
     } catch (error) {
-      return { status: 'error', error: { code: 'git_error', message: this.errorMessage(error) } }
+      return { status: 'error', error: { code: error instanceof StaleReviewError ? 'stale_isolated' : 'git_error', message: this.errorMessage(error) } }
     } finally {
       if (tempRoot) await this.cleanup(tempRoot)
     }
   }
 
-  async plan(input: ApplyPlanInput): Promise<ApplyPlanResult> {
-    return this.calculatePlan(input, true)
-  }
-
-  private async calculatePlan(input: ApplyPlanInput, persistPlan: boolean): Promise<ApplyPlanResult> {
+  async plan(input: ApplyPlanInput, expected: ExpectedReview): Promise<ApplyPlanResult> {
     if (!OID_PATTERN.test(input.baseOid)) {
       return { status: 'error', error: { code: 'invalid_input', message: hostMessage('invalidSessionBaseOIDFormat') } }
     }
@@ -1142,46 +1303,30 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       }
       await runGit(localGitRoot, ['cat-file', '-e', `${input.baseOid}^{commit}`])
 
+      // Legacy ready records only have the full fingerprint. Migrate in memory
+      // only when that exact checkout can still be proven, never from file names alone.
+      let review = expected.snapshot
+      if (!review) {
+        const inspected = await this.inspectReview(input, expected)
+        if (inspected.status === 'error') return inspected
+        review = inspected.snapshot
+      }
+      if (review.version !== 1 || !review.entries.length || review.entries.length !== expected.files.length ||
+          review.entries.some(entry => !reviewEntryPath(entry.path, localPrefix) ||
+            !expected.files.includes(toProjectPath(entry.path, localPrefix)))) throw new StaleReviewError()
+      const isolatedEnv = gitObjectEnvironment(objectDirectory, localObjects)
+      await verifyReview(isolatedGitRoot, review, isolatedEnv, true)
+      const isolatedHeadOid = stdoutText(await runGit(isolatedGitRoot, ['rev-parse', 'HEAD']))
+      const isolatedTreeOid = await reviewedTree(localGitRoot, join(tempRoot, 'reviewed.index'), input.baseOid, review, objectDirectory, localObjects)
       const local = await this.captureSnapshot(
         localGitRoot,
         join(tempRoot, 'local.index'),
         objectDirectory,
         localObjects,
       )
-      const isolated = await this.captureSnapshot(
-        isolatedGitRoot,
-        join(tempRoot, 'isolated.index'),
-        objectDirectory,
-        localObjects,
-      )
-      const effectiveBase = await selectEffectiveApplyBase(
-        localGitRoot,
-        input.baseOid,
-        local.headOid,
-        isolated.headOid,
-      )
-      const isolatedChangedPaths = await changedTreePaths(
-        isolatedGitRoot,
-        effectiveBase.oid,
-        isolated.treeOid,
-        objectDirectory,
-        localObjects,
-      )
-      if (isolatedChangedPaths.some((path) => !isProjectPath(path, localPrefix))) {
-        return {
-          status: 'error',
-          error: { code: 'invalid_input', message: hostMessage('isolatedContainsChangesOutsideTheProjectRootApplyWas') },
-        }
-      }
       const merge = await computeMerge(
-        tempRoot,
-        localObjects,
-        objectDirectory,
-        effectiveBase.oid,
-        local,
-        isolated,
-        localGitRoot,
-        localPrefix,
+        tempRoot, localObjects, objectDirectory, input.baseOid, local, isolatedTreeOid, localGitRoot, localPrefix,
+        new Set(review.entries.map(entry => entry.path)),
       )
       const revision = randomUUID()
       if (merge.status === 'conflict') {
@@ -1189,11 +1334,11 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
           status: 'conflict',
           revision,
           localFingerprint: local.fingerprint,
-          isolatedFingerprint: isolated.fingerprint,
-          effectiveBaseOid: effectiveBase.oid,
-          baseStrategy: effectiveBase.strategy,
+          isolatedFingerprint: expected.fingerprint,
+          effectiveBaseOid: input.baseOid,
+          baseStrategy: 'recorded_base',
           localHeadOid: local.headOid,
-          isolatedHeadOid: isolated.headOid,
+          isolatedHeadOid,
           conflictingFiles: merge.conflictingFiles,
         }
       }
@@ -1201,30 +1346,24 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       const plan: ApplyPlan = {
         revision,
         localFingerprint: local.fingerprint,
-        isolatedFingerprint: isolated.fingerprint,
-        effectiveBaseOid: effectiveBase.oid,
-        baseStrategy: effectiveBase.strategy,
+        isolatedFingerprint: expected.fingerprint,
+        effectiveBaseOid: input.baseOid,
+        baseStrategy: 'recorded_base',
         localHeadOid: local.headOid,
         localHeadRef: local.headRef,
-        isolatedHeadOid: isolated.headOid,
+        isolatedHeadOid,
         changedFiles: merge.changedFiles,
       }
-      if (persistPlan) {
-        this.plans.set(revision, {
-          input: { ...input },
-          patch: merge.patch,
-          plan: { ...plan, changedFiles: [...plan.changedFiles] },
-          scope: {
-            isolatedGitRoot,
-            localGitRoot,
-            projectPrefix: localPrefix,
-            sourceObjects: localObjects,
-          },
-        })
-      }
+      this.plans.set(revision, {
+        input: { ...input },
+        patch: merge.patch,
+        plan: { ...plan, changedFiles: [...plan.changedFiles] },
+        scope: { isolatedGitRoot, localGitRoot, projectPrefix: localPrefix, sourceObjects: localObjects },
+        review,
+      })
       return { status: 'ready', plan: { ...plan, changedFiles: [...plan.changedFiles] } }
     } catch (error) {
-      return { status: 'error', error: { code: 'git_error', message: this.errorMessage(error) } }
+      return { status: 'error', error: { code: error instanceof StaleReviewError ? 'stale_isolated' : 'git_error', message: this.errorMessage(error) } }
     } finally {
       if (tempRoot) await this.cleanup(tempRoot)
     }
@@ -1248,6 +1387,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
     }
 
     let tempRoot: string | null = null
+    let localWriteStarted = false
     try {
       tempRoot = await mkdtemp(join(tmpdir(), 'pi-wtp-preview-'))
       const objectDirectory = join(tempRoot, 'objects')
@@ -1269,32 +1409,24 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       ) {
         return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedAfterPlanningRecalculateThePlan') } }
       }
-      const isolated = await this.captureSnapshot(
-        stored.scope.isolatedGitRoot,
-        join(tempRoot, 'isolated.index'),
-        objectDirectory,
-        sourceObjects,
-      )
-      if (isolated.headOid !== stored.plan.isolatedHeadOid || isolated.fingerprint !== stored.plan.isolatedFingerprint) {
-        return { status: 'error', error: { code: 'stale_isolated', message: hostMessage('isolatedChangedAfterPlanningRecalculateThePlan') } }
+      if (!stored.patch.length) {
+        return { status: 'error', error: { code: 'operation_not_allowed', message: '本次任务没有可写入 Local 的新改动。' } }
       }
-
+      await verifyReview(stored.scope.isolatedGitRoot, stored.review, undefined, true)
+      const repoPaths = stored.plan.changedFiles.map(path => stored.scope.projectPrefix ? `${stored.scope.projectPrefix}/${path}` : path)
+      // '.gitignore' edits can change the visibility of unrelated paths without
+      // touching their bytes; the generic Local fingerprint cannot verify that.
+      const metadata = repoPaths.find(path => ['.gitignore', '.gitattributes'].includes(path.split('/').at(-1)?.toLowerCase() ?? ''))
+      if (metadata) {
+        return { status: 'error', error: { code: 'operation_not_allowed', message: `暂不支持预览影响 Git 快照规则的改动：${JSON.stringify(metadata)}；Local 未写入。` } }
+      }
       const persistentLocal = await this.captureSnapshot(
         stored.scope.localGitRoot,
         join(tempRoot, 'persistent-local.index'),
         null,
         null,
       )
-      const persistentIsolated = await this.captureSnapshot(
-        stored.scope.isolatedGitRoot,
-        join(tempRoot, 'persistent-isolated.index'),
-        null,
-        null,
-      )
-      if (
-        persistentLocal.fingerprint !== stored.plan.localFingerprint
-        || persistentIsolated.fingerprint !== stored.plan.isolatedFingerprint
-      ) {
+      if (persistentLocal.fingerprint !== stored.plan.localFingerprint) {
         return { status: 'error', error: { code: 'invalid_plan', message: hostMessage('thePersistentPreviewSnapshotDoesNotMatchTheReviewed') } }
       }
       const previewWorkingTreeOid = await prepareIndexFromPatch(
@@ -1303,17 +1435,16 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         persistentLocal.treeOid,
         stored.patch,
       )
+      await checkPreviewPatch(stored.scope.localGitRoot, stored.patch, repoPaths, persistentLocal.treeOid, previewWorkingTreeOid)
+      const isolatedTreeOid = await reviewedTree(stored.scope.localGitRoot, join(tempRoot, 'persistent-reviewed.index'), stored.input.baseOid, stored.review)
       const isolatedSnapshotOid = await createSnapshotCommit(
-        stored.scope.isolatedGitRoot,
-        persistentIsolated.treeOid,
+        stored.scope.localGitRoot,
+        isolatedTreeOid,
         stored.plan.effectiveBaseOid,
         null,
         null,
         'Previewed Isolated snapshot',
       )
-      if (stored.plan.changedFiles.length === 0) {
-        return { status: 'error', error: { code: 'operation_not_allowed', message: '本次任务没有可写入 Local 的新改动。' } }
-      }
       const preparedReceipt: PreviewReceipt = {
         previewId: options.previewId,
         reviewId: options.reviewId,
@@ -1329,18 +1460,16 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         localWorkingTreeOid: persistentLocal.treeOid,
         localIndexTreeOid: persistentLocal.indexTreeOid,
         previewWorkingTreeOid,
-        isolatedHeadOid: persistentIsolated.headOid,
-        isolatedFingerprint: persistentIsolated.fingerprint,
+        isolatedHeadOid: stored.plan.isolatedHeadOid,
+        // This is the whole review-time Worktree, used only to authorize cleanup.
+        isolatedFingerprint: stored.plan.isolatedFingerprint,
         isolatedSnapshotOid,
         changedFiles: [...stored.plan.changedFiles],
       }
 
       await options.beforeWrite?.(preparedReceipt)
       await this.options.beforeFinalLocalValidation?.()
-      const finalIsolated = await this.captureSnapshot(stored.scope.isolatedGitRoot, join(tempRoot, 'final-isolated.index'), objectDirectory, sourceObjects)
-      if (finalIsolated.fingerprint !== stored.plan.isolatedFingerprint) {
-        return { status: 'error', error: { code: 'stale_isolated', message: '待验收的 Worktree 在预览前发生变化。' } }
-      }
+      await verifyReview(stored.scope.isolatedGitRoot, stored.review)
       const finalLocal = await this.captureSnapshot(
         stored.scope.localGitRoot,
         join(tempRoot, 'final-local.index'),
@@ -1350,10 +1479,10 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       if (finalLocal.headOid !== stored.plan.localHeadOid || finalLocal.fingerprint !== stored.plan.localFingerprint) {
         return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedBeforePreviewWroteItsChangesRecalculateThe') } }
       }
-      if (stored.patch.length > 0) {
-        await runGit(stored.scope.localGitRoot, ['apply', '-p1', '--binary', '--whitespace=nowarn'], { input: stored.patch })
-        await syncPatchedPaths(stored.scope.localGitRoot, stored.plan.changedFiles)
-      }
+      await checkPreviewPatch(stored.scope.localGitRoot, stored.patch, repoPaths, persistentLocal.treeOid, previewWorkingTreeOid)
+      localWriteStarted = true
+      await runGit(stored.scope.localGitRoot, ['apply', '-p1', '--binary', '--whitespace=nowarn'], { input: stored.patch })
+      await syncPatchedPaths(stored.scope.localGitRoot, repoPaths)
       await this.options.afterLocalWriteBeforeVerification?.()
       const previewedLocal = await this.captureSnapshot(
         stored.scope.localGitRoot,
@@ -1376,6 +1505,9 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       }
       return { status: 'previewed', receipt, changedFiles: [...receipt.changedFiles] }
     } catch (error) {
+      if (error instanceof StaleReviewError && !localWriteStarted) {
+        return { status: 'error', error: { code: 'stale_isolated', message: error.message } }
+      }
       return { status: 'error', error: { code: 'git_error', message: this.errorMessage(error) } }
     } finally {
       if (tempRoot) await this.cleanup(tempRoot)
@@ -1558,6 +1690,12 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         }
       }
 
+      const scope = projectPrefix(localGitRoot, input.localPath)
+      const committedPaths = await changedTreePaths(localGitRoot, current.headTreeOid, assessment.taskTreeOid, objectDirectory, sourceObjects)
+      if (scope === null || committedPaths.some(path => !isProjectPath(path, scope) ||
+          !input.receipt.changedFiles.includes(toProjectPath(path, scope)))) {
+        return { status: 'error', error: { code: 'commit_isolation_conflict', message: '提交结果包含预览之外的文件；Local 未提交。' } }
+      }
       const taskPatch = await treePatch(
         localGitRoot,
         current.headTreeOid,
