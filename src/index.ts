@@ -1,5 +1,5 @@
 import { getAgentDir, SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type InputEvent } from '@earendil-works/pi-coding-agent'
-import { matchesKey, truncateToWidth, visibleWidth, type TuiMouseEvent } from '@earendil-works/pi-tui'
+import { rgbColor, truncateToWidth, visibleWidth, type TuiMouseEvent } from '@earendil-works/pi-tui'
 import { Type } from 'typebox'
 import { randomUUID } from 'node:crypto'
 import { lstat, open, realpath } from 'node:fs/promises'
@@ -46,46 +46,87 @@ function restoreDraft(ctx: ExtensionContext, text: string) {
 
 type Draft = Pick<InputEvent, 'text' | 'images'> & { token: string; sessionId: string }
 
+const lightPanel = {
+  surface: rgbColor(245, 248, 253), header: rgbColor(222, 232, 250), edge: rgbColor(65, 92, 142),
+  text: rgbColor(24, 39, 66), secondary: rgbColor(64, 81, 113), selectedBg: rgbColor(39, 76, 151),
+}
+const darkPanel = {
+  surface: rgbColor(24, 32, 48), header: rgbColor(37, 54, 81), edge: rgbColor(130, 162, 216),
+  text: rgbColor(235, 241, 252), secondary: rgbColor(177, 194, 219), selectedBg: rgbColor(48, 91, 166),
+}
+const selectedFg = rgbColor(255, 255, 255)
+
 interface Choice<T> { label: string; value: T }
 async function pick<T>(ctx: ExtensionCommandContext, title: string, detail: string[], choices: Choice<T>[]): Promise<T | undefined> {
-  return ctx.ui.custom<T | undefined>((tui, theme, _keys, done) => {
+  return ctx.ui.custom<T | undefined>((tui, theme, keys, done) => {
+    // Paint the whole card, including padding, so transcript tool backgrounds never
+    // show through. Use paired colors that remain readable in both Pi appearances.
+    const palette = () => theme.appearance === 'light' ? lightPanel : darkPanel
     let selected = choices.length - 1 // cancellation is the default for keyboard confirmation
     let first = 0
     let rows = 0
     let start = 0
+    let hitWidth = 0
+    let hitInset = 0
     const move = (delta: number) => { selected = (selected + delta + choices.length) % choices.length; tui.requestRender() }
     return {
       invalidate() {},
       render(width: number) {
-        const cap = Math.max(1, tui.terminal.rows - 4)
-        const lines = [theme.fg('accent', clean(title)), ...detail.slice(0, Math.min(7, Math.max(0, cap - Math.min(choices.length, 5) - 2))).map(clean)]
-        start = lines.length
-        rows = Math.max(1, Math.min(choices.length, cap - start - 1))
+        const { surface, header, edge, text, secondary, selectedBg } = palette()
+        const cap = Math.max(1, tui.terminal.rows - 2)
+        hitWidth = width
+        const framed = width >= 12 && cap >= 6
+        hitInset = framed ? 1 : 0
+        const inner = width - hitInset * 2
+        const fit = (value: string) => truncateToWidth(value, inner, '…', true)
+        const border = (value: string) => theme.style(value, { fg: edge, bg: surface })
+        const row = (value: string, style = { fg: text, bg: surface, bold: false }) => {
+          const line = theme.style(fit(value), style)
+          return framed ? border('│') + line + border('│') : line
+        }
+        const roomy = framed && cap >= choices.length + 8
+        const chrome = (framed ? 2 : 0) + (cap >= 2 ? 1 : 0) + (cap >= 4 ? 1 : 0) + (roomy ? 2 : 0)
+        rows = Math.max(1, Math.min(choices.length, cap - chrome))
         first = Math.max(0, Math.min(first, choices.length - rows))
         if (selected < first) first = selected
         if (selected >= first + rows) first = selected - rows + 1
-        for (let i = first; i < first + rows; i++) {
-          const label = `${i === selected ? '›' : ' '} [ ${clean(choices[i].label)} ]`
-          lines.push(i === selected ? theme.fg('accent', label) : label)
+        const lines: string[] = []
+        if (framed) lines.push(border(`╭${'─'.repeat(inner)}╮`))
+        if (cap >= 2) lines.push(row(`  ${clean(title)}`, { fg: text, bg: header, bold: true }))
+        for (const line of detail.slice(0, Math.max(0, cap - chrome - rows))) {
+          lines.push(row(`  ${clean(line)}`))
         }
-        lines.push(theme.fg('dim', '点击选择 · ↑ ↓ Enter · Esc 关闭'))
-        return lines.map(line => truncateToWidth(line, width, '…', true))
+        if (roomy) lines.push(border(`├${'─'.repeat(inner)}┤`))
+        start = lines.length
+        for (let i = first; i < first + rows; i++) {
+          const current = i === selected
+          lines.push(row(`${current ? ' ▸' : '  '} [ ${clean(choices[i].label)} ]`, {
+            fg: current ? selectedFg : text, bg: current ? selectedBg : surface, bold: true,
+          }))
+        }
+        if (roomy) lines.push(row(''))
+        if (cap >= 4) {
+          const position = rows < choices.length ? `  ${selected + 1}/${choices.length} ·` : ' '
+          lines.push(row(`${position} 点击选择 · ↑ ↓ Enter · Esc 关闭`, { fg: secondary, bg: surface, bold: false }))
+        }
+        if (framed) lines.push(border(`╰${'─'.repeat(inner)}╯`))
+        return lines
       },
       handleInput(data: string) {
-        if (matchesKey(data, 'escape')) done(undefined)
-        else if (matchesKey(data, 'up')) move(-1)
-        else if (matchesKey(data, 'down')) move(1)
-        else if (matchesKey(data, 'enter')) done(choices[selected].value)
+        if (keys.matches(data, 'tui.select.cancel')) done(undefined)
+        else if (keys.matches(data, 'tui.select.up')) move(-1)
+        else if (keys.matches(data, 'tui.select.down')) move(1)
+        else if (keys.matches(data, 'tui.select.confirm')) done(choices[selected].value)
       },
       handleMouse(event: TuiMouseEvent) {
         if (event.type === 'wheel' && event.wheelDelta) { move(Math.sign(event.wheelDelta)); return { handled: true } }
         const index = event.y - start
-        if (event.button !== 'left' || index < 0 || index >= rows) return
+        if (event.button !== 'left' || index < 0 || index >= rows || event.x < hitInset || event.x >= hitWidth - hitInset) return
         if (event.type === 'press') return { handled: true, render: false }
         if (event.type === 'click') { done(choices[first + index].value); return { handled: true } }
       },
     }
-  }, { overlay: true, overlayOptions: { anchor: 'center', width: '86%' } })
+  }, { overlay: true, overlayOptions: { anchor: 'center', width: 76, margin: 1 }, blocked: { kind: 'question', message: clean(title) } })
 }
 
 export default function extension(pi: ExtensionAPI) {
@@ -234,12 +275,12 @@ export default function extension(pi: ExtensionAPI) {
         const task = isolated ?? tasks.find(t => t.journal || !['delivered', 'discarded'].includes(t.phase)) ?? tasks[0]
         if (!local && !isolated) throw new Error('请从有初始提交的 Git checkout 打开 Pi。')
         const choices: Choice<MenuAction>[] = []
-        const details = [cwd]
+        const details = [`${isolated ? 'Worktree' : 'Local'}${task ? ` · ${phases[task.phase]}${task.review ? ` · ${task.review.message}（${task.review.files.length} 个文件）` : ''}` : ''}`]
         if (task) {
-          details.push(`${phases[task.phase]}${task.review ? ` · ${task.review.message} (${task.review.files.length} 个文件)` : ''}`)
           if (task.journal || task.phase === 'creating') details.push(`已停止自动操作 · ${data.statePath}`, task.isolatedPath)
           if (task.cleanup?.status === 'retained') details.push(`保留 Worktree：${task.cleanup.reason}`, task.isolatedPath)
         }
+        details.push(`目录：${cwd}`)
         if (isolated) {
           choices.push({ label: '返回 Local', value: 'return' })
           if (!task?.journal && ['working', 'ready'].includes(isolated.phase)) choices.push({ label: '标记待验收（手动）', value: 'mark' })

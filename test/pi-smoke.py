@@ -48,16 +48,16 @@ export default function(pi) {
 
 
 class Pi:
-    def __init__(self, cwd, agent, provider):
-        self.screen = pyte.Screen(COLS, ROWS)
+    def __init__(self, cwd, agent, provider, theme='dark', cols=COLS, rows=ROWS):
+        self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         self.pid, self.fd = pty.fork()
         if not self.pid:
             os.chdir(cwd)
             os.environ.update(PI_CODING_AGENT_DIR=str(agent), TERM='xterm-256color', COLORTERM='truecolor')
-            os.execvp('pi', ['pi', '--tui-mode', 'fullscreen', '-ne', '--no-mcp', '-ns', '-np', '-na',
+            os.execvp('pi', ['pi', '--tui-mode', 'fullscreen', '--theme', theme, '-ne', '--no-mcp', '-ns', '-np', '-na',
                              '--provider', 'wtp-smoke', '--model', 'model', '-e', str(ROOT / 'src/index.ts'), '-e', str(provider)])
-        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLS, 0, 0))
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 
     def dump(self):
         return '\n'.join(line.rstrip() for line in self.screen.display)
@@ -81,7 +81,9 @@ class Pi:
         os.write(self.fd, data)
 
     def click(self, text):
-        x, y = self.until(text)
+        self.click_at(*self.until(text))
+
+    def click_at(self, x, y):
         self.send(f'\x1b[<0;{x};{y}M'.encode())
         time.sleep(.04)
         self.send(f'\x1b[<0;{x};{y}m'.encode())
@@ -176,6 +178,26 @@ def main():
             assert (first_path / 'task.txt').read_text() == 'task edit\n'
             assert (local / 'task.txt').read_text() == 'base\n'
         print('real Pi: checkbox delayed creation; unchecked send stayed Local; checked draft sent only once in Worktree', flush=True)
+        for theme, cols, rows in [('light', 110, 35), ('dark', 42, 11)]:
+            with Pi(local, agent, provider, theme, cols, rows) as pi:
+                pi.until('Local · 待验收')
+                pi.click('[ 工作树操作 ]')
+                _, border_y = pi.until('╭───')
+                border_x = pi.screen.display[border_y - 1].index('╭')
+                right_x = pi.screen.display[border_y - 1].index('╮', border_x)
+                title_x, title_y = pi.until('Worktree 预览工作台')
+                title = pi.screen.buffer[title_y - 1]
+                assert title[title_x - 1].bold and title[title_x - 1].bg != 'default'
+                _, cancel_y = pi.until('[ 关闭 ]')
+                cancel = pi.screen.buffer[cancel_y - 1]
+                assert cancel[border_x + 1].bg == cancel[right_x - 1].bg != 'default'
+                assert cancel[border_x + 1].bg != title[title_x - 1].bg
+                pi.click_at(border_x + 1, cancel_y)  # clicking the frame must not close the panel
+                pi.send(b'\x1b[A\x1b[A\r')
+                pi.until('确认：预览到 Local')
+                pi.click('[ 取消 ]')
+                assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'ready'
+        print('real Pi: opaque framed panels with highlighted selection in light and narrow dark terminals', flush=True)
         with Pi(local, agent, provider) as pi:
             pi.until('Local · 待验收')
             pi.click('[ 工作树操作 ]')
