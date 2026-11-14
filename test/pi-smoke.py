@@ -239,6 +239,7 @@ def main():
             pi.until('Worktree · 已预览')
             assert (local / 'task.txt').read_text() == 'task edit\n'
             assert git('rev-parse', 'HEAD') == head
+            (local / '.pi/loops.json').write_text('Local loop edited after preview')
             pi.click('[ 撤回预览 ]')
             pi.click('[ 执行撤回预览 ]')
             pi.until('Worktree · 待验收')
@@ -260,6 +261,7 @@ def main():
             pi.until('Pi 取消了切换，未提交。')
             assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'previewed' and first_path.is_dir()
             veto.unlink()
+            (local / '.pi/loops.json').write_text('Local loop edited before finalizing')
             pi.click('[ 确认提交 ]')
             pi.click('[ 执行确认提交 ]')
             pi.until('Local · 已交付')
@@ -267,7 +269,7 @@ def main():
             assert git('status', '--porcelain') == baseline
             assert task()['cleanup']['status'] == 'retained'
             assert (first_path / '.pi/loops.json').read_text() == 'Worktree loop'
-            assert (local / '.pi/loops.json').read_text() == 'Local loop'
+            assert (local / '.pi/loops.json').read_text() == 'Local loop edited before finalizing'
             print('real Pi: Worktree preview and rollback stay put; vetoed switch; task-only commit preserves both late .pi/loops.json files', flush=True)
             pi.click('[ ] 新建 Worktree')
             pi.until('[x] 新建 Worktree')

@@ -22,7 +22,7 @@ pi --tui-mode fullscreen -e /path/to/pi-worktree-preview/src/index.ts
 
 - 一个 Local checkout 同时只有一个进行中的任务。隔离目录从 Local 当时的 `HEAD` 建立，不复制 Local 的未提交改动和忽略文件。会话使用 Pi 原生持久化；不支持 `--no-session`。Worktree 隔离的是工作目录，不是安全沙箱。
 - 预览只合并标记待验收时锁定的文件和内容。Worktree 中清单内的工作区内容、文件类型或索引条目有变化时，需重新标记；此后清单外新增或变化的路径不会参与合并，有额外改动的 Worktree 会保留。旧版待验收记录在无法证明原快照时也需重新标记。
-- 撤回、提交前重新检查 Local 的 `HEAD`、索引和工作区。可可靠分离的同文件改动可共存；冲突或漂移则停止。不支持直接把在 Local 预览上做的修订提交回任务；请先将 Local 恢复到准确的预览状态，再撤回并在 Worktree 中修改。
+- 撤回、提交前重新检查 Local 的分支、`HEAD`、整个索引和预览涉及的路径。无关的未暂存改动（包括其他扩展写的状态文件）会保留，不阻止验收。预览路径或索引发生变化则停止。不支持直接把在 Local 预览上做的修订提交回任务；请先将受影响的路径恢复到预览状态，再撤回并在 Worktree 中修改。
 - 预览、撤回、提交前会在 Pi 配置目录 `worktree-preview/` 写入恢复记录（默认 `~/.pi/agent/worktree-preview/tasks.json`），并保留所需的 Git 快照或索引副本。中断后不自动重放或抢占残留锁。若工作台提示已停止，先备份 Local、Worktree 和恢复记录，再人工检查；不要直接删除锁、记录或 `refs/pi-worktree-preview/` 来强行继续。
 - 交付或放弃后，仅在校验通过时移除隔离 Worktree；忽略文件（包括构建产物）、特殊文件、后续改动，或 Pi 进程仍以该目录为启动目录，都会使 Worktree 被保留。Pi 会话历史不删除。保留的路径会出现在通知或工作台中。
 - 当前实现面向 macOS/Linux（已在 macOS 实测）。不支持 sparse checkout、submodule、嵌套仓库、特殊索引条目或影响快照的内容转换/合并属性。暂不预览 `.gitignore` 或 `.gitattributes` 的改动，因为它们可能改变其他文件的快照结果。交付使用 Git plumbing，不运行提交钩子、不签名、不推送。预览/撤回是多文件操作，不是原子交换；操作时不要让其他进程同时修改同一 checkout（例如自动格式化、构建写回或其他 Git 命令）。

@@ -193,6 +193,67 @@ test('ignored Local obstructions are rejected before any preview write', async t
   assert.equal((await f.latest()).journal, undefined)
 })
 
+test('unrelated Local worktree drift survives rollback and finalize, including writes during verification', async t => {
+  let operation: 'rollback' | 'finalize' | undefined
+  const f = await fixture(t, () => createSessionCheckoutApplyEngine({
+    beforeFinalLocalValidation: async () => {
+      if (operation) await writeFile(join(f.local, '.pi/loops.json'), `${operation} before write\n`)
+    },
+    afterLocalWriteBeforeVerification: async () => {
+      if (operation) await writeFile(join(f.local, '.pi/loops.json'), `${operation} after write\n`)
+    },
+  }), true)
+  await mkdir(join(f.local, '.pi'))
+  await writeFile(join(f.local, '.pi/loops.json'), 'at preview\n')
+  await writeFile(join(f.isolated, 'README.md'), 'previewed readme\n')
+  await f.ready()
+  await f.act('preview', await f.latest())
+  await writeFile(join(f.local, '.pi/loops.json'), 'after preview\n')
+  operation = 'rollback'
+  await f.act('rollback', await f.latest())
+  assert.equal(await exists(join(f.local, 'README.md')), false)
+  assert.equal(await exists(join(f.task.local.gitDir, 'index')), false)
+  assert.equal(await content(f.local, '.pi/loops.json'), 'rollback after write\n')
+  operation = undefined
+  await f.act('preview', await f.latest())
+  await writeFile(join(f.local, '.pi/loops.json'), 'after re-preview\n')
+  operation = 'finalize'
+  await f.act('finalize', await f.latest())
+  assert.equal(await git(f.local, 'show', '--format=', '--name-only'), 'README.md\n')
+  assert.equal(await content(f.local, '.pi/loops.json'), 'finalize after write\n')
+  assert.equal(await git(f.local, 'status', '--porcelain'), '?? .pi/\n')
+})
+
+test('a changed preview file, an invisible replacement of a deleted file, or a different ref blocks both actions', async t => {
+  const f = await fixture(t)
+  await writeFile(join(f.isolated, 'task.txt'), 'task edit\n')
+  await rm(join(f.isolated, 'staged.txt'))
+  await f.ready()
+  await f.act('preview', await f.latest())
+  const rejectBoth = async (pattern: RegExp) => {
+    for (const action of ['rollback', 'finalize'] as const) {
+      await assert.rejects(f.act(action, await f.latest()), pattern)
+      assert.equal((await f.latest()).journal, undefined)
+    }
+  }
+  await writeFile(join(f.local, 'task.txt'), 'late user edit\n')
+  await rejectBoth(/预览路径自预览后已变化.*task.txt/)
+  assert.equal(await content(f.local, 'task.txt'), 'late user edit\n')
+  await writeFile(join(f.local, 'task.txt'), 'task edit\n')
+  await mkdir(join(f.local, 'staged.txt'))
+  await rejectBoth(/预览路径自预览后已变化.*staged.txt/)
+  await rm(join(f.local, 'staged.txt'), { recursive: true })
+  await writeFile(join(f.task.local.gitDir, 'info/exclude'), '/staged.txt\n')
+  await symlink('task.txt', join(f.local, 'staged.txt'))
+  await rejectBoth(/预览路径自预览后已变化.*staged.txt/)
+  assert.equal(await readlink(join(f.local, 'staged.txt')), 'task.txt')
+  await rm(join(f.local, 'staged.txt'))
+  await git(f.local, 'branch', 'same-oid')
+  await git(f.local, 'symbolic-ref', 'HEAD', 'refs/heads/same-oid')
+  await rejectBoth(/分支/)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+})
+
 test('both post-preview actions fail closed on drift, including unrelated staged edits', async t => {
   const { local, isolated, latest, act, ready, base } = await fixture(t)
   await writeFile(join(isolated, 'task.txt'), 'task edit\n')
@@ -205,6 +266,21 @@ test('both post-preview actions fail closed on drift, including unrelated staged
   assert.equal(await content(local, 'task.txt'), 'task edit\n')
   assert.equal(await git(local, 'rev-parse', 'HEAD'), base)
   assert.equal((await latest()).phase, 'previewed')
+})
+
+test('finalize does not carry a task edit into a previously staged rename outside the preview', async t => {
+  const f = await fixture(t)
+  await git(f.local, 'mv', 'task.txt', 'renamed.txt')
+  await writeFile(join(f.local, 'task.txt'), 'task.txt base\n')
+  const staged = await git(f.local, 'diff', '--cached', '--binary')
+  await writeFile(join(f.isolated, 'task.txt'), 'task edit\n')
+  await f.ready()
+  await f.act('preview', await f.latest())
+  await assert.rejects(f.act('finalize', await f.latest()), /索引结果包含预览之外的文件/)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+  assert.equal(await git(f.local, 'diff', '--cached', '--binary'), staged)
+  assert.equal(await content(f.local, 'task.txt'), 'task edit\n')
+  assert.equal((await f.latest()).journal, undefined)
 })
 
 test('durable pending write is seen before final revalidation and blocks auto-replay', async t => {
@@ -298,6 +374,7 @@ test('finalize compensates to an absent index after a post-write error', async t
     assert.equal(journal?.indexBefore, null)
     assert.ok(journal?.indexAfter && await exists(journal.indexAfter))
     assert.equal(await exists(join(f.task.local.gitDir, 'index')), true)
+    await writeFile(join(f.local, 'later.txt'), 'keep on compensation\n')
     throw new Error('simulated post-write failure')
   } }), true)
   await writeFile(join(f.isolated, 'README.md'), 'previewed readme\n')
@@ -309,6 +386,7 @@ test('finalize compensates to an absent index after a post-write error', async t
   assert.equal(await content(f.local, 'README.md'), 'previewed readme\n')
   assert.equal(await exists(join(f.task.local.gitDir, 'index')), false)
   assert.equal(await exists(join(f.task.local.gitDir, 'index.lock')), false)
+  assert.equal(await content(f.local, 'later.txt'), 'keep on compensation\n')
 })
 
 test('finalize detects an index created after journaling even when it is logically empty', async t => {

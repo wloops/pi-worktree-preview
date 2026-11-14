@@ -145,16 +145,10 @@ export interface PreviewRecoveryBlockedAction {
   conflictingFiles?: string[]
 }
 
-export interface PreviewRecoverySafeRollback {
-  status: 'safe'
-  targetTreeOid: string
-}
-
 export interface PreviewRecoverySafeFinalize {
   status: 'safe'
   taskTreeOid: string
   finalIndexTreeOid: string
-  expectedWorkingTreeOid: string
   commitRequired: boolean
 }
 
@@ -221,7 +215,6 @@ export interface SessionCheckoutApplyEngine {
     /** Local 写入前持久化 receipt artifacts/journal；失败时不得触碰 Local。 */
     beforeWrite?(receipt: PreviewReceipt): Promise<void>
   }): Promise<PreviewResult>
-  /** Strictly read-only detached Preview recovery assessment; it persists no executable plan. */
   rollback(input: {
     localPath: string
     receipt: PreviewReceipt
@@ -422,15 +415,6 @@ function toProjectPath(repoPath: string, prefix: string): string {
   return prefix ? repoPath.slice(prefix.length + 1) : repoPath
 }
 
-async function isAncestor(checkoutPath: string, olderOid: string, newerOid: string): Promise<boolean> {
-  const result = await runGit(
-    checkoutPath,
-    ['merge-base', '--is-ancestor', olderOid, newerOid],
-    { allowedExitCodes: [0, 1] },
-  )
-  return result.exitCode === 0
-}
-
 async function changedTreePaths(
   checkoutPath: string,
   baseOid: string,
@@ -511,6 +495,11 @@ async function reviewWorkingEntry(root: string, path: string): Promise<{ bytes: 
   throw new StaleReviewError(path)
 }
 
+function gitBlobOid(bytes: Buffer, oidLength: number): string {
+  return createHash(oidLength === 64 ? 'sha256' : 'sha1')
+    .update(`blob ${bytes.length}\0`).update(bytes).digest('hex')
+}
+
 async function verifyReview(root: string, review: FrozenReview, objectEnv?: NodeJS.ProcessEnv, write = false) {
   const paths = new Set(review.entries.map(entry => entry.path))
   const index = entryMap((await runGit(root, ['ls-files', '--stage', '-z'])).stdout, 'index', paths)
@@ -520,8 +509,7 @@ async function verifyReview(root: string, review: FrozenReview, objectEnv?: Node
     if (!file && entry.working === null) continue
     if (!file || !entry.working) throw new StaleReviewError(entry.path)
     const [, oid] = entry.working.split(' ')
-    const object = createHash(oid.length === 64 ? 'sha256' : 'sha1')
-      .update(`blob ${file.bytes.length}\0`).update(file.bytes).digest('hex')
+    const object = gitBlobOid(file.bytes, oid.length)
     if (`${file.mode} ${object}` !== entry.working) throw new StaleReviewError(entry.path)
     if (write) {
       const written = stdoutText(await runGit(root, ['hash-object', '-w', '--stdin'], { input: file.bytes, env: objectEnv }))
@@ -943,79 +931,87 @@ async function createUserCommit(
   ))
 }
 
-async function prepareRollbackAssessment(
-  tempRoot: string,
-  sourceObjects: string,
-  objectDirectory: string,
-  localGitRoot: string,
-  current: CheckoutSnapshot,
-  receipt: PreviewReceipt,
-): Promise<PreviewRecoverySafeRollback | PreviewRecoveryBlockedAction> {
-  if (current.headRef !== receipt.localHeadRef) {
-    return { status: 'blocked', code: 'stale_local', message: hostMessage('theLocalBranchHasChangedPreviewCannotBeRolled') }
+async function receiptPaths(root: string, project: string, receipt: PreviewReceipt): Promise<string[]> {
+  const prefix = projectPrefix(root, project)
+  const paths = await changedTreePaths(root, receipt.localWorkingTreeOid, receipt.previewWorkingTreeOid, null, null)
+  const recorded = new Set(receipt.changedFiles)
+  if (prefix === null || paths.length !== recorded.size || paths.some(path =>
+    !reviewEntryPath(path, prefix) || !recorded.has(toProjectPath(path, prefix)))) {
+    throw new Error('预览记录中的文件清单与快照不一致；保留现场。')
   }
-  if (current.headOid !== receipt.localHeadOid && !await isAncestor(localGitRoot, receipt.localHeadOid, current.headOid)) {
-    return { status: 'blocked', code: 'stale_local', message: hostMessage('localHEADIsNotASafeFastForwardFrom') }
-  }
+  return paths
+}
 
-  let rollbackBaselineTreeOid = receipt.localWorkingTreeOid
-  let expectedPreviewTreeOid = receipt.previewWorkingTreeOid
-  if (current.headOid !== receipt.localHeadOid) {
-    const receiptHeadTreeOid = stdoutText(await runGit(localGitRoot, ['rev-parse', `${receipt.localHeadOid}^{tree}`]))
-    const advancedBaseline = await computeTreeMerge(
-      tempRoot, sourceObjects, objectDirectory, localGitRoot,
-      'preview-rollback-advanced-baseline', receiptHeadTreeOid, current.headTreeOid, receipt.localWorkingTreeOid,
-    )
-    if (advancedBaseline.status === 'conflict') {
-      return {
-        status: 'blocked', code: 'preview_modified',
-        message: hostMessage('newLocalCommitsConflictWithPrePreviewLocalChanges', { p0: advancedBaseline.conflictingFiles.join('、') }),
-        conflictingFiles: [...advancedBaseline.conflictingFiles],
-      }
-    }
-    const previewAbsence = await computeTreeMerge(
-      tempRoot, sourceObjects, objectDirectory, localGitRoot,
-      'preview-rollback-preview-absence', receipt.previewWorkingTreeOid, advancedBaseline.treeOid, receipt.localWorkingTreeOid,
-    )
-    if (previewAbsence.status === 'conflict') {
-      return {
-        status: 'blocked', code: 'preview_modified',
-        message: hostMessage('newLocalCommitsConflictWithThePreviewTaskChanges', { p0: previewAbsence.conflictingFiles.join('、') }),
-        conflictingFiles: [...previewAbsence.conflictingFiles],
-      }
-    }
-    if (previewAbsence.treeOid !== advancedBaseline.treeOid) {
-      return {
-        status: 'blocked', code: 'preview_modified',
-        message: hostMessage('newLocalCommitsAlreadyContainSomeOrAllPreview'),
-      }
-    }
-    const advancedPreview = await computeTreeMerge(
-      tempRoot, sourceObjects, objectDirectory, localGitRoot,
-      'preview-rollback-advanced-preview', receipt.localWorkingTreeOid, advancedBaseline.treeOid, receipt.previewWorkingTreeOid,
-    )
-    if (advancedPreview.status === 'conflict') {
-      return {
-        status: 'blocked', code: 'preview_modified',
-        message: hostMessage('newLocalCommitsConflictWithThePreviewTaskChanges', { p0: advancedPreview.conflictingFiles.join('、') }),
-        conflictingFiles: [...advancedPreview.conflictingFiles],
-      }
-    }
-    rollbackBaselineTreeOid = advancedBaseline.treeOid
-    expectedPreviewTreeOid = advancedPreview.treeOid
+function pathsOverlap(a: string, b: string): boolean {
+  const key = (path: string) => path.normalize('NFC').toLowerCase()
+  const x = key(a), y = key(b)
+  return x === y || x.startsWith(`${y}/`) || y.startsWith(`${x}/`)
+}
+
+async function checkWorkingScope(root: string, actual: string, expected: string, paths: string[],
+  objectDirectory: string | null, sourceObjects: string | null): Promise<ApplyError | undefined> {
+  const changed = (await changedTreePaths(root, expected, actual, objectDirectory, sourceObjects))
+    .find(path => paths.some(task => pathsOverlap(path, task)))
+  if (changed !== undefined) {
+    return { code: 'preview_modified', message: `Local 的预览路径自预览后已变化：${JSON.stringify(changed)}；保留现场。` }
   }
-  const rollbackTree = await computeTreeMerge(
-    tempRoot, sourceObjects, objectDirectory, localGitRoot,
-    'preview-rollback', expectedPreviewTreeOid, current.treeOid, rollbackBaselineTreeOid,
-  )
-  if (rollbackTree.status === 'conflict') {
-    return {
-      status: 'blocked', code: 'preview_modified',
-      message: hostMessage('localHasAdditionalChangesInThePreviewAreaSafe', { p0: rollbackTree.conflictingFiles.join('、') }),
-      conflictingFiles: [...rollbackTree.conflictingFiles],
+  // Git's view can omit ignored replacements or normalize an aliased name.
+  const entries = entryMap((await runGit(root, ['ls-tree', '-rz', expected])).stdout, 'tree', new Set(paths))
+  for (const path of paths) {
+    const wanted = entries.get(path)
+    let matches = false
+    try {
+      if (wanted) {
+        const file = await reviewWorkingEntry(root, path)
+        matches = file !== null && `${file.mode} ${gitBlobOid(file.bytes, expected.length)}` === wanted
+      } else {
+        matches = await matchesAbsentPath(root, path, entries)
+      }
+    } catch (error) {
+      if (!(error instanceof StaleReviewError)) throw error
+    }
+    if (!matches) {
+      return { code: 'preview_modified', message: `Local 的预览路径自预览后已变化：${JSON.stringify(path)}；保留现场。` }
     }
   }
-  return { status: 'safe', targetTreeOid: rollbackTree.treeOid }
+}
+
+async function matchesAbsentPath(root: string, path: string, entries: ReadonlyMap<string, string>): Promise<boolean> {
+  const statAt = (name: string) => lstat(join(root, name)).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') throw error
+    return undefined
+  })
+  const matchesDirectory = async (name: string): Promise<boolean> => {
+    const items = await readdir(join(root, name), { withFileTypes: true })
+    if (!items.length) return false
+    for (const item of items) {
+      const child = `${name}/${item.name}`
+      if (item.isDirectory() ? !await matchesDirectory(child) : !entries.has(child)) return false
+    }
+    return true
+  }
+  let parent = ''
+  for (const part of path.split('/')) {
+    const name = parent ? `${parent}/${part}` : part
+    const stat = await statAt(name)
+    if (!stat) return true
+    if (!(await readdir(join(root, parent))).includes(part)) return false
+    if (!stat.isDirectory()) return name !== path && entries.has(name)
+    parent = name
+  }
+  // A file-to-directory replacement may contain reviewed descendants, but no
+  // ignored or empty obstructions that Git's snapshot would omit.
+  return matchesDirectory(path)
+}
+
+function matchesReceiptIndex(current: CheckoutSnapshot, receipt: PreviewReceipt): boolean {
+  // Legacy receipts already bind the exact index entries and both tree IDs.
+  // Reconstruct those hashes without using today's unrelated worktree content.
+  const fingerprint = (tree: string) => snapshotFingerprint(current.headOid, current.headRef, current.indexEntries, tree)
+  return current.headOid === receipt.localHeadOid && current.headRef === receipt.localHeadRef &&
+    current.indexTreeOid === receipt.localIndexTreeOid &&
+    fingerprint(receipt.localWorkingTreeOid) === receipt.localFingerprintBefore &&
+    fingerprint(receipt.previewWorkingTreeOid) === receipt.localFingerprintPreview
 }
 
 async function prepareFinalizeAssessment(
@@ -1028,23 +1024,6 @@ async function prepareFinalizeAssessment(
 ): Promise<PreviewRecoverySafeFinalize | PreviewRecoveryBlockedAction> {
   if (!receipt.localHeadRef?.startsWith('refs/heads/')) {
     return { status: 'blocked', code: 'operation_not_allowed', message: hostMessage('localIsNotOnANormalBranchATask') }
-  }
-  if (current.headRef !== receipt.localHeadRef) {
-    return { status: 'blocked', code: 'stale_local', message: hostMessage('theLocalBranchHasChangedThePreviewCommitCannot') }
-  }
-  if (current.headOid !== receipt.localHeadOid && !await isAncestor(localGitRoot, receipt.localHeadOid, current.headOid)) {
-    return { status: 'blocked', code: 'stale_local', message: hostMessage('localHEADIsNotASafeFastForwardFrom281') }
-  }
-  const previewRemoval = await computeTreeMerge(
-    tempRoot, sourceObjects, objectDirectory, localGitRoot,
-    'preview-finalize-separation', receipt.previewWorkingTreeOid, current.treeOid, receipt.localWorkingTreeOid,
-  )
-  if (previewRemoval.status === 'conflict') {
-    return {
-      status: 'blocked', code: 'preview_modified',
-      message: hostMessage('localHasAdditionalChangesInThePreviewAreaA', { p0: previewRemoval.conflictingFiles.join('、') }),
-      conflictingFiles: [...previewRemoval.conflictingFiles],
-    }
   }
   const taskTree = await computeTreeMerge(
     tempRoot, sourceObjects, objectDirectory, localGitRoot,
@@ -1076,7 +1055,6 @@ async function prepareFinalizeAssessment(
   }
   return {
     status: 'safe', taskTreeOid: taskTree.treeOid, finalIndexTreeOid: finalIndexTree.treeOid,
-    expectedWorkingTreeOid: current.treeOid,
     commitRequired: receipt.changedFiles.length > 0 && taskTree.treeOid !== current.headTreeOid,
   }
 }
@@ -1551,27 +1529,18 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         objectDirectory,
         sourceObjects,
       )
-      if (current.fingerprint !== input.receipt.localFingerprintPreview) {
-        return { status: 'error', error: { code: 'stale_local', message: 'Local 自预览后已变化；停止撤回，保留现场。' } }
+      const receipt = input.receipt
+      if (!matchesReceiptIndex(current, receipt)) {
+        return { status: 'error', error: { code: 'stale_local', message: 'Local 自预览后已变化（分支、HEAD 或索引）；停止撤回，保留现场。' } }
       }
-      const assessment = await prepareRollbackAssessment(
-        tempRoot,
-        sourceObjects,
-        objectDirectory,
-        localGitRoot,
-        current,
-        input.receipt,
-      )
-      if (assessment.status === 'blocked') {
-        return { status: 'error', error: { code: assessment.code, message: assessment.message } }
-      }
-      const rollbackPatch = await treePatch(
-        localGitRoot,
-        current.treeOid,
-        assessment.targetTreeOid,
-        objectDirectory,
-        sourceObjects,
-      )
+      const paths = await receiptPaths(localGitRoot, input.localPath, receipt)
+      const checkScope = (actual: string, expected: string, objects: string | null, alternates: string | null) =>
+        checkWorkingScope(localGitRoot, actual, expected, paths, objects, alternates)
+      const initialError = await checkScope(current.treeOid, receipt.previewWorkingTreeOid, objectDirectory, sourceObjects)
+      if (initialError) return { status: 'error', error: initialError }
+      const rollbackPatch = await treePatch(localGitRoot, receipt.previewWorkingTreeOid, receipt.localWorkingTreeOid, objectDirectory, sourceObjects)
+      const checkPatch = () => checkPreviewPatch(localGitRoot, rollbackPatch, paths, receipt.previewWorkingTreeOid, receipt.localWorkingTreeOid)
+      if (rollbackPatch.length) await checkPatch()
       // Journal persistence may await registry I/O, so it must happen before the authoritative
       // final Local CAS. From the snapshot below to git apply there is no callback/yield seam.
       await input.beforeWrite?.()
@@ -1582,54 +1551,34 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         objectDirectory,
         sourceObjects,
       )
-      if (
-        finalLocal.fingerprint !== current.fingerprint
-        || finalLocal.headOid !== current.headOid
-        || finalLocal.headRef !== current.headRef
-      ) {
+      if (!matchesReceiptIndex(finalLocal, receipt)) {
         return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedBeforePreviewRollbackRetry') } }
       }
+      const finalError = await checkScope(finalLocal.treeOid, receipt.previewWorkingTreeOid, objectDirectory, sourceObjects)
+      if (finalError) return { status: 'error', error: finalError }
       if (rollbackPatch.length > 0) {
+        await checkPatch()
         await runGit(localGitRoot, ['apply', '-p1', '--binary', '--whitespace=nowarn'], { input: rollbackPatch })
-        await syncPatchedPaths(localGitRoot, input.receipt.changedFiles)
+        await syncPatchedPaths(localGitRoot, paths)
       }
-      let rolledBack: CheckoutSnapshot
       try {
         await this.options.afterLocalWriteBeforeVerification?.()
-        rolledBack = await this.captureSnapshot(
+        const rolledBack = await this.captureSnapshot(
           localGitRoot,
           join(tempRoot, 'rolled-back.index'),
-          null,
-          null,
+          objectDirectory,
+          sourceObjects,
         )
+        const scopeError = await checkScope(rolledBack.treeOid, receipt.localWorkingTreeOid, objectDirectory, sourceObjects)
+        if (!matchesReceiptIndex(rolledBack, receipt) || scopeError) {
+          throw new Error(scopeError?.message ?? hostMessage('theLocalSnapshotAfterPreviewRollbackDoesNotMatch'))
+        }
       } catch (error) {
         return {
           status: 'error',
           error: {
             code: 'git_error',
             message: hostMessage('cannotVerifyAfterWritingPreviewRollbackTheEnvironmentMust', { p0: this.errorMessage(error) }),
-            recoveryState: 'uncertain',
-          },
-        }
-      }
-      const expectedFingerprint = snapshotFingerprint(
-        current.headOid,
-        current.headRef,
-        current.indexEntries,
-        assessment.targetTreeOid,
-      )
-      if (
-        rolledBack.headOid !== current.headOid
-        || rolledBack.headRef !== current.headRef
-        || rolledBack.indexTreeOid !== current.indexTreeOid
-        || rolledBack.treeOid !== assessment.targetTreeOid
-        || rolledBack.fingerprint !== expectedFingerprint
-      ) {
-        return {
-          status: 'error',
-          error: {
-            code: 'git_error',
-            message: hostMessage('theLocalSnapshotAfterPreviewRollbackDoesNotMatch'),
             recoveryState: 'uncertain',
           },
         }
@@ -1669,9 +1618,15 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         objectDirectory,
         sourceObjects,
       )
-      if (current.fingerprint !== input.receipt.localFingerprintPreview) {
-        return { status: 'error', error: { code: 'stale_local', message: 'Local 自预览后已变化；停止提交，保留现场。' } }
+      const receipt = input.receipt
+      if (!matchesReceiptIndex(current, receipt)) {
+        return { status: 'error', error: { code: 'stale_local', message: 'Local 自预览后已变化（分支、HEAD 或索引）；停止提交，保留现场。' } }
       }
+      const paths = await receiptPaths(localGitRoot, input.localPath, receipt)
+      const checkScope = (actual: string) =>
+        checkWorkingScope(localGitRoot, actual, receipt.previewWorkingTreeOid, paths, objectDirectory, sourceObjects)
+      const initialError = await checkScope(current.treeOid)
+      if (initialError) return { status: 'error', error: initialError }
       const realIndexPath = await resolveIndexPath(localGitRoot)
       const originalIndexBytes = await readIndexBytes(realIndexPath)
       const assessment = await prepareFinalizeAssessment(
@@ -1694,13 +1649,11 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
           objectDirectory,
           sourceObjects,
         )
-        if (
-          finalLocal.headOid !== current.headOid
-          || finalLocal.headRef !== current.headRef
-          || finalLocal.fingerprint !== current.fingerprint
-        ) {
+        if (!matchesReceiptIndex(finalLocal, receipt)) {
           return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedBeforeFinalizingPreviewRetry') } }
         }
+        const finalError = await checkScope(finalLocal.treeOid)
+        if (finalError) return { status: 'error', error: finalError }
         return {
           status: 'finished',
           changedFiles: [],
@@ -1709,11 +1662,13 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         }
       }
 
-      const scope = projectPrefix(localGitRoot, input.localPath)
-      const committedPaths = await changedTreePaths(localGitRoot, current.headTreeOid, assessment.taskTreeOid, objectDirectory, sourceObjects)
-      if (scope === null || committedPaths.some(path => !isProjectPath(path, scope) ||
-          !input.receipt.changedFiles.includes(toProjectPath(path, scope)))) {
-        return { status: 'error', error: { code: 'commit_isolation_conflict', message: '提交结果包含预览之外的文件；Local 未提交。' } }
+      const [committedPaths, reindexedPaths] = await Promise.all([
+        changedTreePaths(localGitRoot, current.headTreeOid, assessment.taskTreeOid, objectDirectory, sourceObjects),
+        changedTreePaths(localGitRoot, receipt.localIndexTreeOid, assessment.finalIndexTreeOid, objectDirectory, sourceObjects),
+      ])
+      const taskPaths = new Set(paths)
+      if ([...committedPaths, ...reindexedPaths].some(path => !taskPaths.has(path))) {
+        return { status: 'error', error: { code: 'commit_isolation_conflict', message: '提交或索引结果包含预览之外的文件；Local 未提交。' } }
       }
       const taskPatch = await treePatch(
         localGitRoot,
@@ -1753,12 +1708,6 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         await runGit(localGitRoot, ['ls-files', '--stage', '-z'], { env: { GIT_INDEX_FILE: finalIndexPath } })
       ).stdout
       const intendedIndexBytes = await readFile(finalIndexPath)
-      const expectedFingerprint = snapshotFingerprint(
-        commitOid,
-        current.headRef,
-        expectedIndexEntries,
-        assessment.expectedWorkingTreeOid,
-      )
       await input.beforeCommit?.(commitOid, originalIndexBytes, intendedIndexBytes)
 
       const branchRef = current.headRef
@@ -1789,20 +1738,23 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         sourceObjects,
       )
       const finalIndexBytes = await readIndexBytes(realIndexPath)
-      if (
-        finalLocal.headOid !== current.headOid
-        || finalLocal.headRef !== current.headRef
-        || finalLocal.fingerprint !== current.fingerprint
-        || !sameIndexBytes(finalIndexBytes, originalIndexBytes)
-      ) {
+      if (!matchesReceiptIndex(finalLocal, receipt) || !sameIndexBytes(finalIndexBytes, originalIndexBytes)) {
         return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedBeforeThePreviewCommitWasWrittenRetry') } }
       }
+      const finalError = await checkScope(finalLocal.treeOid)
+      if (finalError) return { status: 'error', error: finalError }
 
+      // Updating a named branch gives an OID CAS without following a different
+      // checkout's HEAD. Recheck the symbolic ref after filesystem verification.
+      const headRef = await runGit(localGitRoot, ['symbolic-ref', '--quiet', 'HEAD'], { allowedExitCodes: [0, 1] })
+      if (headRef.exitCode !== 0 || stdoutText(headRef) !== branchRef) {
+        return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedBeforeThePreviewCommitWasWrittenRetry') } }
+      }
       let refUpdated = false
       let indexReplaced = false
       let writeError: unknown = null
       try {
-        await runGit(localGitRoot, ['update-ref', branchRef, commitOid, current.headOid])
+        await runGit(localGitRoot, ['update-ref', '--no-deref', branchRef, commitOid, current.headOid])
         refUpdated = true
         await rename(ownedIndexLock, realIndexPath)
         ownedIndexLock = null
@@ -1818,16 +1770,17 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
           const committed = await this.captureSnapshot(
             localGitRoot,
             join(tempRoot, 'committed.index'),
-            null,
-            null,
+            objectDirectory,
+            sourceObjects,
           )
+          const scopeError = await checkScope(committed.treeOid)
           const committedIndexBytes = await readIndexBytes(realIndexPath)
           if (
             committed.headOid === commitOid
             && committed.headRef === branchRef
             && committed.indexTreeOid === assessment.finalIndexTreeOid
-            && committed.treeOid === assessment.expectedWorkingTreeOid
-            && committed.fingerprint === expectedFingerprint
+            && committed.indexEntries.equals(expectedIndexEntries)
+            && !scopeError
             && sameIndexBytes(committedIndexBytes, intendedIndexBytes)
           ) {
             await removeBestEffort(backupIndex)
@@ -1839,7 +1792,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
               nextBaseOid: input.receipt.isolatedSnapshotOid,
             }
           }
-          writeError = new Error(hostMessage('previewCommitVerificationFailedAfterWriting'))
+          writeError = new Error(scopeError?.message ?? hostMessage('previewCommitVerificationFailedAfterWriting'))
         } catch (error) {
           writeError = error
         }
@@ -1850,7 +1803,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         // The ref moved but the index replacement did not. We still own index.lock, so no Git
         // index writer can race the ref CAS rollback; the real index is already the original one.
         try {
-          await runGit(localGitRoot, ['update-ref', branchRef, current.headOid, commitOid])
+          await runGit(localGitRoot, ['update-ref', '--no-deref', branchRef, current.headOid, commitOid])
           refUpdated = false
           await unlink(ownedIndexLock)
           ownedIndexLock = null
@@ -1867,7 +1820,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
           if (!sameIndexBytes(currentIndexBytes, intendedIndexBytes)) {
             rollbackErrors.push(hostMessage('indexLocalIndexChangedAfterPreviewWroteItsChanges'))
           } else {
-            await runGit(localGitRoot, ['update-ref', branchRef, current.headOid, commitOid])
+            await runGit(localGitRoot, ['update-ref', '--no-deref', branchRef, current.headOid, commitOid])
             refUpdated = false
             if (restoreBytes === null) {
               await unlink(realIndexPath)
@@ -1891,15 +1844,13 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
           const restoredLocal = await this.captureSnapshot(
             localGitRoot,
             join(tempRoot, 'restored.index'),
-            null,
-            null,
+            objectDirectory,
+            sourceObjects,
           )
+          const scopeError = await checkScope(restoredLocal.treeOid)
           const restoredIndexBytes = await readIndexBytes(realIndexPath)
-          restored = restoredLocal.headOid === current.headOid
-            && restoredLocal.headRef === current.headRef
-            && restoredLocal.indexTreeOid === current.indexTreeOid
-            && restoredLocal.treeOid === current.treeOid
-            && restoredLocal.fingerprint === current.fingerprint
+          restored = matchesReceiptIndex(restoredLocal, receipt)
+            && !scopeError
             && sameIndexBytes(restoredIndexBytes, originalIndexBytes)
           if (ownedIndexLock) {
             await unlink(ownedIndexLock)
