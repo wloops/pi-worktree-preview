@@ -257,17 +257,17 @@ def main():
             veto = base / 'veto-switch'
             veto.touch()
             pi.click('[ 确认提交 ]')
-            pi.click('[ 执行确认提交 ]')
+            pi.click('[ 提交并清理 Worktree（默认） ]')
             pi.until('Pi 取消了切换，未提交。')
             assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'previewed' and first_path.is_dir()
             veto.unlink()
             (local / '.pi/loops.json').write_text('Local loop edited before finalizing')
             pi.click('[ 确认提交 ]')
-            pi.click('[ 执行确认提交 ]')
+            pi.click('[ 提交并清理 Worktree（默认） ]')
             pi.until('Local · 已交付')
             assert git('show', '--format=', '--name-only') == 'task.txt'
             assert git('status', '--porcelain') == baseline
-            assert task()['cleanup']['status'] == 'retained'
+            assert task()['cleanup']['status'] == 'retained' and not task()['cleanup'].get('requested')
             assert (first_path / '.pi/loops.json').read_text() == 'Worktree loop'
             assert (local / '.pi/loops.json').read_text() == 'Local loop edited before finalizing'
             print('real Pi: Worktree preview and rollback stay put; vetoed switch; task-only commit preserves both late .pi/loops.json files', flush=True)
@@ -309,13 +309,30 @@ def main():
             pi.until('Worktree · 已预览')
             assert not index.exists()
             pi.click('[ 确认提交 ]')
-            pi.click('[ 执行确认提交 ]')
+            pi.click('[ 提交并保留 Worktree ]')
             pi.until('Local · 已交付')
             assert index.is_file()
             assert git('rev-parse', 'HEAD^') == head
             assert git('show', '--format=', '--name-only') == 'task.txt'
             assert git('status', '--porcelain') == '?? private.txt'
-            print('real Pi: empty initial commit and absent index finalize successfully', flush=True)
+            retained_path = Path(task()['isolatedPath'])
+            task_id = task()['id'][:8]
+            assert task()['cleanup']['requested'] is True
+            assert (retained_path / 'task.txt').read_text() == 'task edit\n'
+        # Session navigation is read-only and must not require the original branch
+        # or a clean Git-operation state in the retained environment.
+        git('switch', '-qc', 'inspect-retained')
+        isolated_git_dir = Path(task()['isolated']['gitDir'])
+        (isolated_git_dir / 'CHERRY_PICK_HEAD').write_text(head + '\n')
+        with Pi(local, agent, provider) as pi:
+            pi.click('[ 已保留的 Worktree ]')
+            pi.click(f'[ {task_id} · Isolated smoke change ]')
+            pi.until('Worktree · 已交付')
+            pi.until('Worktree ready.')
+            pi.click('[ 工作树操作 ]')
+            pi.click('[ 返回 Local ]')
+            pi.until('Local · 已交付')
+            print('real Pi: explicit retention with absent Local index; environment and session reopen after restart', flush=True)
 
 
 if __name__ == '__main__':

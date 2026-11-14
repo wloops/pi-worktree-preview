@@ -21,7 +21,7 @@ export interface Task {
   receipt?: PreviewReceipt
   // A null indexBefore explicitly records that no index file existed.
   journal?: { operation: 'preview' | 'rollback' | 'finalize' | 'cleanup'; at: number; commitOid?: string; indexBefore?: string | null; indexAfter?: string }
-  cleanup?: { status: 'done' | 'retained'; reason?: string }
+  cleanup?: { status: 'done' | 'retained'; reason?: string; requested?: true }
   commitOid?: string | null
 }
 interface State { version: 1; tasks: Task[] }
@@ -143,16 +143,22 @@ export class TaskStore {
     })
   }
 
-  async validateIsolated(task: Task) {
+  async validateIsolatedIdentity(task: Task) {
     const expected = task.isolated
     if (!expected || task.isolatedPath !== join(this.worktrees, task.id) || expected.root !== task.isolatedPath ||
         expected.root === task.local.root || expected.gitDir === task.local.gitDir || expected.commonDir !== task.local.commonDir ||
         !same(await checkout(task.isolatedPath), expected)) throw new Error('隔离 Worktree 的身份已变化；保留现场。')
-    await assertOrdinary(expected)
+    return expected
+  }
+
+  async validateIsolated(task: Task) { await assertOrdinary(await this.validateIsolatedIdentity(task)) }
+
+  async validateLocalIdentity(task: Task) {
+    if (!same(await checkout(task.local.root), task.local)) throw new Error('Local checkout 的身份已变化。')
   }
 
   async validateLocal(task: Task) {
-    if (!same(await checkout(task.local.root), task.local)) throw new Error('Local checkout 的身份已变化。')
+    await this.validateLocalIdentity(task)
     await assertOrdinary(task.local)
     if (await normalRef(task.local.root) !== task.localHeadRef) throw new Error('Local 分支已变化；保留现场。')
   }
@@ -188,7 +194,9 @@ export class TaskStore {
   }
 
   /** Expected tokens tie the confirmation to the state that the user actually saw. */
-  async act(id: string, action: Action, expected: { phase: Phase; reviewId?: string; previewId?: string; discardFingerprint?: string }): Promise<Task> {
+  async act(id: string, action: Action, expected: {
+    phase: Phase; reviewId?: string; previewId?: string; discardFingerprint?: string; keepWorktree?: boolean
+  }): Promise<Task> {
     return this.locked(async (state, save) => {
       const task = state.tasks.find(t => t.id === id)
       if (!task || task.journal || task.phase !== expected.phase || task.review?.id !== expected.reviewId || task.receipt?.previewId !== expected.previewId) {
@@ -247,6 +255,7 @@ export class TaskStore {
         } else if (action === 'finalize' && task.phase === 'previewed' && task.receipt && task.review) {
           const done = await engine.finalize({ localPath: task.local.root, receipt: task.receipt, commitMessage: task.review.message, beforeCommit: async (commitOid, before, after) => {
             await this.validateLocal(task)
+            if (expected.keepWorktree) await this.validateIsolatedIdentity(task)
             const prefix = join(this.directory, `${task.id}-${task.receipt!.previewId}`)
             const indexBefore = before === null ? null : `${prefix}.index-before`
             const indexAfter = `${prefix}.index-after`
@@ -259,6 +268,7 @@ export class TaskStore {
           if (done.status === 'error') engineError(done)
           task.phase = 'delivered'
           task.commitOid = done.commitOid
+          if (expected.keepWorktree) task.cleanup = { status: 'retained', reason: '按用户选择保留环境。', requested: true }
           const journal = task.journal as Task['journal']
           delete task.journal
           // Persist delivery independently before cleanup can do anything destructive.
@@ -266,10 +276,12 @@ export class TaskStore {
           for (const file of [journal?.indexBefore, journal?.indexAfter]) {
             if (file) await rm(file, { force: true }).catch(() => {})
           }
-          try {
-            await this.cleanup(task, task.receipt.isolatedFingerprint, save)
-          } catch (error) {
-            throw new Error(`已提交 ${done.commitOid}，但未能确认 Worktree 清理完成：${errText(error)}`, { cause: error })
+          if (!expected.keepWorktree) {
+            try {
+              await this.cleanup(task, task.receipt.isolatedFingerprint, save)
+            } catch (error) {
+              throw new Error(`已提交 ${done.commitOid}，但未能确认 Worktree 清理完成：${errText(error)}`, { cause: error })
+            }
           }
           await this.unpin(task).catch(() => {})
         } else throw new Error('当前阶段不允许此操作。')

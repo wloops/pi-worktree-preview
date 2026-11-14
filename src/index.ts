@@ -9,7 +9,7 @@ import { checkout, shortSessionName, TaskStore, type Action, type SessionLink, t
 const NAME = 'worktree-preview'
 const TOOL = 'worktree_ready_for_review'
 const labels: Record<Action, string> = { preview: '预览到 Local', rollback: '撤回预览', finalize: '确认提交', discard: '放弃任务' }
-type MenuAction = Action | 'arm' | 'resume' | 'return' | 'mark' | 'close'
+type MenuAction = Action | 'arm' | 'resume' | 'retained' | 'return' | 'mark' | 'close'
 const phases = { creating: '创建中断', working: '进行中', ready: '待验收', previewed: '已预览', delivered: '已交付', discarded: '已放弃' }
 const clean = (s: string) => s.replace(/[\p{Cc}\p{Cf}]/gu, '?')
 const message = (e: unknown) => clean(e instanceof Error ? e.message : String(e))
@@ -31,6 +31,9 @@ function deliveryChoices(task: Task | undefined, allowed: boolean): Choice<Actio
   return []
 }
 const localCheck = { label: '打开 Local 检查', value: 'return' } as const
+const retainedChoice = { label: '已保留的 Worktree', value: 'retained' } as const
+const retainedTasks = (tasks: Task[]) => tasks.filter(task =>
+  task.phase === 'delivered' && !task.journal && task.cleanup?.requested && task.isolatedSession)
 const taskVersion = (task?: Task) => task && JSON.stringify([task.id, task.phase, task.review?.id, task.receipt?.previewId])
 async function existing(file: string) {
   try { return (await lstat(file)).isFile() } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false; throw e }
@@ -47,11 +50,15 @@ async function newSession(cwd: string, name: string, sessionDir?: string): Promi
 }
 type SwitchOptions = NonNullable<Parameters<ExtensionCommandContext['switchSession']>[1]>
 
-async function switchTo(ctx: ExtensionCommandContext, link: SessionLink, withSession?: SwitchOptions['withSession']) {
+async function validateSession(link: SessionLink) {
   if (!isAbsolute(link.file) || !await existing(link.file)) throw new Error(`Pi 会话文件不存在：${link.file}`)
   if (!(await lstat(link.cwd)).isDirectory()) throw new Error(`会话工作目录不存在：${link.cwd}`)
   const sm = SessionManager.open(link.file)
   if (sm.getSessionId() !== link.id || sm.getHeader()?.cwd !== link.cwd) throw new Error('会话身份或工作目录已变化。')
+}
+
+async function switchTo(ctx: ExtensionCommandContext, link: SessionLink, withSession?: SwitchOptions['withSession']) {
+  await validateSession(link)
   return ctx.switchSession(link.file, { withSession })
 }
 
@@ -173,6 +180,7 @@ export default function extension(pi: ExtensionAPI) {
     const active = currentTask(state.isolated, state.tasks)
     const direct: Choice<MenuAction>[] = deliveryChoices(active, !state.isolated || isBoundSession(ctx, active?.isolatedSession))
     if (state.isolated && active?.phase === 'previewed' && !active.journal) direct.unshift(localCheck)
+    if (retainedTasks(state.tasks).length) direct.push(retainedChoice)
     const scope = state.isolated ? 'Worktree' : 'Local'
     const status = active ? ` · ${active.journal ? '恢复记录：已停止' : phases[active.phase]}` : ''
     const canArm = !active || (!state.isolated && !active.journal && ['delivered', 'discarded'].includes(active.phase))
@@ -246,7 +254,9 @@ export default function extension(pi: ExtensionAPI) {
     if (!task || task.isolatedSession?.id !== ctx.sessionManager.getSessionId()) return
     const guidance = task.phase === 'previewed'
       ? 'Local has an active preview. Discuss the changes without modifying files. If more edits are needed, ask the user to click 撤回预览 first; do not roll back yourself.'
-      : `After completing and verifying the requested task, call ${TOOL} with a short commit title. After marking ready, do not modify the worktree unless the user asks for more work.`
+      : task.phase === 'delivered' || task.phase === 'discarded'
+        ? 'This task is closed. Use this environment for inspection only; do not mark it ready again. Ask the user to start a new task from Local for further edits.'
+        : `After completing and verifying the requested task, call ${TOOL} with a short commit title. After marking ready, do not modify the worktree unless the user asks for more work.`
     return { systemPrompt: `${event.systemPrompt}\n\nThis is a managed isolated Git worktree. Work only in the active cwd; do not write to Local or deliver changes yourself. ${guidance} The user alone controls preview, rollback, delivery and discard.` }
   })
   pi.registerTool({
@@ -336,6 +346,8 @@ export default function extension(pi: ExtensionAPI) {
           if (task.isolatedSession) choices.unshift({ label: '进入 / 恢复 Worktree', value: 'resume' })
           if (task.phase === 'working' || task.phase === 'ready') choices.push({ label: labels.discard, value: 'discard' })
         }
+        const retained = retainedTasks(tasks)
+        if (retained.length) choices.push(retainedChoice)
         choices.push({ label: '关闭', value: 'close' })
         if (intent && (intent.sessionId !== ctx.sessionManager.getSessionId() || intent.taskVersion !== taskVersion(task) ||
             !choices.some(option => option.value === intent.choice))) throw new Error('任务状态已变化，请重新选择。')
@@ -346,12 +358,17 @@ export default function extension(pi: ExtensionAPI) {
           const id = ctx.sessionManager.getSessionId()
           armedSession = armedSession === id ? undefined : id
         } else if (choice === 'return' && isolated) {
-          await data.validateLocal(isolated)
+          await data.validateLocalIdentity(isolated)
           const moved = await switchTo(ctx, isolated.localSession, async () => { switching = true })
           if (moved.cancelled) throw new Error('Pi 取消了切换。')
-        } else if (choice === 'resume' && task?.isolatedSession) {
-          await data.validateIsolated(task)
-          const moved = await switchTo(ctx, task.isolatedSession, async () => { switching = true })
+        } else if (choice === 'retained' || (choice === 'resume' && task?.isolatedSession)) {
+          const target = choice === 'retained' ? await pick<Task | undefined>(ctx, '已保留的 Worktree', ['任务已交付，可恢复会话检查原环境。'], [
+            ...retained.map(item => ({ label: `${item.id.slice(0, 8)} · ${item.review?.message ?? 'Worktree'}`, value: item })),
+            { label: '取消', value: undefined },
+          ]) : task
+          if (!target?.isolatedSession || !ctx.isIdle()) return
+          await data.validateIsolatedIdentity(target)
+          const moved = await switchTo(ctx, target.isolatedSession, async () => { switching = true })
           if (moved.cancelled) throw new Error('Pi 取消了切换。')
         } else if (choice === 'mark' && isolated) {
           const link = sessionLink(ctx)
@@ -372,16 +389,27 @@ export default function extension(pi: ExtensionAPI) {
           if (relevantFiles.length > 3) summary.push(`… 共 ${relevantFiles.length} 个文件`)
           const leavesWorktree = act === 'finalize' && !!isolated
           const detail = [impact[act], task.local.root, ...summary]
-          if (leavesWorktree) detail.unshift('将先切换到原 Local 会话，再提交并安全清理 Worktree。')
-          const yes = await pick(ctx, `确认：${labels[act]}`, detail, [
-            { label: `执行${labels[act]}`, value: true }, { label: '取消', value: false },
+          if (act === 'finalize') detail.push('默认安全清理；也可保留 Worktree 环境供日后检查。')
+          if (leavesWorktree) detail.unshift('将先切换到原 Local 会话，再提交。')
+          const decision = await pick<'execute' | 'keep' | undefined>(ctx, `确认：${labels[act]}`, detail, [
+            { label: act === 'finalize' ? '提交并清理 Worktree（默认）' : `执行${labels[act]}`, value: 'execute' },
+            ...(act === 'finalize' ? [{ label: '提交并保留 Worktree', value: 'keep' as const }] : []),
+            { label: '取消', value: undefined },
           ])
-          if (!yes || !ctx.isIdle()) return
+          if (!decision || !ctx.isIdle()) return
           const execute = async (activeCtx: ExtensionContext) => {
-            const result = await data.act(task.id, act, { phase: task.phase, reviewId: task.review?.id, previewId: task.receipt?.previewId, discardFingerprint })
+            if (decision === 'keep') {
+              if (!task.isolatedSession || task.isolatedSession.cwd !== task.isolatedPath) throw new Error('找不到可保留的 Worktree 会话，未提交。')
+              await validateSession(task.isolatedSession)
+            }
+            const result = await data.act(task.id, act, {
+              phase: task.phase, reviewId: task.review?.id, previewId: task.receipt?.previewId,
+              discardFingerprint, keepWorktree: decision === 'keep',
+            })
             const note = result.cleanup?.status === 'retained' ? `；保留 Worktree：${result.isolatedPath}（${result.cleanup.reason}）` : ''
             const preview = act === 'preview' && isolated ? '；仍在 Worktree，可点击「打开 Local 检查」' : ''
-            activeCtx.ui.notify(`${labels[act]}完成${result.commitOid ? ` · ${result.commitOid.slice(0, 12)}` : ''}${preview}${note}`, note ? 'warning' : 'info')
+            activeCtx.ui.notify(`${labels[act]}完成${result.commitOid ? ` · ${result.commitOid.slice(0, 12)}` : ''}${preview}${note}`,
+              note && !result.cleanup?.requested ? 'warning' : 'info')
           }
           if (leavesWorktree) {
             // Leave the active cwd before finalize can delete it. A veto or failed
