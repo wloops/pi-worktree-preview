@@ -1,0 +1,4 @@
+node_modules/
+.pi/
+__pycache__/
+*.tgz

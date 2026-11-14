@@ -1,0 +1,21 @@
+{
+  "name": "pi-worktree-preview",
+  "version": "0.1.0",
+  "description": "Review isolated Git worktree changes in your original checkout from Pi",
+  "license": "MIT",
+  "type": "module",
+  "keywords": ["pi-package", "git", "worktree"],
+  "engines": { "node": ">=22.18" },
+  "files": ["src", "README.md", "LICENSE"],
+  "pi": { "extensions": ["./src/index.ts"] },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "^1.5.2" },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --experimental-transform-types --disable-warning=ExperimentalWarning --test test/*.test.ts"
+  }
+}
