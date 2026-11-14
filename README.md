@@ -2,24 +2,28 @@
 
 在隔离的 Git Worktree 里用 Pi 完成任务，直接预览到原 checkout，再检查和验收。不需要复制文件、切换 Local 分支或手动暂存。
 
-## 最短试用
+## 安装与试用
 
-需要 Pi 1.5.2、较新的 Git（已验证 2.55）、支持鼠标的终端，以及有初始提交、位于普通分支的 Git checkout。请先配好 `git config user.name` 和 `user.email`，以及 Pi 模型。
+需要 Pi 1.5.2 或兼容版本、较新的 Git（已验证 2.55）、支持鼠标的终端，以及有初始提交、位于普通分支的 Git checkout。请先配置 Git 提交身份（`user.name`、`user.email`）和 Pi 模型。
+
+从 npm 安装：
 
 ```sh
+pi install npm:pi-worktree-preview
 cd /path/to/your/repo
-pi --tui-mode fullscreen -e /path/to/pi-worktree-preview/src/index.ts
+pi --tui-mode fullscreen
 ```
+
+若已经从源码目录安装过，请先用 `pi list` 和 `pi remove /path/to/pi-worktree-preview` 移除旧入口，避免同时加载两份扩展。源码开发时也可直接运行 `pi --tui-mode fullscreen -e /path/to/pi-worktree-preview/src/index.ts`。
 
 1. 勾选编辑器上方的 **[ ] 新建 Worktree**，输入任务并发送。勾选本身不会创建目录；发送时才创建隔离 Worktree、切换到新会话，并只把这条消息发到新会话。再次点击可取消勾选；斜杠命令和 `!` shell 命令不会触发创建。退出 Pi 后，用 Pi 的会话选择器（`pi --resume`）恢复创建任务的那条 Local 会话，再点 **工作树操作 → 进入 / 恢复 Worktree**，也可直接恢复原 Worktree 会话。
 2. Agent 调用工具标记 **待验收**（也可从菜单手动标记）。这一步锁定当时的任务路径和内容，不改 Local。
 3. 在 Worktree 编辑器旁点击 **预览到 Local → 执行预览到 Local**。预览不暂存、不提交，也不会自动切换会话。想在 Pi 里对原目录运行测试时，再点 **打开 Local 检查**；仍可从 Local 的操作菜单回 Worktree。如果 Local 的新提交与任务冲突，点 **让 Agent 解决冲突**：回到原 Worktree，仅合并确认时的 Local `HEAD`，解决后重新标记待验收。新版本仍需你重新点击预览；Local 的未提交改动不会被搬进 Worktree。
 4. 想返修时，在原 Worktree 会话直接发送修改要求。未预览时，Agent 开始返修前会作废旧验收，无需确认。已预览时，Agent 会显示 **撤回预览，继续返修**；点一次，Local 撤回成功后 Agent 会接着处理刚才的要求，无需重发。取消或撤回失败则不开始修改；单纯提问不会作废验收。若只想恢复 Local、不需要返修，两边的 **撤回预览** 仍可单独执行，保留旧验收。
 5. 两边都能直接点击 **确认提交**。确认框默认提供 **提交并清理 Worktree**，也可选 **提交并保留 Worktree**，提交内容相同，只包含任务改动，保留 Local 原有改动。从 Worktree 确认提交时，会先切到原 Local 会话；切换被取消则不提交。主动保留或未通过清理检查的环境，可以在 Local 点 **工作树操作 → 已保留的 Worktree** 恢复会话检查或发起清理；任务已结束，不会继续交付，也不会定时删除。尚未预览的任务仍可在 Local 菜单里放弃。
-
 6. 任务已交付或放弃后，在 Local 点击 **任务历史** 并选中任务，Pi 消息区会立即显示旧对话。此时只是查看历史，不创建 Worktree；不想继续可点击 **返回 Local**。发送第一条后续要求时，才从 Local 当前分支的 `HEAD` 新建隔离目录并继承对话。不带入旧任务的未提交改动，也不改动原会话。旧 Worktree 已清理仍可续接，只要原 Pi 会话文件还在。
 
-编辑器上方的操作条只在任务所属的 Local 或 Worktree 会话显示该任务的阶段和操作。需要并行开发时，在同一个 checkout 新开一个 Local 对话，勾选 **[ ] 新建 Worktree** 后发送任务。每个 Local 对话只显示自己的进行中任务；其他任务即使正在预览，也不影响新建或修改隔离 Worktree。已结束任务的历史和保留目录仍可从同一 checkout 查看。每次写入或放弃都需要单独确认；确认框初始选中取消，避免直接按 Enter 误执行。面板详情过长时，可用滚轮或 Page Up / Page Down 查看。强删确认需要终端完整显示警告和目标路径。`/worktree-preview` 是菜单的键盘备用入口。若希望始终启用，可运行 `pi install /path/to/pi-worktree-preview`，再用 `pi --tui-mode fullscreen` 启动。
+编辑器上方的操作条只在任务所属的 Local 或 Worktree 会话显示该任务的阶段和操作。需要并行开发时，在同一个 checkout 新开一个 Local 对话，勾选 **[ ] 新建 Worktree** 后发送任务。每个 Local 对话只显示自己的进行中任务；其他任务即使正在预览，也不影响新建或修改隔离 Worktree。已结束任务的历史和保留目录仍可从同一 checkout 查看。每次写入或放弃都需要单独确认；确认框初始选中取消，避免直接按 Enter 误执行。面板详情过长时，可用滚轮或 Page Up / Page Down 查看。强删确认需要终端完整显示警告和目标路径。`/worktree-preview` 是菜单的键盘备用入口。
 
 ## 安全边界与限制
 

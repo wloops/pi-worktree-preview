@@ -17,6 +17,7 @@ import time
 import pyte
 
 ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = os.environ.get('PI_WORKTREE_PREVIEW_PACKAGE')
 COLS, ROWS = 110, 35
 # Use a deterministic offline provider, but run the real agent, bash tool, and review tool.
 PROVIDER = '''
@@ -88,13 +89,16 @@ class Pi:
     def __init__(self, cwd, agent, provider, theme='dark', cols=COLS, rows=ROWS, session=None):
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
-        (agent / 'settings.json').write_text(json.dumps({'theme': theme}))
+        settings_path = agent / 'settings.json'
+        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        settings_path.write_text(json.dumps({**settings, 'theme': theme}))
         self.pid, self.fd = pty.fork()
         if not self.pid:
             os.chdir(cwd)
             os.environ.update(PI_CODING_AGENT_DIR=str(agent), TERM='xterm-256color', COLORTERM='truecolor')
-            os.execvp('pi', ['pi', '--tui-mode', 'fullscreen', '-ne', '--no-mcp', '-ns', '-np', '-na',
-                             '--provider', 'wtp-smoke', '--model', 'model', '-e', str(ROOT / 'src/index.ts'), '-e', str(provider),
+            extension = [] if PACKAGE else ['-ne', '-e', str(ROOT / 'src/index.ts')]
+            os.execvp('pi', ['pi', '--tui-mode', 'fullscreen', '--no-mcp', '-ns', '-np', '-na',
+                             '--provider', 'wtp-smoke', '--model', 'model', *extension, '-e', str(provider),
                              *(['--session', str(session)] if session else [])])
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 
@@ -181,6 +185,9 @@ def main():
         local.mkdir()
         agent = base / 'agent'
         agent.mkdir()
+        if PACKAGE:
+            subprocess.run(['pi', 'install', PACKAGE], cwd=base, check=True,
+                           env={**os.environ, 'PI_CODING_AGENT_DIR': str(agent)})
         provider = base / 'offline.ts'
         provider.write_text(PROVIDER)
         # Test extension imports resolve through Pi's extension loader; this link keeps offline
