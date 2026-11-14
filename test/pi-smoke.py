@@ -72,6 +72,8 @@ class Pi:
             data = os.read(self.fd, 65536)
             # pyte doesn't implement OSC 66 (text sizing), which isn't needed here.
             self.stream.feed(re.sub(rb'\x1b\]66;[^\x07]*(?:\x07|\x1b\\)', b'', data))
+            return True
+        return False
 
     def until(self, text, timeout=20):
         end = time.monotonic() + timeout
@@ -102,6 +104,12 @@ class Pi:
         os.write(self.fd, data)
 
     def click(self, text):
+        self.until(text)
+        # A label can arrive in an intermediate render before Pi settles layout.
+        # Drain the frame before measuring mouse coordinates.
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and self.read(.12):
+            pass
         self.click_at(*self.until(text))
 
     def click_at(self, x, y):
@@ -264,13 +272,38 @@ def main():
             (local / '.pi/loops.json').write_text('Local loop edited before finalizing')
             pi.click('[ 确认提交 ]')
             pi.click('[ 提交并清理 Worktree（默认） ]')
+            pi.until('未能安全清理 Worktree')
+            pi.click('[ 保留 Worktree ]')
             pi.until('Local · 已交付')
             assert git('show', '--format=', '--name-only') == 'task.txt'
             assert git('status', '--porcelain') == baseline
             assert task()['cleanup']['status'] == 'retained' and not task()['cleanup'].get('requested')
             assert (first_path / '.pi/loops.json').read_text() == 'Worktree loop'
             assert (local / '.pi/loops.json').read_text() == 'Local loop edited before finalizing'
-            print('real Pi: Worktree preview and rollback stay put; vetoed switch; task-only commit preserves both late .pi/loops.json files', flush=True)
+            delivered_head = git('rev-parse', 'HEAD')
+            first_id = task()['id'][:8]
+            def inspect_removal():
+                pi.click('[ 已保留的 Worktree ]')
+                pi.click(f'[ {first_id} · Isolated smoke change ]')
+                pi.click('[ 检查并清理… ]')
+
+            with Pi(local, agent, provider) as other:
+                other.click('[ 已保留的 Worktree ]')
+                other.click(f'[ {first_id} · Isolated smoke change ]')
+                other.click('[ 恢复会话检查 ]')
+                other.until('Worktree · 已交付')
+                inspect_removal()
+                pi.until('另一个 Pi 会话正在使用此 Worktree')
+                assert first_path.is_dir()
+                other.click('[ 工作树操作 ]')
+                other.click('[ 返回 Local ]')
+                other.until('Local · 已交付')
+                inspect_removal()
+                pi.click('[ 确认强删 Worktree ]')
+            pi.until('Worktree 已删除')
+            assert not first_path.exists()
+            assert git('rev-parse', 'HEAD') == delivered_head and git('status', '--porcelain') == baseline
+            print('real Pi: protected retention, blocked removal while another Pi used it, then explicit force removal', flush=True)
             pi.click('[ ] 新建 Worktree')
             pi.until('[x] 新建 Worktree')
             pi.send(b'Open a task to discard.\r')
@@ -327,6 +360,7 @@ def main():
         with Pi(local, agent, provider) as pi:
             pi.click('[ 已保留的 Worktree ]')
             pi.click(f'[ {task_id} · Isolated smoke change ]')
+            pi.click('[ 恢复会话检查 ]')
             pi.until('Worktree · 已交付')
             pi.until('Worktree ready.')
             pi.click('[ 工作树操作 ]')

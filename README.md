@@ -14,17 +14,17 @@ pi --tui-mode fullscreen -e /path/to/pi-worktree-preview/src/index.ts
 1. 勾选编辑器上方的 **[ ] 新建 Worktree**，输入任务并发送。勾选本身不会创建目录；发送时才创建隔离 Worktree、切换到新会话，并只把这条消息发到新会话。再次点击可取消勾选；斜杠命令和 `!` shell 命令不会触发创建。退出 Pi 后，重新从同一 Local 启动，点 **工作树操作 → 进入 / 恢复 Worktree** 即可继续原会话。
 2. Agent 调用工具标记 **待验收**（也可从菜单手动标记）。这一步锁定当时的任务路径和内容，不改 Local。
 3. 在 Worktree 编辑器旁点击 **预览到 Local → 执行预览到 Local**。预览不暂存、不提交，也不会自动切换会话。想在 Pi 里对原目录运行测试时，再点 **打开 Local 检查**；仍可从 Local 的操作菜单回 Worktree。
-4. 两边都能直接点击并确认 **撤回预览** 或 **确认提交**。撤回后可在 Worktree 继续改，再标记待验收。确认框默认提供 **提交并清理 Worktree**，也可选 **提交并保留 Worktree**，提交内容相同，只包含任务改动，保留 Local 原有改动。从 Worktree 确认提交时，会先切到原 Local 会话；切换被取消则不提交。主动保留的环境可以在 Local 点 **已保留的 Worktree** 恢复原会话检查；任务已结束，不会继续交付，也不会定时删除。尚未预览的任务仍可在 Local 菜单里放弃。
+4. 两边都能直接点击并确认 **撤回预览** 或 **确认提交**。撤回后可在 Worktree 继续改，再标记待验收。确认框默认提供 **提交并清理 Worktree**，也可选 **提交并保留 Worktree**，提交内容相同，只包含任务改动，保留 Local 原有改动。从 Worktree 确认提交时，会先切到原 Local 会话；切换被取消则不提交。主动保留或未通过清理检查的环境，可以在 Local 点 **已保留的 Worktree** 恢复会话检查或发起清理；任务已结束，不会继续交付，也不会定时删除。尚未预览的任务仍可在 Local 菜单里放弃。
 
 每次写入或放弃都需要单独确认。也可用方向键与 Enter 操作；`/worktree-preview` 是菜单的键盘备用入口。若希望始终启用，可运行 `pi install /path/to/pi-worktree-preview`，再用 `pi --tui-mode fullscreen` 启动。
 
 ## 安全边界与限制
 
-- 一个 Local checkout 同时只有一个进行中的任务。隔离目录从 Local 当时的 `HEAD` 建立，不复制 Local 的未提交改动和忽略文件。会话使用 Pi 原生持久化；不支持 `--no-session`。Worktree 隔离的是工作目录，不是安全沙箱。
+- 一个 Local checkout 同时只有一个进行中的任务。隔离目录从 Local 当时的 `HEAD` 建立，不复制 Local 的未提交改动和忽略文件，默认位于 `~/.pi/agent/worktree-preview/worktrees/<任务 UUID>/`（可随 `PI_CODING_AGENT_DIR` 改变）。会话使用 Pi 原生持久化；不支持 `--no-session`。Worktree 隔离的是工作目录，不是安全沙箱。
 - 预览只合并标记待验收时锁定的文件和内容。Worktree 中清单内的工作区内容、文件类型或索引条目有变化时，需重新标记；此后清单外新增或变化的路径不会参与合并，有额外改动的 Worktree 会保留。旧版待验收记录在无法证明原快照时也需重新标记。
 - 撤回、提交前重新检查 Local 的分支、`HEAD`、整个索引和预览涉及的路径。无关的未暂存改动（包括其他扩展写的状态文件）会保留，不阻止验收。预览路径或索引发生变化则停止。不支持直接把在 Local 预览上做的修订提交回任务；请先将受影响的路径恢复到预览状态，再撤回并在 Worktree 中修改。
 - 预览、撤回、提交前会在 Pi 配置目录 `worktree-preview/` 写入恢复记录（默认 `~/.pi/agent/worktree-preview/tasks.json`），并保留所需的 Git 快照或索引副本。中断后不自动重放或抢占残留锁。若工作台提示已停止，先备份 Local、Worktree 和恢复记录，再人工检查；不要直接删除锁、记录或 `refs/pi-worktree-preview/` 来强行继续。
-- 默认在交付或放弃后，仅在校验通过时移除隔离 Worktree；忽略文件（包括构建产物）、特殊文件、后续改动，或 Pi 进程仍以该目录为启动目录，都会触发保护性保留。Pi 会话历史不删除。保留的路径会出现在通知或工作台中。
+- 默认在交付或放弃后，仅在校验通过时移除隔离 Worktree。如果只是因为后续改动、忽略文件（包括构建产物）或空目录而无法安全清理，会再问是否强删，默认保留。强删永久删除整个隔离目录（含未交付文件），不修改 Local 工作区、提交或 Pi 会话历史；点确认后会再次核对，确认期间有变化、身份不匹配、Git 操作未结束、目录已锁定、存在恢复记录、嵌套仓库、特殊文件或其他受管 Pi 会话占用时不删除。扩展无法确认所有外部进程是否在使用目录，检查和删除也不是原子操作；请先关闭其他相关会话和写入进程。保留的路径会出现在通知或工作台中。
 - 当前实现面向 macOS/Linux（已在 macOS 实测）。不支持 sparse checkout、submodule、嵌套仓库、特殊索引条目或影响快照的内容转换/合并属性。暂不预览 `.gitignore` 或 `.gitattributes` 的改动，因为它们可能改变其他文件的快照结果。交付使用 Git plumbing，不运行提交钩子、不签名、不推送。预览/撤回是多文件操作，不是原子交换；操作时不要让其他进程同时修改同一 checkout（例如自动格式化、构建写回或其他 Git 命令）。
 
 ## 验证
@@ -37,4 +37,4 @@ npm test
 python3 test/pi-smoke.py
 ```
 
-`test/pi-smoke.py` 在临时 Git 仓库和临时 Pi 配置中运行，使用离线测试模型，无需 API 密钥；覆盖鼠标创建、恢复、取消确认、预览、撤回、提交及放弃。Git 合并与验收引擎移植自 [`dsh-git-worktree`](https://github.com/wloops/dsh-git-worktree)，保留 MIT 许可。
+`test/pi-smoke.py` 在临时 Git 仓库和临时 Pi 配置中运行，使用离线测试模型，无需 API 密钥；覆盖鼠标创建、恢复、取消确认、预览、撤回、提交、放弃，以及保留后强删和双 Pi 会话占用保护。Git 合并与验收引擎移植自 [`dsh-git-worktree`](https://github.com/wloops/dsh-git-worktree)，保留 MIT 许可。

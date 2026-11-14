@@ -33,7 +33,7 @@ function deliveryChoices(task: Task | undefined, allowed: boolean): Choice<Actio
 const localCheck = { label: '打开 Local 检查', value: 'return' } as const
 const retainedChoice = { label: '已保留的 Worktree', value: 'retained' } as const
 const retainedTasks = (tasks: Task[]) => tasks.filter(task =>
-  task.phase === 'delivered' && !task.journal && task.cleanup?.requested && task.isolatedSession)
+  ['delivered', 'discarded'].includes(task.phase) && !task.journal && task.cleanup?.status === 'retained')
 const taskVersion = (task?: Task) => task && JSON.stringify([task.id, task.phase, task.review?.id, task.receipt?.previewId])
 async function existing(file: string) {
   try { return (await lstat(file)).isFile() } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false; throw e }
@@ -81,7 +81,7 @@ const darkPanel = {
 const selectedFg = rgbColor(255, 255, 255)
 
 interface Choice<T> { label: string; value: T }
-async function pick<T>(ctx: ExtensionCommandContext, title: string, detail: string[], choices: Choice<T>[]): Promise<T | undefined> {
+async function pick<T>(ctx: ExtensionContext, title: string, detail: string[], choices: Choice<T>[]): Promise<T | undefined> {
   return ctx.ui.custom<T | undefined>((tui, theme, keys, done) => {
     // Paint the whole card, including padding, so transcript tool backgrounds never
     // show through. Use paired colors that remain readable in both Pi appearances.
@@ -153,12 +153,40 @@ async function pick<T>(ctx: ExtensionCommandContext, title: string, detail: stri
   }, { overlay: true, overlayOptions: { anchor: 'center', width: 76, margin: 1 }, blocked: { kind: 'question', message: clean(title) } })
 }
 
+async function confirmRemoval(ctx: ExtensionContext, data: TaskStore, task: Task, title: string) {
+  const proof = await data.inspectRetainedRemoval(task, ctx.cwd)
+  const remove = await pick(ctx, title, [
+    '强删将永久移除此目录，包括未交付改动和忽略文件。',
+    '先备份需要的文件，并关闭其他使用该目录的会话。',
+    `原因：${task.cleanup?.reason ?? '保留环境'}`,
+    ...pathLines(task.isolatedPath),
+  ], [{ label: '确认强删 Worktree', value: true }, { label: '保留 Worktree', value: false }])
+  if (!remove || !ctx.isIdle()) return
+  await data.removeRetained(task.id, ctx.cwd, proof)
+  ctx.ui.notify('Worktree 已删除；Local 与 Pi 会话历史未改动。', 'info')
+}
+
+// Keep long paths readable in the fixed-width confirmation panel.
+function pathLines(path: string) {
+  const lines: string[] = []
+  let line = ''
+  for (const char of path) {
+    if (visibleWidth(line + char) > 54) { lines.push(line); line = '' }
+    line += char
+  }
+  if (line) lines.push(line)
+  return lines
+}
+
 export default function extension(pi: ExtensionAPI) {
   let store: TaskStore | undefined
   let busy = false
   let armedSession: string | undefined
   let draft: Draft | undefined
   let clickIntent: ClickIntent | undefined
+  let activeHold: { data: TaskStore; id: string } | undefined
+  let pendingHold: { data: TaskStore; id: string } | undefined
+  let incomingHoldFailed = false
 
   async function context(ctx: ExtensionContext) {
     const data = store ??= new TaskStore(join(await realpath(getAgentDir()), NAME))
@@ -229,10 +257,60 @@ export default function extension(pi: ExtensionAPI) {
     })
   }
 
+  // Pi changes its logical cwd without chdir. Coordinate managed sessions with
+  // removal, including the interval between native switch and session_start.
+  pi.on('session_before_switch', async (event, ctx) => {
+    try {
+      if (pendingHold && pendingHold.id !== activeHold?.id) await pendingHold.data.releaseWorktree(pendingHold.id)
+      pendingHold = undefined
+      const file = event.targetSessionFile
+      if (!file || !await existing(file)) return
+      const data = store ??= new TaskStore(join(await realpath(getAgentDir()), NAME))
+      const targetCwd = SessionManager.open(file).getHeader()?.cwd
+      if (!targetCwd) return
+      const path = await realpath(targetCwd)
+      const target = (await data.read()).tasks.find(task => path === task.isolatedPath || path.startsWith(task.isolatedPath + '/'))
+      if (target) {
+        await data.holdWorktree(target.id)
+        pendingHold = { data, id: target.id }
+      }
+    } catch (error) {
+      if (ctx.hasUI) ctx.ui.notify(message(error), 'error')
+      return { cancel: true }
+    }
+  })
+  pi.on('session_shutdown', async (event, ctx) => {
+    try {
+      if (event.reason === 'quit' && pendingHold && pendingHold.id !== activeHold?.id) await pendingHold.data.releaseWorktree(pendingHold.id)
+      if (!activeHold || (event.reason !== 'quit' && event.reason !== 'resume')) return
+      if (event.reason === 'resume' && event.targetSessionFile) {
+        const targetCwd = SessionManager.open(event.targetSessionFile).getCwd()
+        if (targetCwd === ctx.cwd) return
+      }
+      await activeHold.data.releaseWorktree(activeHold.id)
+    } catch (error) { if (ctx.hasUI) ctx.ui.notify(message(error), 'warning') }
+  })
   pi.on('session_start', async (_event, ctx) => {
-    try { await refresh(ctx) } catch (error) { if (ctx.hasUI) ctx.ui.notify(message(error), 'error') }
+    try {
+      const data = store ??= new TaskStore(join(await realpath(getAgentDir()), NAME))
+      const path = await realpath(ctx.cwd).catch(() => ctx.cwd)
+      const isolated = (await data.read()).tasks.find(task => path === task.isolatedPath || path.startsWith(task.isolatedPath + '/'))
+      if (isolated) {
+        // Native startup can reach a managed cwd while another Pi deletes it.
+        incomingHoldFailed = true
+        await data.holdWorktree(isolated.id)
+        activeHold = { data, id: isolated.id }
+        incomingHoldFailed = false
+      }
+      await refresh(ctx)
+    } catch (error) { if (ctx.hasUI) ctx.ui.notify(message(error), 'error') }
   })
   pi.on('input', (event, ctx) => {
+    if (incomingHoldFailed) {
+      if (ctx.hasUI && event.source === 'interactive') restoreDraft(ctx, event.text)
+      if (ctx.hasUI) ctx.ui.notify('无法确认 Worktree 会话占用，请退出后重试。', 'error')
+      return { action: 'handled' }
+    }
     if (event.source !== 'interactive' || !ctx.hasUI || !event.text.trim() || /^[!/]/.test(event.text.trimStart())) return
     const sessionId = ctx.sessionManager.getSessionId()
     if (armedSession !== sessionId) return
@@ -362,11 +440,23 @@ export default function extension(pi: ExtensionAPI) {
           const moved = await switchTo(ctx, isolated.localSession, async () => { switching = true })
           if (moved.cancelled) throw new Error('Pi 取消了切换。')
         } else if (choice === 'retained' || (choice === 'resume' && task?.isolatedSession)) {
-          const target = choice === 'retained' ? await pick<Task | undefined>(ctx, '已保留的 Worktree', ['任务已交付，可恢复会话检查原环境。'], [
+          const target = choice === 'retained' ? await pick<Task | undefined>(ctx, '已保留的 Worktree', ['选择一个已结束任务的保留目录。'], [
             ...retained.map(item => ({ label: `${item.id.slice(0, 8)} · ${item.review?.message ?? 'Worktree'}`, value: item })),
             { label: '取消', value: undefined },
           ]) : task
-          if (!target?.isolatedSession || !ctx.isIdle()) return
+          if (!target || !ctx.isIdle()) return
+          if (choice === 'retained') {
+            const next = await pick(ctx, '管理保留的 Worktree', [
+              `原因：${target.cleanup?.reason ?? '保留环境'}`, ...pathLines(target.isolatedPath),
+            ], [
+              ...(target.isolatedSession ? [{ label: '恢复会话检查', value: 'resume' }] : []),
+              { label: '检查并清理…', value: 'remove' }, { label: '关闭', value: 'close' },
+            ])
+            if (!ctx.isIdle()) return
+            if (next === 'remove') { await confirmRemoval(ctx, data, target, '确认：清理保留的 Worktree'); return }
+            if (next !== 'resume') return
+          }
+          if (!target.isolatedSession) return
           await data.validateIsolatedIdentity(target)
           const moved = await switchTo(ctx, target.isolatedSession, async () => { switching = true })
           if (moved.cancelled) throw new Error('Pi 取消了切换。')
@@ -410,6 +500,10 @@ export default function extension(pi: ExtensionAPI) {
             const preview = act === 'preview' && isolated ? '；仍在 Worktree，可点击「打开 Local 检查」' : ''
             activeCtx.ui.notify(`${labels[act]}完成${result.commitOid ? ` · ${result.commitOid.slice(0, 12)}` : ''}${preview}${note}`,
               note && !result.cleanup?.requested ? 'warning' : 'info')
+            if (result.cleanup?.canForce && activeCtx.isIdle()) {
+              try { await confirmRemoval(activeCtx, data, result, '未能安全清理 Worktree') }
+              catch (error) { activeCtx.ui.notify(`Worktree 清理已停止：${message(error)}`, 'warning') }
+            }
           }
           if (leavesWorktree) {
             // Leave the active cwd before finalize can delete it. A veto or failed

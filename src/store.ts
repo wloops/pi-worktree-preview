@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto'
-import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, stat } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { createHash, randomUUID } from 'node:crypto'
+import { constants, type BigIntStats } from 'node:fs'
+import { lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 import { createSessionCheckoutApplyEngine, runGit, type FrozenReview, type PreviewReceipt } from './engine.ts'
 
 export interface Checkout { root: string; gitDir: string; commonDir: string; rootIdentity: string; gitIdentity: string; commonIdentity: string }
@@ -21,7 +22,7 @@ export interface Task {
   receipt?: PreviewReceipt
   // A null indexBefore explicitly records that no index file existed.
   journal?: { operation: 'preview' | 'rollback' | 'finalize' | 'cleanup'; at: number; commitOid?: string; indexBefore?: string | null; indexAfter?: string }
-  cleanup?: { status: 'done' | 'retained'; reason?: string; requested?: true }
+  cleanup?: { status: 'done' | 'retained'; reason?: string; requested?: true; canForce?: true }
   commitOid?: string | null
 }
 interface State { version: 1; tasks: Task[] }
@@ -81,6 +82,7 @@ async function normalRef(root: string) {
 }
 
 function terminal(task: Task) { return task.phase === 'delivered' || task.phase === 'discarded' }
+class CleanupDataLoss extends Error {}
 function engineError(result: { error: { message: string } }): never { throw new Error(result.error.message) }
 
 /** A single durable registry/lock per Pi profile. No automatic lock stealing or journal replay. */
@@ -306,49 +308,188 @@ export class TaskStore {
     if (refs) await runGit(task.local.root, ['update-ref', '--stdin'], { input: refs.split('\n').map(ref => `delete ${ref}\n`).join('') })
   }
 
-  private async cleanup(task: Task, expected: string, save: () => Promise<void>) {
-    const retained = async (reason: string) => { task.cleanup = { status: 'retained', reason }; await save() }
-    await save() // The confirmed terminal phase is durable even if cleanup is skipped.
-    try {
-      const processCwd = await realpath(process.cwd())
-      if (processCwd === task.isolatedPath || processCwd.startsWith(task.isolatedPath + '/')) {
-        throw new Error('Pi 进程仍从此 Worktree 启动，保留目录。')
-      }
-      await this.validateLocal(task)
-      await this.validateIsolated(task)
-      const listed = (await runGit(task.local.root, ['worktree', 'list', '--porcelain', '-z'])).stdout.toString('utf8')
-      const entry = listed.split('\0\0').find(record => record.split('\0')[0] === `worktree ${task.isolatedPath}`)
-      if (!entry || entry.split('\0').some(field => /^(locked|prunable)( |$)/.test(field))) throw new Error('Worktree 未注册、已锁定或可被修剪。')
-      task.journal = { operation: 'cleanup', at: Date.now() }
-      await save()
-      if (await this.discardFingerprint(task) !== expected) throw new Error('隔离 Worktree 在确认后已变化。')
-      const ignored = await runGit(task.isolatedPath, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z'])
-      if (ignored.stdout.length) throw new Error('隔离 Worktree 有被 Git 忽略的文件；为避免丢失，保留整个 Worktree。')
-      const marker = await lstat(join(task.isolatedPath, '.git'))
-      if (!marker.isFile()) throw new Error('不是受管的 linked Worktree。')
-      const visit = async (dir: string) => {
-        const children = await readdir(dir, { withFileTypes: true })
-        if (!children.length) throw new Error('隔离 Worktree 有 Git 无法快照的空目录；保留整个 Worktree。')
-        for (const child of children) {
-          if (child.name.toLowerCase() === '.git') {
-            if (dir === task.isolatedPath && child.name === '.git') continue
-            throw new Error('Worktree 中有嵌套的 Git 元数据。')
-          }
-          if (child.isDirectory()) await visit(join(dir, child.name))
-          else if (!child.isFile() && !child.isSymbolicLink()) throw new Error('Worktree 中有 Git 无法快照的特殊文件。')
-        }
-      }
-      await visit(task.isolatedPath)
-    } catch (error) {
-      delete task.journal
-      await retained(errText(error))
-      return
+  private leaseDir(id: string) {
+    if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error('Worktree ID 无效。')
+    return join(this.directory, 'active-sessions', id)
+  }
+
+  async holdWorktree(id: string) {
+    await this.locked(async state => {
+      const task = state.tasks.find(item => item.id === id)
+      if (!task || task.cleanup?.status === 'done' || task.journal?.operation === 'cleanup') throw new Error('Worktree 已清理或正在清理。')
+      await this.validateIsolatedIdentity(task)
+      const dir = this.leaseDir(id)
+      await mkdir(dir, { recursive: true, mode: 0o700 })
+      const handle = await open(join(dir, String(process.pid)), 'a', 0o600)
+      await handle.close()
+    })
+  }
+
+  async releaseWorktree(id: string) {
+    await rm(join(this.leaseDir(id), String(process.pid)), { force: true })
+  }
+
+  private async assertNoActiveSessions(id: string) {
+    const entries = await readdir(this.leaseDir(id)).catch(error => { if (missing(error)) return []; throw error })
+    for (const pid of entries) {
+      if (!/^[1-9]\d*$/.test(pid)) throw new Error('无法确认 Worktree 的会话占用状态。')
+      try { process.kill(Number(pid), 0) } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') continue }
+      throw new Error('另一个 Pi 会话正在使用此 Worktree，或仍有未释放的占用。')
     }
-    // If removal fails or is interrupted, deliberately leave the cleanup journal.
+  }
+
+  private async checkCleanupIdentity(task: Task, cwd: string) {
+    for (const active of [cwd, process.cwd()]) {
+      const path = await realpath(active)
+      if (path === task.isolatedPath || path.startsWith(task.isolatedPath + '/')) {
+        throw new Error('当前 Pi 会话或进程仍在此 Worktree 中，保留目录。')
+      }
+    }
+    await this.assertNoActiveSessions(task.id)
+    const local = await checkout(cwd)
+    if (!same(local, task.local)) throw new Error('只能从原 Local checkout 清理该 Worktree。')
+    await assertOrdinary(task.local)
+    const isolated = await this.validateIsolatedIdentity(task)
+    await assertOrdinary(isolated)
+    const marker = join(isolated.root, '.git')
+    if (!(await lstat(marker)).isFile()) throw new Error('不是受管的 linked Worktree。')
+    const pointer = (await readFile(marker, 'utf8')).replace(/\r?\n$/, '')
+    const backlink = (await readFile(join(isolated.gitDir, 'gitdir'), 'utf8')).replace(/\r?\n$/, '')
+    if (!pointer.startsWith('gitdir: ') || await realpath(resolve(isolated.root, pointer.slice(8))) !== isolated.gitDir ||
+        await realpath(resolve(isolated.gitDir, backlink)) !== marker) throw new Error('Git Worktree 登记与目录不匹配。')
+    try {
+      await lstat(join(isolated.gitDir, 'index.lock'))
+      throw new Error('Worktree 的 Git 索引仍被锁定。')
+    } catch (error) { if (!missing(error)) throw error }
+    const [index, head, modules] = await Promise.all([
+      runGit(isolated.root, ['ls-files', '--stage', '-z']), runGit(isolated.root, ['ls-tree', '-r', '-z', 'HEAD']),
+      lstat(join(isolated.gitDir, 'modules')).then(() => true, error => { if (missing(error)) return false; throw error }),
+    ])
+    if (modules || [index, head].some(result => result.stdout.toString('utf8').split('\0').some(line => line.startsWith('160000 ')))) {
+      throw new Error('Worktree 中有 Git 子模块，不能清理。')
+    }
+    if (process.platform === 'linux') {
+      const mounts = await readFile('/proc/self/mountinfo', 'utf8')
+      for (const record of mounts.trimEnd().split('\n')) {
+        const mount = record.split(' ')[4]?.replace(/\\([0-7]{3})/g, (_, oct: string) => String.fromCharCode(parseInt(oct, 8)))
+        if (!mount || mount === isolated.root || mount.startsWith(isolated.root + '/')) throw new Error('无法排除 Worktree 中的挂载点。')
+      }
+    }
+    const listed = (await runGit(task.local.root, ['worktree', 'list', '--porcelain', '-z'])).stdout.toString('utf8')
+    const entry = listed.split('\0\0').find(record => record.split('\0')[0] === `worktree ${task.isolatedPath}`)
+    if (!entry || entry.split('\0').some(field => /^(locked|prunable)( |$)/.test(field))) throw new Error('Worktree 未注册、已锁定或可被修剪。')
+  }
+
+  private async scanCleanupTree(root: string, hash?: ReturnType<typeof createHash>) {
+    const device = (await lstat(root, { bigint: true })).dev
+    let empty = false
+    const stamp = (s: BigIntStats) =>
+      [s.dev, s.ino, s.mode, s.size, s.mtimeNs, s.ctimeNs].map(value => value.toString()).join(':')
+    const visit = async (path: string, rel: string) => {
+      const s = await lstat(path, { bigint: true })
+      if (s.dev !== device) throw new Error('Worktree 内有其他文件系统，不能清理。')
+      const before = stamp(s)
+      hash?.update(JSON.stringify([rel, before]) + '\n')
+      if (rel === '.git' && !s.isFile()) throw new Error('不是受管的 linked Worktree。')
+      if (s.isDirectory()) {
+        const children = (await readdir(path, { encoding: 'buffer' })).map(name => {
+          const text = name.toString('utf8')
+          if (!Buffer.from(text).equals(name)) throw new Error('Worktree 中有无法安全检查的非 UTF-8 文件名。')
+          return text
+        }).sort()
+        if (!children.length) empty = true
+        if (children.includes('HEAD') && children.includes('objects') && children.includes('refs')) {
+          throw new Error('Worktree 中可能有嵌套的裸 Git 仓库。')
+        }
+        for (const child of children) {
+          if (child.toLowerCase() === '.git' && (rel || child !== '.git')) throw new Error('Worktree 中有嵌套的 Git 元数据。')
+          await visit(join(path, child), rel ? `${rel}/${child}` : child)
+        }
+      } else if (s.isFile()) {
+        if (hash) {
+          const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+          try {
+            if (stamp(await fd.stat({ bigint: true })) !== before) throw new Error('检查期间文件已变化。')
+            const content = createHash('sha256')
+            for await (const block of fd.createReadStream({ autoClose: false })) content.update(block)
+            if (stamp(await fd.stat({ bigint: true })) !== before) throw new Error('检查期间文件已变化。')
+            hash.update(content.digest())
+          } finally { await fd.close() }
+        }
+      } else if (s.isSymbolicLink()) {
+        if (hash) hash.update(createHash('sha256').update(await readlink(path, { encoding: 'buffer' })).digest())
+      } else throw new Error('Worktree 中有 Git 无法快照的特殊文件。')
+      if (hash && stamp(await lstat(path, { bigint: true })) !== before) throw new Error('检查期间目录内容已变化。')
+    }
+    await visit(root, '')
+    return empty
+  }
+
+  private async removeWorktree(task: Task, save: () => Promise<void>) {
+    // A failed or interrupted removal deliberately leaves the cleanup journal.
     await runGit(task.local.root, ['worktree', 'remove', '--force', '--', task.isolatedPath])
     task.cleanup = { status: 'done' }
     delete task.journal
     await save()
+  }
+
+  private async cleanup(task: Task, expected: string, save: () => Promise<void>) {
+    await save() // The terminal phase is durable even if cleanup is skipped.
+    try {
+      await this.checkCleanupIdentity(task, task.local.root)
+      task.journal = { operation: 'cleanup', at: Date.now() }
+      await save()
+      const empty = await this.scanCleanupTree(task.isolatedPath)
+      const ignored = await runGit(task.isolatedPath, ['ls-files', '--others', '--ignored', '--exclude-standard', '-z'])
+      const changed = await this.discardFingerprint(task) !== expected
+      const reasons = [changed && '隔离 Worktree 在确认后已变化', ignored.stdout.length > 0 && '包含 Git 忽略的文件', empty && '包含空目录'].filter(Boolean)
+      if (reasons.length) throw new CleanupDataLoss(`${reasons.join('；')}。`)
+    } catch (error) {
+      delete task.journal
+      task.cleanup = { status: 'retained', reason: errText(error), ...(error instanceof CleanupDataLoss ? { canForce: true } : {}) }
+      await save()
+      return
+    }
+    await this.removeWorktree(task, save)
+  }
+
+  private async removalProof(task: Task, cwd: string) {
+    await this.checkCleanupIdentity(task, cwd)
+    const isolated = task.isolated!
+    const hash = createHash('sha256')
+    // Include raw ignored bytes and empty directories which the Git fingerprint omits.
+    // Hash symlinks themselves, never their targets.
+    await this.scanCleanupTree(task.isolatedPath, hash)
+    hash.update(await this.discardFingerprint(task))
+    for (const file of ['HEAD', 'index']) {
+      const data = await readFile(join(isolated.gitDir, file)).catch(error => { if (missing(error)) return undefined; throw error })
+      hash.update(data ? createHash('sha256').update(data).digest('hex') : '-').update('\n')
+    }
+    await this.checkCleanupIdentity(task, cwd)
+    return hash.digest('hex')
+  }
+
+  async inspectRetainedRemoval(task: Task, cwd: string): Promise<string> {
+    if (!terminal(task) || task.journal || task.cleanup?.status !== 'retained') throw new Error('仅可清理已结束且没有恢复记录的保留 Worktree。')
+    return this.removalProof(task, cwd)
+  }
+
+  async removeRetained(id: string, cwd: string, proof: string): Promise<void> {
+    await this.locked(async (state, save) => {
+      const task = state.tasks.find(item => item.id === id)
+      if (!task || !terminal(task) || task.journal || task.cleanup?.status !== 'retained') throw new Error('保留状态已变化或存在恢复记录，未删除。')
+      task.journal = { operation: 'cleanup', at: Date.now() }
+      await save()
+      try {
+        if (await this.removalProof(task, cwd) !== proof) throw new Error('Worktree 在确认期间发生变化，未删除。请重新检查。')
+      } catch (error) {
+        delete task.journal // No deletion was attempted.
+        await save()
+        throw error
+      }
+      try { await this.removeWorktree(task, save) }
+      catch (error) { throw new Error(`未能确认 Worktree 清理完成，恢复记录：${this.statePath}；${errText(error)}`, { cause: error }) }
+    })
   }
 }
 
