@@ -16,7 +16,7 @@ cd /path/to/your/repo
 pi --tui-mode fullscreen
 ```
 
-也可以从 GitHub 安装固定版本：`pi install git:github.com/wloops/pi-worktree-preview@v0.1.0`。两种安装方式任选其一。
+也可以从 GitHub 安装固定版本：`pi install git:github.com/wloops/pi-worktree-preview@v0.1.1`。两种安装方式任选其一。
 
 若已经从源码目录安装过，请先用 `pi list` 和 `pi remove /path/to/pi-worktree-preview` 移除旧入口，避免同时加载两份扩展。源码开发时也可直接运行 `pi --tui-mode fullscreen -e /path/to/pi-worktree-preview/src/index.ts`。
 
