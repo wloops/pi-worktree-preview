@@ -8,15 +8,15 @@ A Pi fullscreen extension for parallel Git worktrees and reversible previews in 
 
 需要 Pi 1.5.2 或兼容版本、较新的 Git（已验证 2.55）、支持鼠标的终端，以及有初始提交、位于普通分支的 Git checkout。请先配置 Git 提交身份（`user.name`、`user.email`）和 Pi 模型。
 
-从 [npm](https://www.npmjs.com/package/pi-worktree-preview) 安装：
+从 GitHub 安装此版本：
 
 ```sh
-pi install npm:pi-worktree-preview
+pi install git:github.com/wloops/pi-worktree-preview@v0.1.2
 cd /path/to/your/repo
 pi --tui-mode fullscreen
 ```
 
-也可以从 GitHub 安装固定版本：`pi install git:github.com/wloops/pi-worktree-preview@v0.1.1`。两种安装方式任选其一。
+也可以用 `pi install npm:pi-worktree-preview` 安装 [npm 上已发布的版本](https://www.npmjs.com/package/pi-worktree-preview)。两个渠道可能不同步，请任选其一，不要重复安装。
 
 若已经从源码目录安装过，请先用 `pi list` 和 `pi remove /path/to/pi-worktree-preview` 移除旧入口，避免同时加载两份扩展。源码开发时也可直接运行 `pi --tui-mode fullscreen -e /path/to/pi-worktree-preview/src/index.ts`。
 
