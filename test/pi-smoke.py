@@ -283,7 +283,7 @@ def main():
         with Pi(local, agent, provider) as unrelated:
             before = tasks()
             unrelated.until('[ ] 新建 Worktree')
-            assert '待验收' not in unrelated.dump() and '[ 预览到项目目录 ]' not in unrelated.dump()
+            assert '待验收' not in unrelated.dump() and '[ 预览改动 ]' not in unrelated.dump()
             unrelated.click('[ ] 新建 Worktree')
             unrelated.until('[x] 新建 Worktree')
             assert tasks() == before
@@ -292,7 +292,7 @@ def main():
             unrelated.send(b'/worktree-preview\r')
             unrelated.until('Worktree · 更多')
             assert '待验收' not in unrelated.dump() and '[ 进入 / 恢复 Worktree ]' not in unrelated.dump()
-            assert '[ 预览到项目目录 ]' not in unrelated.dump() and '[ 放弃任务 ]' not in unrelated.dump()
+            assert '[ 预览改动 ]' not in unrelated.dump() and '[ 放弃任务 ]' not in unrelated.dump()
             unrelated.until('[ 下次发送时新建 Worktree ]')
             unrelated.send(b'\x1b')
             unrelated.until_gone('Worktree · 更多')
@@ -303,7 +303,7 @@ def main():
         for theme, cols, rows in [('light', 110, 35), ('dark', 42, 11)]:
             with Pi(local, agent, provider, theme, cols, rows, session=origin) as pi:
                 pi.until('项目目录 · Worktree 待验收')
-                action_x, action_y = pi.until('[ 预览到项目目录 ]')
+                action_x, action_y = pi.until('[ 预览改动 ]')
                 assert '预览只写入项目目录' not in pi.dump()
                 primary = pi.screen.buffer[action_y - 1][action_x - 1]
                 assert primary.bold and primary.bg == {'light': '274c97', 'dark': '305ba6'}[theme]
@@ -332,10 +332,10 @@ def main():
                 pi.click_at(right_x - 1, cancel_y)  # neither is the trailing space
                 pi.until('▸ [ 关闭 ]')  # Closing remains selected after frame clicks.
                 pi.send(b'\x1b[B')  # Wrap from the last (close) to the first (preview) action.
-                pi.until('▸ [ 预览到项目目录 ]')
+                pi.until('▸ [ 预览改动 ]')
                 pi.send(b'\r')
-                pi.until('预览到项目目录？')
-                lead_x, lead_y = pi.until('写入文件，不暂存、不提交。')
+                pi.until('预览改动？')
+                lead_x, lead_y = pi.until('改动写入项目目录，不暂存、不提交。')
                 assert pi.screen.buffer[lead_y - 1][lead_x - 1].bold
                 _, confirm_y = pi.until('[ 预览 ]')
                 _, cancel_y = pi.until('▸ [ 取消 ]')
@@ -345,7 +345,7 @@ def main():
                 pi.send(b'\x1b[C')
                 pi.until('▸ [ 取消 ]')
                 pi.send(b'\r')  # Enter also cancels a confirmation by default.
-                pi.until_gone('预览到项目目录？')
+                pi.until_gone('预览改动？')
                 assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'ready'
         print('real Pi: phase and primary-action contrast, hit targets and keyboard cancellation in light and narrow dark terminals', flush=True)
         with Pi(local, agent, provider, session=origin) as pi:
@@ -368,7 +368,7 @@ def main():
             assert task()['phase'] == 'ready' and task()['review']['id'] != review_id
             assert (first_path / 'task.txt').read_text() == 'ready revision\n'
             assert (local / 'task.txt').read_text() == 'base\n'
-            pi.click('[ 预览到项目目录 ]')
+            pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             preview_task = task()
@@ -408,12 +408,12 @@ def main():
                 (root / '.pi').mkdir(exist_ok=True)
                 (root / '.pi/loops.json').write_text(value)
             baseline = git('status', '--porcelain')
-            pi.click('[ 预览到项目目录 ]')
-            pi.until('预览到项目目录？')
+            pi.click('[ 预览改动 ]')
+            pi.until('预览改动？')
             pi.click('[ 取消 ]')
-            pi.until_gone('预览到项目目录？')
+            pi.until_gone('预览改动？')
             assert (local / 'task.txt').read_text() == 'base\n'
-            pi.click('[ 预览到项目目录 ]')
+            pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             assert (local / 'task.txt').read_text() == 'previewed revision\n'
@@ -424,7 +424,7 @@ def main():
             pi.click('[ 撤回 ]')
             pi.until('Worktree · 待验收')
             assert git('status', '--porcelain') == baseline
-            pi.click('[ 预览到项目目录 ]')
+            pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             pi.click('[ 打开项目目录检查 ]')
@@ -671,7 +671,7 @@ def main():
             pi.until('Worktree ready.', 40)
             assert task()['localSession']['id'] == original_id
             assert kickoff not in Path(task()['localSession']['file']).read_text()
-            pi.click('[ 预览到项目目录 ]')
+            pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             assert not index.exists()
@@ -722,7 +722,7 @@ def main():
             git('commit', '-am', 'upstream')
             head = git('rev-parse', 'HEAD')
             (local / 'untracked.txt').write_text('private\n')
-            pi.click('[ 预览到项目目录 ]')
+            pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
             pi.until('预览冲突 · 项目目录未修改')
             pi.click('[ 关闭 ]')
@@ -731,7 +731,7 @@ def main():
             pi.click('⋯ 更多')
             pi.click('[ 返回原对话 ]')
             pi.until('项目目录 · Worktree 待验收')
-            pi.click('[ 预览到项目目录 ]')
+            pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
             pi.click('[ 让 Agent 解决冲突 ]')
             pi.until('Conflict resolved in Worktree.', 45)
@@ -741,7 +741,7 @@ def main():
             assert git('rev-parse', 'HEAD') == head
             assert git('status', '--porcelain') == '?? untracked.txt'
             assert (local / 'task.txt').read_text() == 'committed upstream\n'
-            pi.click('[ 预览到项目目录 ]')
+            pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             assert (local / 'task.txt').read_text() == 'merged task\n'
@@ -765,7 +765,7 @@ def main():
                 pi.until('Worktree ready.', 40)
                 original = task()['review']
                 assert original['files'] == (['.pi/loops.json', 'task.txt'] if broad else ['task.txt'])
-                pi.click('[ 预览到项目目录 ]')
+                pi.click('[ 预览改动 ]')
                 pi.click('[ 预览 ]')
                 if broad:
                     pi.until('预览冲突 · 项目目录未修改')
@@ -777,7 +777,7 @@ def main():
                     assert task()['review']['id'] != original['id']
                     assert task()['review']['files'] == ['task.txt']
                     assert (local / 'task.txt').read_text() == 'base\n'
-                    pi.click('[ 预览到项目目录 ]')
+                    pi.click('[ 预览改动 ]')
                     pi.click('[ 预览 ]')
                 pi.until('Worktree · 已预览')
                 assert (local / 'task.txt').read_text() == 'task edit\n'
@@ -806,7 +806,7 @@ def main():
             first.send(kickoff.encode() + b'\r')
             first.until('Worktree ready.', 40)
             first_task = task()
-            first.click('[ 预览到项目目录 ]')
+            first.click('[ 预览改动 ]')
             first.click('[ 预览 ]')
             first.until('Worktree · 已预览')
             with Pi(local, agent, provider) as second:
@@ -819,7 +819,7 @@ def main():
                 assert first_task['isolatedPath'] != second_task['isolatedPath']
                 assert (local / 'task.txt').read_text() == 'task edit\n'
                 before = tasks()
-                second.click('[ 预览到项目目录 ]')
+                second.click('[ 预览改动 ]')
                 second.click('[ 预览 ]')
                 second.until('正在预览另一个任务')
                 assert tasks() == before
@@ -827,7 +827,7 @@ def main():
                 first.click('[ 撤回 ]')
                 first.until('Worktree · 待验收')
                 assert (local / 'task.txt').read_text() == 'base\n'
-                second.click('[ 预览到项目目录 ]')
+                second.click('[ 预览改动 ]')
                 second.click('[ 预览 ]')
                 second.until('Worktree · 已预览')
                 assert task()['phase'] == 'previewed'

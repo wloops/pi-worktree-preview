@@ -20,22 +20,22 @@ const pendingDelivery = deliveryState[deliveryKey] ??= new Set<string>()
 const delivering = (ctx: ExtensionContext) => pendingDelivery.has(ctx.sessionManager.getSessionFile() ?? '')
 const guardedTools = new Set(['edit', 'write', 'bash', 'powershell', TOOL])
 const labels: Record<Action, string> = {
-  preview: '预览到项目目录', rollback: '撤回预览', finalize: '确认提交',
+  preview: '预览改动', rollback: '撤回预览', finalize: '确认提交',
   commit_ready: '跳过预览，直接提交', discard: '放弃任务',
 }
 const confirmationCopy: Record<Action, { title: string; lead: string; button: string }> = {
-  preview: { title: '预览到项目目录？', lead: '写入文件，不暂存、不提交。', button: '预览' },
+  preview: { title: '预览改动？', lead: '改动写入项目目录，不暂存、不提交。', button: '预览' },
   rollback: { title: '撤回预览？', lead: '只还原本次预览。', button: '撤回' },
   finalize: { title: '提交本次预览？', lead: '只提交任务改动。', button: '提交并安全清理' },
   commit_ready: { title: '跳过预览，直接提交？', lead: '写入项目目录并提交。', button: '提交并安全清理' },
   discard: { title: '放弃任务？', lead: '安全检查通过后删除隔离目录，项目目录不变。', button: '放弃' },
 }
 const completed: Record<Action, string> = {
-  preview: '已预览到项目目录，未暂存、未提交。', rollback: '已撤回本次预览。',
+  preview: '改动已写入项目目录，未暂存、未提交。', rollback: '已撤回本次预览。',
   finalize: '已提交本次预览', commit_ready: '已直接提交本次任务', discard: '任务已放弃，项目目录未改动。',
 }
 const progress: Record<Action, string> = {
-  preview: '正在预览到项目目录…', rollback: '正在撤回预览…', finalize: '正在提交预览…',
+  preview: '正在写入预览改动…', rollback: '正在撤回预览…', finalize: '正在提交预览…',
   commit_ready: '正在直接提交…', discard: '正在放弃任务并检查清理…',
 }
 type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'scope' | 'recover' | 'close'
@@ -644,7 +644,7 @@ export default function extension(pi: ExtensionAPI) {
       const id = state.isolated.id
       const review = await withLoading(ctx, '正在标记待验收…', () => state.data.markReady(id, link, params.commitMessage, params.files))
       await refresh(ctx)
-      return { content: [{ type: 'text', text: `已标记待验收（${review.files.length} 个文件）；未修改项目目录。可点击「预览到项目目录」。` }], details: { reviewId: review.id } }
+      return { content: [{ type: 'text', text: `已标记待验收（${review.files.length} 个文件）；未修改项目目录。可点击「预览改动」。` }], details: { reviewId: review.id } }
     },
   })
 
@@ -965,7 +965,7 @@ export default function extension(pi: ExtensionAPI) {
               })
             }).catch(error => {
               if (act === 'commit_ready' && error instanceof PreviewConflict) {
-                throw new Error(`${error.message}。可使用「预览到项目目录」查看冲突处理选项。`, { cause: error })
+                throw new Error(`${error.message}。可通过「预览改动」查看冲突处理选项。`, { cause: error })
               }
               throw error
             })
