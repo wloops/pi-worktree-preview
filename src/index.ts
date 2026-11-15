@@ -842,11 +842,15 @@ export default function extension(pi: ExtensionAPI) {
           const commits = act === 'finalize' || act === 'commit_ready'
           const leavesWorktree = commits && !!isolated
           const partial = commits && !!task.review?.partial
-          const relevantFiles = task.receipt?.changedFiles ?? task.review?.files ?? []
-          const detail = [act === 'discard' ? '隔离 Worktree' : `Local${relevantFiles.length ? ` · ${relevantFiles.length} 个文件` : ''}`,
-            act === 'discard' ? task.isolatedPath : task.local.root]
+          const relevantFiles = (act === 'commit_ready' ? task.review?.files : task.receipt?.changedFiles ?? task.review?.files) ?? []
+          const detail = [
+            ...(commits && task.review ? [`提交标题：${task.review.message.trim()}`] : []),
+            act === 'discard' ? '隔离 Worktree' : `Local${relevantFiles.length ? ` · ${relevantFiles.length} 个文件` : ''}`,
+            act === 'discard' ? task.isolatedPath : task.local.root,
+          ]
           if (leavesWorktree) detail.push('先回到原 Local 会话。')
           if (partial) detail.push('清单外有改动，将保留 Worktree。')
+          if (commits) detail.push(...relevantFiles.map(path => `• ${JSON.stringify(path)}`))
           const decision = await pick<'execute' | 'keep' | undefined>(ctx, copy.title, detail, [
             { label: partial ? '提交并保留' : copy.button, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
             ...(commits && !partial ? [{ label: '提交并保留', value: 'keep' as const }] : []),

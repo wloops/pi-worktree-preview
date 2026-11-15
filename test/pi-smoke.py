@@ -52,12 +52,13 @@ export default function(pi) {
       const revise = () => tool("worktree_begin_revision");
       const badWrite = () => tool("write", {path:"forbidden.txt",content:"must not be written"});
       const runtime = text === "Edit with runtime state." || text === "Edit with overbroad review.";
-      const edit = () => tool("bash", {command:`printf '${revision ? (text === "Revise before preview." ? "ready revision" : "previewed revision") : "task edit"}\\\\n' > task.txt${runtime ? " && mkdir -p .pi && printf isolated > .pi/loops.json" : ""}`});
+      const extra = text === "Edit many files." ? Array.from({length: 32}, (_, i) => `extra-${String(i + 1).padStart(2, '0')}.txt`) : [];
+      const edit = () => tool("bash", {command:`printf '${revision ? (text === "Revise before preview." ? "ready revision" : "previewed revision") : "task edit"}\\\\n' > task.txt${runtime ? " && mkdir -p .pi && printf isolated > .pi/loops.json" : ""}${extra.map(path => ` && touch ${path}`).join('')}`});
       let content;
       if (last?.role === "toolResult") {
         switch (last.toolName) {
           case "bash": content = last.isError ? say("Worktree command failed.") : [tool("worktree_ready_for_review", {
-            commitMessage:"Isolated smoke change", files: text === "Edit with overbroad review." ? ["task.txt", ".pi/loops.json"] : ["task.txt"],
+            commitMessage:"Isolated smoke change", files: text === "Edit with overbroad review." ? ["task.txt", ".pi/loops.json"] : ["task.txt", ...extra],
           })]; break;
           case "read": content = say("Explained without edits."); break;
           case "write": content = say(last.isError ? "Write was blocked." : "Unexpected write."); break;
@@ -437,6 +438,9 @@ def main():
             veto.touch()
             pi.click('[ 确认提交 ]')
             pi.until('只提交任务改动。')
+            pi.until('提交标题：Isolated smoke change')
+            pi.until('• "task.txt"')
+            assert '• ".pi/loops.json"' not in pi.dump()
             pi.click('[ 提交并安全清理 ]')
             pi.until('Pi 取消了切换，未提交。')
             assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'previewed' and first_path.is_dir()
@@ -846,7 +850,7 @@ exec {real_git} "$@"
             with Pi(local, agent, provider, git_bin=git_bin) as pi:
                 pi.click('[ ] 新建 Worktree')
                 pi.until('[x] 新建 Worktree')
-                pi.send(kickoff.encode() + b'\r')
+                pi.send((kickoff if from_worktree else 'Edit many files.').encode() + b'\r')
                 pi.until('Worktree ready.', 40)
                 before = task()
                 isolated = Path(before['isolatedPath'])
@@ -859,7 +863,16 @@ exec {real_git} "$@"
                 pi.click('[ 跳过预览，直接提交 ]')
                 pi.until('跳过预览，直接提交？')
                 pi.until('写入 Local 并提交。')
-                pi.until('Local · 1 个文件')
+                pi.until('提交标题：Isolated smoke change')
+                if from_worktree:
+                    pi.until('Local · 1 个文件')
+                else:
+                    pi.until('Local · 33 个文件')
+                    pi.until('• "extra-01.txt"')
+                    assert '• "task.txt"' not in pi.dump()
+                    pi.click('详情 1–')
+                pi.until('• "task.txt"')
+                assert '• "user.txt"' not in pi.dump()
                 assert '正在直接提交' not in pi.dump()
                 pi.send(b'\r')  # Cancel is preselected.
                 pi.until_gone('跳过预览，直接提交？')
@@ -901,7 +914,9 @@ exec {real_git} "$@"
                 assert done['cleanup']['status'] == ('done' if from_worktree else 'retained')
                 assert isolated.is_dir() != from_worktree
                 assert git('rev-parse', 'HEAD^') == head
-                assert git('show', '--format=', '--name-only') == 'task.txt'
+                assert git('log', '-1', '--format=%s') == 'Isolated smoke change'
+                assert git('show', '--format=', '--name-only').splitlines() == (
+                    ['task.txt'] if from_worktree else [*(f'extra-{i:02}.txt' for i in range(1, 33)), 'task.txt'])
                 assert (local / 'task.txt').read_text() == 'task edit\n'
                 assert git('diff', '--cached') == staged and git('diff') == unstaged
         print('real Pi: menu-only direct commit cancelled and authorized from Worktree and Local; default cleanup and explicit retention verified', flush=True)
