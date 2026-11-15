@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { link, lstat, mkdir, mkdtemp, open, realpath, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { checkout, PreviewConflict, shortSessionName, TaskStore, type Action, type SessionLink, type Task } from './store.ts'
-import { clean, pick, toolbar, type Choice } from './ui.ts'
+import { clean, pick, toolbar, withLoading, type Choice } from './ui.ts'
 
 const NAME = 'worktree-preview'
 const TOOL = 'worktree_ready_for_review'
@@ -16,6 +16,10 @@ const guardedTools = new Set(['edit', 'write', 'bash', 'powershell', TOOL])
 const labels: Record<Action, string> = {
   preview: '预览到 Local', rollback: '撤回预览', finalize: '确认提交',
   commit_ready: '跳过预览，直接提交', discard: '放弃任务',
+}
+const progress: Record<Action, string> = {
+  preview: '正在预览到 Local…', rollback: '正在撤回预览…', finalize: '正在提交预览…',
+  commit_ready: '正在直接提交…', discard: '正在放弃任务并检查清理…',
 }
 type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'scope' | 'recover' | 'close'
 const phases = { creating: '创建中断', working: '进行中', ready: '待验收', previewed: '已预览', delivered: '已交付', discarded: '已放弃' }
@@ -152,13 +156,13 @@ async function withSavedLocal(ctx: ExtensionCommandContext, run: (next: Extensio
       await undoPublication()
       throw error
     }
-    const moved = await ctx.switchSession(source.file, { withSession: async next => {
+    const moved = await withLoading(ctx, '正在恢复原 Local 会话…', () => ctx.switchSession(source.file, { withSession: async next => {
       if (!isBoundSession(next, source) || !next.isIdle()) {
         next.ui.notify('未恢复空闲的原 Local 会话；没有新建 Worktree。', 'error')
         return
       }
       await run(next, text => next.sendUserMessage(text, { expandPromptTemplates: true }))
-    } })
+    } }))
     if (moved.cancelled) {
       await undoPublication()
       throw new Error('Pi 取消了保存原 Local 会话。')
@@ -257,9 +261,11 @@ async function validateSession(link: SessionLink) {
   if (sm.getSessionId() !== link.id || sm.getHeader()?.cwd !== link.cwd) throw new Error('会话身份或工作目录已变化。')
 }
 
-async function switchTo(ctx: ExtensionCommandContext, link: SessionLink, withSession?: SwitchOptions['withSession']) {
-  await validateSession(link)
-  return ctx.switchSession(link.file, { withSession })
+async function switchTo(ctx: ExtensionCommandContext, link: SessionLink, loading: string, withSession?: SwitchOptions['withSession']) {
+  return withLoading(ctx, loading, async () => {
+    await validateSession(link)
+    return ctx.switchSession(link.file, { withSession })
+  })
 }
 
 function restoreDraft(ctx: ExtensionContext, text: string) {
@@ -272,7 +278,7 @@ type Draft = Pick<InputEvent, 'text' | 'images'> & Armed & { token: string }
 type ClickIntent = { token: string; sessionId: string; taskVersion: ReturnType<typeof taskVersion>; choice: MenuAction }
 
 async function confirmRemoval(ctx: ExtensionContext, data: TaskStore, task: Task, title: string) {
-  const proof = await data.inspectRetainedRemoval(task, ctx.cwd)
+  const proof = await withLoading(ctx, '正在检查保留的 Worktree…', () => data.inspectRetainedRemoval(task, ctx.cwd))
   const remove = await pick(ctx, title, [
     '强删将永久移除此目录，包括未交付改动和忽略文件。',
     '目标目录：', task.isolatedPath,
@@ -281,7 +287,7 @@ async function confirmRemoval(ctx: ExtensionContext, data: TaskStore, task: Task
   ], [{ label: '确认强删 Worktree', value: true, tone: 'danger' }, { label: '保留 Worktree', value: false, tone: 'quiet' }],
   { tone: 'danger', requiredDetails: 3 })
   if (!remove || !ctx.isIdle()) return
-  await data.removeRetained(task.id, ctx.cwd, proof)
+  await withLoading(ctx, '正在删除 Worktree…', () => data.removeRetained(task.id, ctx.cwd, proof))
   ctx.ui.notify('Worktree 已删除；Local 与 Pi 会话历史未改动。', 'info')
 }
 
@@ -533,7 +539,8 @@ export default function extension(pi: ExtensionAPI) {
           throw new Error('当前不在可返修的 Worktree 验收状态。')
         }
         if (task.phase === 'ready') {
-          await data.continueEditing(task.id, link, task.review.id, signal)
+          const reviewId = task.review.id
+          await withLoading(ctx, '正在准备返修…', () => data.continueEditing(task.id, link, reviewId, signal))
         } else {
           if (ctx.mode !== 'tui' || !ctx.hasUI) throw new Error('需要在 Pi TUI 由用户确认撤回。')
           const confirmed = await pick(ctx, '返修前需撤回 Local 预览', [
@@ -543,9 +550,10 @@ export default function extension(pi: ExtensionAPI) {
           ], [{ label: '撤回预览，继续返修', value: true, tone: 'primary' }, { label: '取消', value: false, tone: 'quiet' }], { signal, tone: 'warning' })
           signal?.throwIfAborted()
           if (!confirmed) throw new Error('用户取消了撤回，预览保留。')
-          await data.act(task.id, 'rollback', {
-            phase: task.phase, reviewId: task.review.id, previewId: task.receipt?.previewId, revision: { session: link, signal },
-          })
+          const reviewId = task.review.id
+          await withLoading(ctx, progress.rollback, () => data.act(task.id, 'rollback', {
+            phase: task.phase, reviewId, previewId: task.receipt?.previewId, revision: { session: link, signal },
+          }))
         }
         return result(true, '已进入返修。请现在继续处理用户刚才的修改要求，只改本 Worktree，验证后重新标记待验收。')
       } catch (error) {
@@ -568,7 +576,8 @@ export default function extension(pi: ExtensionAPI) {
       const state = await context(ctx)
       const link = sessionLink(ctx)
       if (!state.isolated || !link) throw new Error('只能在受管 Worktree 的原始 Pi 会话中标记待验收。')
-      const review = await state.data.markReady(state.isolated.id, link, params.commitMessage, params.files)
+      const id = state.isolated.id
+      const review = await withLoading(ctx, '正在标记待验收…', () => state.data.markReady(id, link, params.commitMessage, params.files))
       await refresh(ctx)
       return { content: [{ type: 'text', text: `已标记待验收（${review.files.length} 个文件）；未修改 Local。用户可直接点击「预览到 Local」。` }], details: { reviewId: review.id } }
     },
@@ -588,12 +597,14 @@ export default function extension(pi: ExtensionAPI) {
         const source = view?.returnTo ?? active
         if (tasks.some(task => task.localSession.id === source.id && task.localSession.file === source.file &&
             task.localSession.cwd === source.cwd && isOpenTask(task))) throw new Error(sessionBusy)
-        await validateSession(source)
-        const created = await data.create(local, source, (path, task, prior) => prior && view
-          ? forkWorktreeSession(path, task, prior, view.historyHash)
-          : newSession(path, shortSessionName(task.id)), view?.priorId)
+        const created = await withLoading(current, '正在创建 Worktree…', async () => {
+          await validateSession(source)
+          return data.create(local, source, (path, task, prior) => prior && view
+            ? forkWorktreeSession(path, task, prior, view.historyHash)
+            : newSession(path, shortSessionName(task.id)), view?.priorId)
+        })
         const target = created.isolatedSession!
-        const result = await switchTo(current, target, async next => {
+        const result = await switchTo(current, target, '正在进入 Worktree…', async next => {
           entered = replaced = true
           try {
             if (!isBoundSession(next, target)) throw new Error('Pi 未进入预期的隔离 Worktree。')
@@ -652,7 +663,7 @@ export default function extension(pi: ExtensionAPI) {
         busy = true
         let replaced = false
         try {
-          const moved = await switchTo(ctx, returnTo, async next => {
+          const moved = await switchTo(ctx, returnTo, '正在返回 Local…', async next => {
             replaced = true
             if (viewFile && isBoundSession(next, returnTo)) await rm(viewFile, { force: true }).catch(() => {})
           })
@@ -720,20 +731,24 @@ export default function extension(pi: ExtensionAPI) {
             { label: '取消', value: undefined },
           ])
           if (!prior || !ctx.isIdle()) return
-          await data.validateLocalIdentity(prior)
           const source = prior.isolatedSession!
-          const { body, hash } = await readHistory(source)
+          const { body, hash } = await withLoading(ctx, '正在读取历史对话…', async () => {
+            await data.validateLocalIdentity(prior)
+            return readHistory(source)
+          })
           await withSavedLocal(ctx, async current => {
             if (current !== ctx) switching = true
             try {
               const returnTo = sessionLink(current)!
-              const dir = join(data.directory, HISTORY_DIR)
-              await mkdir(dir, { recursive: true, mode: 0o700 })
-              const view = await copyHistory(current.cwd, source, body, sm => {
-                sm.appendSessionInfo(`历史对话 · ${prior.review?.message ?? shortSessionName(prior.id)}`)
-                sm.appendCustomEntry(HISTORY_VIEW, { priorId: prior.id, historyHash: hash, returnTo } satisfies HistoryView)
-              }, dir)
-              const moved = await switchTo(current, view, async () => { switching = true })
+              const view = await withLoading(current, '正在准备历史对话…', async () => {
+                const dir = join(data.directory, HISTORY_DIR)
+                await mkdir(dir, { recursive: true, mode: 0o700 })
+                return copyHistory(current.cwd, source, body, sm => {
+                  sm.appendSessionInfo(`历史对话 · ${prior.review?.message ?? shortSessionName(prior.id)}`)
+                  sm.appendCustomEntry(HISTORY_VIEW, { priorId: prior.id, historyHash: hash, returnTo } satisfies HistoryView)
+                }, dir)
+              })
+              const moved = await switchTo(current, view, '正在打开历史对话…', async () => { switching = true })
               if (moved.cancelled) {
                 await rm(view.file, { force: true })
                 throw new Error('Pi 取消了打开历史对话。')
@@ -744,8 +759,8 @@ export default function extension(pi: ExtensionAPI) {
             }
           })
         } else if (choice === 'return' && isolated) {
-          await data.validateLocalIdentity(isolated)
-          const moved = await switchTo(ctx, isolated.localSession, async () => { switching = true })
+          await withLoading(ctx, '正在检查 Local 会话…', () => data.validateLocalIdentity(isolated))
+          const moved = await switchTo(ctx, isolated.localSession, '正在返回 Local…', async () => { switching = true })
           if (moved.cancelled) throw new Error('Pi 取消了切换。')
         } else if (choice === 'retained' || (choice === 'resume' && task?.isolatedSession)) {
           const target = choice === 'retained' ? await pick<Task | undefined>(ctx, '已保留的 Worktree', ['选择一个已结束任务的保留目录。'], [
@@ -765,23 +780,25 @@ export default function extension(pi: ExtensionAPI) {
             if (next !== 'resume') return
           }
           if (!target.isolatedSession) return
-          await data.validateIsolatedIdentity(target)
-          const moved = await switchTo(ctx, target.isolatedSession, async () => { switching = true })
+          await withLoading(ctx, '正在检查 Worktree…', () => data.validateIsolatedIdentity(target))
+          const moved = await switchTo(ctx, target.isolatedSession, '正在恢复 Worktree 会话…', async () => { switching = true })
           if (moved.cancelled) throw new Error('Pi 取消了切换。')
         } else if (choice === 'recover' && task?.recovery) {
           const target = task.isolatedSession
           if (!target) throw new Error('找不到任务的 Worktree 会话。')
-          await data.validateIsolatedIdentity(task)
           const resume = async (next: ExtensionContext, send: (text: string) => unknown) => {
-            const latest = (await data.read()).tasks.find(item => item.id === task.id)
-            if (!isBoundSession(next, target) || !next.isIdle() || latest?.phase !== 'working' || latest.journal ||
-                JSON.stringify(latest.recovery) !== JSON.stringify(task.recovery)) throw new Error('冲突恢复状态已变化。')
-            await data.validateIsolatedIdentity(latest)
+            await withLoading(next, '正在检查冲突恢复状态…', async () => {
+              const latest = (await data.read()).tasks.find(item => item.id === task.id)
+              if (!isBoundSession(next, target) || !next.isIdle() || latest?.phase !== 'working' || latest.journal ||
+                  JSON.stringify(latest.recovery) !== JSON.stringify(task.recovery)) throw new Error('冲突恢复状态已变化。')
+              await data.validateIsolatedIdentity(latest)
+            })
             await send(conflictPrompt(task.recovery!))
           }
           if (isolated) await resume(ctx, text => pi.sendUserMessage(text))
           else {
-            const moved = await switchTo(ctx, target, async next => {
+            await withLoading(ctx, '正在检查 Worktree…', () => data.validateIsolatedIdentity(task))
+            const moved = await switchTo(ctx, target, '正在恢复 Worktree 会话…', async next => {
               switching = true
               try { await resume(next, text => next.sendUserMessage(text)) }
               catch (error) { next.ui.notify(message(error), 'error') }
@@ -791,20 +808,24 @@ export default function extension(pi: ExtensionAPI) {
         } else if (choice === 'mark' && isolated) {
           const link = sessionLink(ctx)
           if (!link) throw new Error('没有可保存的 Pi 会话。')
-          const files = await chooseReviewFiles(ctx, await data.reviewCandidates(isolated), false)
+          const candidates = await withLoading(ctx, '正在扫描 Worktree 改动…', () => data.reviewCandidates(isolated))
+          const files = await chooseReviewFiles(ctx, candidates, false)
           if (!files || !ctx.isIdle()) return
-          await data.markReady(isolated.id, link, isolated.review?.message ?? 'Worktree task changes', files)
+          await withLoading(ctx, '正在标记待验收…', () =>
+            data.markReady(isolated.id, link, isolated.review?.message ?? 'Worktree task changes', files))
           ctx.ui.notify('已标记待验收；未修改 Local。', 'info')
         } else if (choice === 'scope' && task?.review && task.isolatedSession) {
           const files = await chooseReviewFiles(ctx, task.review.files, true)
           if (!files || files.length === task.review.files.length || !ctx.isIdle()) return
           const link = sessionLink(ctx)
           if (!link) throw new Error('找不到绑定的 Pi 会话。')
-          await data.restrictReview(task.id, link, task.review.id, files)
+          const reviewId = task.review.id
+          await withLoading(ctx, '正在更新交付清单…', () => data.restrictReview(task.id, link, reviewId, files))
           ctx.ui.notify('已更新交付清单；未修改 Local。', 'info')
         } else if (task && choice in labels) {
           const act = choice as Action
-          const discardFingerprint = act === 'discard' ? await data.discardFingerprint(task) : undefined
+          const discardFingerprint = act === 'discard'
+            ? await withLoading(ctx, '正在检查可放弃的 Worktree…', () => data.discardFingerprint(task)) : undefined
           const impact: Record<Action, string> = {
             preview: '只将任务改动写入原 checkout，不暂存、不提交。',
             rollback: '恢复预览前的文件状态；Local 发生漂移时停止。',
@@ -848,18 +869,18 @@ export default function extension(pi: ExtensionAPI) {
               if (!files || files.length === task.review.files.length || !ctx.isIdle()) return
               const link = sessionLink(ctx)
               if (!link) throw new Error('找不到绑定的 Pi 会话。')
-              await data.restrictReview(task.id, link, reviewId, files)
+              await withLoading(ctx, '正在更新交付清单…', () => data.restrictReview(task.id, link, reviewId, files))
               ctx.ui.notify('已更新交付清单；请重新点击预览。', 'info')
               return
             }
             const begin = async (next: ExtensionContext, send: (text: string) => unknown) => {
               if (!isBoundSession(next, target) || !next.isIdle()) throw new Error('未进入预期的空闲 Worktree 会话。')
-              const recovery = await data.beginConflictRecovery(task.id, target, reviewId, plan)
+              const recovery = await withLoading(next, '正在准备冲突处理…', () => data.beginConflictRecovery(task.id, target, reviewId, plan))
               await send(conflictPrompt(recovery))
             }
             if (isolated) await begin(ctx, text => pi.sendUserMessage(text))
             else {
-              const moved = await switchTo(ctx, target, async next => {
+              const moved = await switchTo(ctx, target, '正在进入 Worktree…', async next => {
                 switching = true
                 try { await begin(next, text => next.sendUserMessage(text)) }
                 catch (error) { next.ui.notify(message(error), 'error') }
@@ -871,13 +892,15 @@ export default function extension(pi: ExtensionAPI) {
             }
           }
           const execute = async (activeCtx: ExtensionContext) => {
-            if (decision === 'keep') {
-              if (!task.isolatedSession || task.isolatedSession.cwd !== task.isolatedPath) throw new Error('找不到可保留的 Worktree 会话，未提交。')
-              await validateSession(task.isolatedSession)
-            }
-            const result = await data.act(task.id, act, {
-              phase: task.phase, reviewId: task.review?.id, previewId: task.receipt?.previewId,
-              discardFingerprint, keepWorktree: decision === 'keep',
+            const result = await withLoading(activeCtx, progress[act], async () => {
+              if (decision === 'keep') {
+                if (!task.isolatedSession || task.isolatedSession.cwd !== task.isolatedPath) throw new Error('找不到可保留的 Worktree 会话，未提交。')
+                await validateSession(task.isolatedSession)
+              }
+              return data.act(task.id, act, {
+                phase: task.phase, reviewId: task.review?.id, previewId: task.receipt?.previewId,
+                discardFingerprint, keepWorktree: decision === 'keep',
+              })
             }).catch(error => {
               if (act === 'commit_ready' && error instanceof PreviewConflict) {
                 throw new Error(`${error.message}。可使用「预览到 Local」查看冲突处理选项。`, { cause: error })
@@ -896,8 +919,8 @@ export default function extension(pi: ExtensionAPI) {
           if (leavesWorktree) {
             // Leave the active cwd before delivery can delete it. A veto or failed
             // switch never authorizes a commit from the old session.
-            await data.validateLocal(task)
-            const moved = await switchTo(ctx, task.localSession, async next => {
+            await withLoading(ctx, '正在检查 Local checkout…', () => data.validateLocal(task))
+            const moved = await switchTo(ctx, task.localSession, '正在切换到 Local 提交…', async next => {
               switching = true
               try {
                 const nextCwd = await realpath(next.cwd)

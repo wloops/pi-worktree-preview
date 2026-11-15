@@ -30,6 +30,8 @@ pi --tui-mode fullscreen
 
 编辑器上方的操作条只在任务所属的 Local 或 Worktree 会话显示该任务的阶段和操作。需要并行开发时，在同一个 checkout 新开一个 Local 对话，勾选 **[ ] 新建 Worktree** 后发送任务。每个 Local 对话只显示自己的进行中任务；其他任务即使正在预览，也不影响新建或修改隔离 Worktree。已结束任务的历史和保留目录仍可从同一 checkout 查看。每次写入或放弃都需要单独确认；确认框初始选中取消，避免直接按 Enter 误执行。面板详情过长时，可用滚轮或 Page Up / Page Down 查看。强删确认需要终端完整显示警告和目标路径。`/worktree-preview` 是菜单的键盘备用入口。
 
+创建或切换 Worktree，以及实际执行预览、撤回、提交和清理时，编辑器旁会显示当前操作的转圈提示。等待你点确认时不转圈；完成、失败或取消后提示自动消失。
+
 ## 安全边界与限制
 
 - 每个 Local 会话同时只绑定一个进行中任务；同一个 checkout 的不同 Local 会话可以并行开发和标记待验收。一个 Local checkout 同时只接受一份预览：先撤回或提交当前预览，才能预览或直接提交另一个任务。如果存在未解决的 Local 写入恢复记录，则停止该 checkout 的自动验收。隔离目录从 Local 当时的 `HEAD` 建立，不复制 Local 的未提交改动和忽略文件，默认位于 `~/.pi/agent/worktree-preview/worktrees/<任务 UUID>/`（可随 `PI_CODING_AGENT_DIR` 改变）。会话使用 Pi 原生持久化；不支持 `--no-session`。Worktree 隔离的是工作目录，不是安全沙箱。待验收或已预览时，Agent 可以读取和讨论，但内置编辑、写入和 shell 工具需等返修开始后才开放；其他扩展和外部进程不受这个限制。

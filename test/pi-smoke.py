@@ -7,6 +7,8 @@ from pathlib import Path
 import pty
 import re
 import select
+import shlex
+import shutil
 import signal
 import struct
 import subprocess
@@ -26,7 +28,11 @@ import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 export default function(pi) {
   const veto = fileURLToPath(new URL('./veto-switch', import.meta.url));
-  pi.on('session_before_switch', () => existsSync(veto) ? { cancel: true } : undefined);
+  const slowVeto = fileURLToPath(new URL('./slow-veto-switch', import.meta.url));
+  pi.on('session_before_switch', async () => {
+    if (existsSync(slowVeto)) await new Promise(resolve => setTimeout(resolve, 700));
+    if (existsSync(veto)) return { cancel: true };
+  });
   pi.registerCommand('smoke-session-id', {
     handler: async (_args, ctx) => ctx.ui.notify(`Smoke session ${ctx.sessionManager.getSessionId()}`, 'info'),
   });
@@ -91,7 +97,7 @@ export default function(pi) {
 
 
 class Pi:
-    def __init__(self, cwd, agent, provider, theme='dark', cols=COLS, rows=ROWS, session=None):
+    def __init__(self, cwd, agent, provider, theme='dark', cols=COLS, rows=ROWS, session=None, git_bin=None):
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         settings_path = agent / 'settings.json'
@@ -101,6 +107,8 @@ class Pi:
         if not self.pid:
             os.chdir(cwd)
             os.environ.update(PI_CODING_AGENT_DIR=str(agent), TERM='xterm-256color', COLORTERM='truecolor')
+            if git_bin:
+                os.environ['PATH'] = str(git_bin) + os.pathsep + os.environ['PATH']
             extension = [] if PACKAGE else ['-ne', '-e', str(ROOT / 'src/index.ts')]
             os.execvp('pi', ['pi', '--tui-mode', 'fullscreen', '--no-mcp', '-ns', '-np', '-na',
                              '--provider', 'wtp-smoke', '--model', 'model', *extension, '-e', str(provider),
@@ -786,6 +794,26 @@ def main():
                 assert (local / 'task.txt').read_text() == 'task edit\n'
         print('real Pi: parallel Worktrees from different Local sessions; Local preview held and released independently', flush=True)
 
+        # Pause a real Git preflight until the PTY has observed multiple spinner frames.
+        # The wrapper is used by Pi only; verification commands from Python use real Git.
+        git_bin = base / 'slow-git-bin'
+        git_bin.mkdir()
+        gate = base / 'pause-apply-check'
+        real_git = shlex.quote(shutil.which('git'))
+        wrapper = git_bin / 'git'
+        wrapper.write_text(f'''#!/bin/sh
+case " $* " in
+  *" apply --check "*)
+    count=0
+    while [ -f {shlex.quote(str(gate))} ] && [ "$count" -lt 200 ]; do
+      sleep .05
+      count=$((count + 1))
+    done
+    ;;
+esac
+exec {real_git} "$@"
+''')
+        wrapper.chmod(0o755)
         for from_worktree in (True, False):
             local = base / ('direct-from-worktree' if from_worktree else 'direct-from-local')
             local.mkdir()
@@ -802,7 +830,7 @@ def main():
             (local / 'user.txt').write_text('my unstaged edit\n')
             staged = git('diff', '--cached')
             unstaged = git('diff')
-            with Pi(local, agent, provider) as pi:
+            with Pi(local, agent, provider, git_bin=git_bin) as pi:
                 pi.click('[ ] 新建 Worktree')
                 pi.until('[x] 新建 Worktree')
                 pi.send(kickoff.encode() + b'\r')
@@ -817,24 +845,42 @@ def main():
                 pi.click('[ 工作树操作 ]')
                 pi.click('[ 跳过预览，直接提交 ]')
                 pi.until('确认：跳过预览，直接提交')
+                assert '正在直接提交' not in pi.dump()
                 pi.send(b'\r')  # Cancel is preselected.
                 pi.until_gone('确认：跳过预览，直接提交')
                 assert git('rev-parse', 'HEAD') == head and task() == before
                 assert (local / 'task.txt').read_text() == 'base\n'
                 if from_worktree:
                     veto = base / 'veto-switch'
+                    slow_veto = base / 'slow-veto-switch'
                     veto.touch()
+                    slow_veto.touch()
                     pi.click('[ 工作树操作 ]')
                     pi.click('[ 跳过预览，直接提交 ]')
                     pi.click('[ 提交并清理 Worktree（默认） ]')
+                    pi.until('正在切换到 Local 提交')
                     pi.until('Pi 取消了切换，未提交。')
+                    pi.until_gone('正在切换到 Local 提交')
                     assert git('rev-parse', 'HEAD') == head and task() == before
                     assert (local / 'task.txt').read_text() == 'base\n'
                     veto.unlink()
+                    slow_veto.unlink()
                 pi.click('[ 工作树操作 ]')
                 pi.click('[ 跳过预览，直接提交 ]')
-                pi.click('[ 提交并清理 Worktree（默认） ]' if from_worktree else '[ 提交并保留 Worktree ]')
+                gate.touch()
+                try:
+                    pi.click('[ 提交并清理 Worktree（默认） ]' if from_worktree else '[ 提交并保留 Worktree ]')
+                    pi.until('正在直接提交')
+                    frame = next(line for line in pi.screen.display if '正在直接提交' in line)
+                    end = time.monotonic() + 3
+                    while frame in pi.screen.display and time.monotonic() < end:
+                        pi.read(.15)
+                    assert frame not in pi.screen.display and '正在直接提交' in pi.dump(), pi.dump()
+                    assert git('rev-parse', 'HEAD') == head
+                finally:
+                    gate.unlink()
                 pi.until('Local · Worktree 已交付')
+                pi.until_gone('正在直接提交')
                 done = task()
                 assert done['phase'] == 'delivered' and not done.get('receipt') and not done.get('journal')
                 assert done['cleanup']['status'] == ('done' if from_worktree else 'retained')

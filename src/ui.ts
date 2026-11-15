@@ -1,5 +1,5 @@
 import type { ExtensionContext, Theme, ThemeStyle } from '@earendil-works/pi-coding-agent'
-import { Key, matchesKey, rgbColor, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TuiMouseEvent } from '@earendil-works/pi-tui'
+import { Key, Loader, matchesKey, rgbColor, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TuiMouseEvent } from '@earendil-works/pi-tui'
 
 export const clean = (text: string) => text.replace(/[\p{Cc}\p{Cf}]/gu, '?')
 
@@ -23,6 +23,30 @@ const dark = {
 }
 const white = rgbColor(255, 255, 255)
 const palette = (theme: Theme) => theme.appearance === 'light' ? light : dark
+
+/** A non-modal indicator for an actual operation, never for a user confirmation. */
+export async function withLoading<T>(ctx: ExtensionContext, label: string, run: () => Promise<T>): Promise<T> {
+  if (!ctx.hasUI || ctx.mode !== 'tui') return run()
+  const key = 'worktree-preview-progress'
+  let installed = false
+  ctx.ui.setWidget(key, (tui, theme) => {
+    const loader = new Loader(tui, frame => theme.fg('accent', frame), text => theme.bold(text), label)
+    installed = true
+    return {
+      render: width => width > 0 ? loader.render(width).slice(1) : [],
+      invalidate: () => loader.invalidate(),
+      dispose() { installed = false; loader.stop() },
+    }
+  })
+  try { return await run() }
+  finally {
+    // Pi disposes outgoing widgets on replacement. Never clear a replacement
+    // session's indicator from its predecessor or mask the operation result.
+    if (installed) {
+      try { ctx.ui.setWidget(key, undefined) } catch { /* stale context */ }
+    }
+  }
+}
 
 type StatusTone = 'normal' | 'success' | 'warning' | 'danger'
 function statusStyle(theme: Theme, tone: StatusTone): ThemeStyle {
