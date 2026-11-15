@@ -319,11 +319,8 @@ def main():
                     pi.until('▸ [ 关闭 ]')
                 pi.click_at(border_x + 1, cancel_y)  # the frame is not a button
                 pi.click_at(right_x - 1, cancel_y)  # neither is the trailing space
-                for _ in range(3):
-                    pi.send(b'\x1b[A')
-                    pi.read()
-                    if '▸ [ 预览到 Local ]' in pi.dump():
-                        break
+                pi.until('▸ [ 关闭 ]')  # Closing remains selected after frame clicks.
+                pi.send(b'\x1b[B')  # Wrap from the last (close) to the first (preview) action.
                 pi.until('▸ [ 预览到 Local ]')
                 pi.send(b'\r')
                 pi.until('确认：预览到 Local')
@@ -788,6 +785,65 @@ def main():
                 assert task()['phase'] == 'previewed'
                 assert (local / 'task.txt').read_text() == 'task edit\n'
         print('real Pi: parallel Worktrees from different Local sessions; Local preview held and released independently', flush=True)
+
+        for from_worktree in (True, False):
+            local = base / ('direct-from-worktree' if from_worktree else 'direct-from-local')
+            local.mkdir()
+            git('init', '-q', '-b', 'main')
+            git('config', 'user.name', 'Smoke Test')
+            git('config', 'user.email', 'smoke@example.invalid')
+            (local / 'task.txt').write_text('base\n')
+            (local / 'user.txt').write_text('user base\n')
+            git('add', '.')
+            git('commit', '-m', 'base')
+            head = git('rev-parse', 'HEAD')
+            (local / 'user.txt').write_text('my staged edit\n')
+            git('add', 'user.txt')
+            (local / 'user.txt').write_text('my unstaged edit\n')
+            staged = git('diff', '--cached')
+            unstaged = git('diff')
+            with Pi(local, agent, provider) as pi:
+                pi.click('[ ] 新建 Worktree')
+                pi.until('[x] 新建 Worktree')
+                pi.send(kickoff.encode() + b'\r')
+                pi.until('Worktree ready.', 40)
+                before = task()
+                isolated = Path(before['isolatedPath'])
+                if not from_worktree:
+                    pi.click('[ 工作树操作 ]')
+                    pi.click('[ 返回 Local ]')
+                    pi.until('Local · Worktree 待验收')
+                assert '跳过预览，直接提交' not in pi.dump(), 'direct commit is menu-only'
+                pi.click('[ 工作树操作 ]')
+                pi.click('[ 跳过预览，直接提交 ]')
+                pi.until('确认：跳过预览，直接提交')
+                pi.send(b'\r')  # Cancel is preselected.
+                pi.until_gone('确认：跳过预览，直接提交')
+                assert git('rev-parse', 'HEAD') == head and task() == before
+                assert (local / 'task.txt').read_text() == 'base\n'
+                if from_worktree:
+                    veto = base / 'veto-switch'
+                    veto.touch()
+                    pi.click('[ 工作树操作 ]')
+                    pi.click('[ 跳过预览，直接提交 ]')
+                    pi.click('[ 提交并清理 Worktree（默认） ]')
+                    pi.until('Pi 取消了切换，未提交。')
+                    assert git('rev-parse', 'HEAD') == head and task() == before
+                    assert (local / 'task.txt').read_text() == 'base\n'
+                    veto.unlink()
+                pi.click('[ 工作树操作 ]')
+                pi.click('[ 跳过预览，直接提交 ]')
+                pi.click('[ 提交并清理 Worktree（默认） ]' if from_worktree else '[ 提交并保留 Worktree ]')
+                pi.until('Local · Worktree 已交付')
+                done = task()
+                assert done['phase'] == 'delivered' and not done.get('receipt') and not done.get('journal')
+                assert done['cleanup']['status'] == ('done' if from_worktree else 'retained')
+                assert isolated.is_dir() != from_worktree
+                assert git('rev-parse', 'HEAD^') == head
+                assert git('show', '--format=', '--name-only') == 'task.txt'
+                assert (local / 'task.txt').read_text() == 'task edit\n'
+                assert git('diff', '--cached') == staged and git('diff') == unstaged
+        print('real Pi: menu-only direct commit cancelled and authorized from Worktree and Local; default cleanup and explicit retention verified', flush=True)
 
         for prompt, response, expanded in [
             (b'/smoke-task', 'Expanded Worktree template.', 'Registered Worktree prompt.'),

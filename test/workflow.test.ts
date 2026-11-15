@@ -179,6 +179,7 @@ test('separate Local sessions develop in parallel but share one Local preview', 
   const secondPreview = () => f.store.act(second.id, 'preview', { phase: 'ready', reviewId: reviewed.id })
   const state = await f.store.read()
   await assert.rejects(secondPreview(), /正在预览另一个任务/)
+  await assert.rejects(f.store.act(second.id, 'commit_ready', { phase: 'ready', reviewId: reviewed.id }), /正在预览另一个任务/)
   assert.deepEqual(await f.store.read(), state)
   assert.equal(await exists(join(f.local, 'second.txt')), false)
   assert.equal(await content(f.local, 'task.txt'), 'first task\n')
@@ -718,6 +719,187 @@ test('finalize detects an index created after journaling even when it is logical
   assert.equal(await git(f.local, 'ls-files'), '')
   assert.equal(await exists(index), true)
   assert.equal(await content(f.local, 'README.md'), 'previewed readme\n')
+})
+
+test('direct commit delivers exactly the frozen files on current Local HEAD and preserves other Local layers', async t => {
+  const f = await fixture(t)
+  await writeFile(join(f.local, 'upstream.txt'), 'already committed\n')
+  await git(f.local, 'add', 'upstream.txt')
+  await git(f.local, 'commit', '-m', 'advance Local')
+  const head = await git(f.local, 'rev-parse', 'HEAD')
+  await writeFile(join(f.local, 'staged.txt'), 'staged Local data\n')
+  await git(f.local, 'add', 'staged.txt')
+  await writeFile(join(f.local, 'staged.txt'), 'unstaged Local data on top\n')
+  await writeFile(join(f.local, 'local-only.txt'), 'untracked Local data\n')
+  await writeFile(join(f.isolated, 'task.txt'), 'only task edit\n')
+  const binary = Buffer.from([0, 1, 0xff, 0x80])
+  await writeFile(join(f.isolated, 'binary.dat'), binary)
+  await f.ready()
+  const [status, staged, unstaged] = await Promise.all([
+    git(f.local, 'status', '--porcelain'), git(f.local, 'diff', '--cached'), git(f.local, 'diff'),
+  ])
+  const done = await f.act('commit_ready', await f.latest())
+  assert.equal(done.phase, 'delivered')
+  assert.equal(done.cleanup?.status, 'done')
+  assert.equal(done.receipt, undefined)
+  assert.equal(done.journal, undefined)
+  assert.equal(await exists(f.isolated), false)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD^'), head)
+  assert.equal(await git(f.local, 'show', '-s', '--format=%s'), 'Task only\n')
+  assert.equal(await git(f.local, 'show', '--format=', '--name-only'), 'binary.dat\ntask.txt\n')
+  assert.deepEqual(await readFile(join(f.local, 'binary.dat')), binary)
+  assert.equal(await git(f.local, 'status', '--porcelain'), status)
+  assert.equal(await git(f.local, 'diff', '--cached'), staged)
+  assert.equal(await git(f.local, 'diff'), unstaged)
+  assert.equal(await content(f.local, 'local-only.txt'), 'untracked Local data\n')
+})
+
+test('direct commit from an absent index preserves unreviewed files and partial Worktree', async t => {
+  const f = await fixture(t, undefined, true)
+  await writeFile(join(f.local, 'untracked.txt'), 'Local data\n')
+  await writeFile(join(f.isolated, 'task.txt'), 'task from empty base\n')
+  await writeFile(join(f.isolated, 'untracked.txt'), 'different Worktree data\n')
+  await f.ready(['task.txt'])
+  assert.equal(await exists(join(f.local, '.git/index')), false)
+  const done = await f.act('commit_ready', await f.latest())
+  assert.equal(done.cleanup?.status, 'retained')
+  assert.equal(await git(f.local, 'show', '--format=', '--name-only'), 'task.txt\n')
+  assert.equal(await git(f.local, 'status', '--porcelain'), '?? untracked.txt\n')
+  assert.equal(await content(f.local, 'untracked.txt'), 'Local data\n')
+  assert.equal(await content(f.isolated, 'untracked.txt'), 'different Worktree data\n')
+})
+
+test('direct commit rejects stale reviews and same-path staging even if the user edit matches the task', async t => {
+  const f = await fixture(t)
+  await writeFile(join(f.isolated, 'task.txt'), 'ready task\n')
+  await f.ready()
+  const pending = await f.latest()
+  const run = () => f.act('commit_ready', pending)
+  await writeFile(join(f.isolated, 'task.txt'), 'changed since review\n')
+  await assert.rejects(run(), /待验收文件已变化/)
+  await writeFile(join(f.isolated, 'task.txt'), 'ready task\n')
+  await writeFile(join(f.local, 'task.txt'), 'ready task\n')
+  await git(f.local, 'add', 'task.txt')
+  await writeFile(join(f.local, 'task.txt'), 'task.txt base\n')
+  await assert.rejects(run(), /Local 原有改动与交付清单重叠/)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+  assert.equal(await git(f.local, 'show', ':task.txt'), 'ready task\n')
+  assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
+  assert.deepEqual(await f.latest(), pending)
+  await git(f.local, 'restore', '--staged', 'task.txt')
+  await writeFile(join(f.local, 'task.txt'), 'conflicting Local edit\n')
+  await assert.rejects(run(), PreviewConflict)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+  assert.equal(await content(f.local, 'task.txt'), 'conflicting Local edit\n')
+  assert.deepEqual(await f.latest(), pending)
+})
+
+test('direct commit rejects drift after persisting evidence, before the first Local write', async t => {
+  let f: Awaited<ReturnType<typeof fixture>>
+  let change = 'local'
+  f = await fixture(t, () => createSessionCheckoutApplyEngine({ beforeFinalLocalValidation: async () => {
+    const journal = (await f.latest()).journal
+    assert.equal(journal?.operation, 'commit_ready')
+    assert.equal((await f.latest()).phase, 'ready')
+    assert.ok(journal.indexBefore && await exists(journal.indexBefore))
+    assert.ok(journal.indexAfter && await exists(journal.indexAfter))
+    const root = change === 'local' ? f.local : f.isolated
+    await writeFile(join(root, change === 'local' ? 'unstaged.txt' : 'task.txt'), 'last-minute edit\n')
+  } }))
+  await writeFile(join(f.isolated, 'task.txt'), 'frozen task\n')
+  await f.ready()
+  const pending = await f.latest()
+  await assert.rejects(f.act('commit_ready', pending), /Local 在直接提交前已变化/)
+  assert.equal(await content(f.local, 'unstaged.txt'), 'last-minute edit\n')
+  assert.deepEqual(await f.latest(), pending)
+  change = 'worktree'
+  await assert.rejects(f.act('commit_ready', pending), /待验收文件已变化/)
+  assert.deepEqual(await f.latest(), pending)
+  assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+  assert.equal(await git(f.local, 'for-each-ref', 'refs/pi-worktree-preview'), '')
+})
+
+test('direct commit detects index creation after journaling even if the index tree stays empty', async t => {
+  let f: Awaited<ReturnType<typeof fixture>>
+  f = await fixture(t, () => createSessionCheckoutApplyEngine({ beforeFinalLocalValidation: async () => {
+    const journal = (await f.latest()).journal
+    assert.equal(journal?.operation, 'commit_ready')
+    assert.equal(journal.indexBefore, null)
+    await git(f.local, 'read-tree', '--empty')
+  } }), true)
+  await writeFile(join(f.isolated, 'task.txt'), 'frozen task\n')
+  await f.ready()
+  await assert.rejects(f.act('commit_ready', await f.latest()), /Local 在直接提交前已变化/)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+  assert.equal(await exists(join(f.local, 'task.txt')), false)
+  assert.equal(await exists(join(f.local, '.git/index')), true)
+  assert.equal(await exists(join(f.local, '.git/index.lock')), false)
+  assert.equal((await f.latest()).journal, undefined)
+})
+
+test('direct commit preserves recovery evidence and does not auto-undo a changed file after writing', async t => {
+  let f: Awaited<ReturnType<typeof fixture>>
+  f = await fixture(t, () => createSessionCheckoutApplyEngine({ afterDirectPatchBeforeCommit: async () => {
+    const state = await f.latest()
+    assert.equal(state.phase, 'ready')
+    assert.equal(state.journal?.operation, 'commit_ready')
+    assert.equal(await content(f.local, 'task.txt'), 'task content\n')
+    assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+    await writeFile(join(f.local, 'task.txt'), 'external concurrent edit\n')
+  } }))
+  await writeFile(join(f.isolated, 'task.txt'), 'task content\n')
+  await f.ready()
+  const index = await readFile(join(f.local, '.git/index'))
+  await assert.rejects(f.act('commit_ready', await f.latest()), /未能确认直接提交完成.*恢复记录/)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+  assert.equal(await content(f.local, 'task.txt'), 'external concurrent edit\n')
+  assert.deepEqual(await readFile(join(f.local, '.git/index')), index)
+  const pending = await f.latest()
+  assert.equal(pending.phase, 'ready')
+  assert.ok(pending.receipt)
+  assert.ok(pending.journal?.commitOid)
+  assert.ok(pending.journal?.indexBefore && pending.journal?.indexAfter)
+  assert.deepEqual(await readFile(pending.journal.indexBefore), index)
+  assert.equal(await git(f.local, 'show', `${pending.journal.commitOid}:task.txt`), 'task content\n')
+  assert.ok(await exists(pending.journal.indexAfter))
+  assert.ok(await exists(f.isolated))
+  assert.equal(await exists(join(f.local, '.git/index.lock')), false)
+  await assert.rejects(f.act('commit_ready', pending), /存在恢复记录/)
+  const peer = await f.store.create(await checkout(f.local), { ...f.task.localSession, id: 'peer' },
+    async cwd => ({ ...f.task.isolatedSession!, cwd }))
+  await writeFile(join(peer.isolatedPath, 'peer.txt'), 'peer task\n')
+  const review = await f.store.markReady(peer.id, peer.isolatedSession!, 'Peer task', ['peer.txt'])
+  for (const action of ['preview', 'commit_ready'] as const) {
+    await assert.rejects(f.store.act(peer.id, action, { phase: 'ready', reviewId: review.id }), /Local 有未解决的写入恢复记录/)
+  }
+})
+
+test('direct commit does not compensate over concurrent ref and staging changes after the commit write', async t => {
+  let f: Awaited<ReturnType<typeof fixture>>
+  let ownCommit = ''
+  let externalCommit = ''
+  let externalIndex: Buffer
+  f = await fixture(t, () => createSessionCheckoutApplyEngine({ afterLocalWriteBeforeVerification: async () => {
+    ownCommit = await git(f.local, 'rev-parse', 'HEAD')
+    const tree = (await git(f.local, 'rev-parse', 'HEAD^{tree}')).trim()
+    externalCommit = await git(f.local, 'commit-tree', tree, '-p', ownCommit.trim(), '-m', 'external writer')
+    await git(f.local, 'update-ref', 'HEAD', externalCommit.trim(), ownCommit.trim())
+    await writeFile(join(f.local, 'staged.txt'), 'external staged bytes\n')
+    await git(f.local, 'add', 'staged.txt')
+    externalIndex = await readFile(join(f.local, '.git/index'))
+  } }))
+  await writeFile(join(f.isolated, 'task.txt'), 'frozen task\n')
+  await f.ready()
+  await assert.rejects(f.act('commit_ready', await f.latest()), /未能确认直接提交完成.*恢复记录/)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), externalCommit)
+  assert.deepEqual(await readFile(join(f.local, '.git/index')), externalIndex!)
+  assert.equal(await git(f.local, 'show', ':staged.txt'), 'external staged bytes\n')
+  assert.equal(await content(f.local, 'task.txt'), 'frozen task\n')
+  const pending = await f.latest()
+  assert.equal(pending.phase, 'ready')
+  assert.equal(pending.journal?.commitOid, ownCommit.trim())
+  assert.ok(await exists(f.isolated))
 })
 
 test('discard removes a verified dirty worktree but preserves ignored data', async t => {

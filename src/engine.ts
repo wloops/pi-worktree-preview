@@ -215,6 +215,14 @@ export type ApplyError =
   | OperationNotAllowedApplyError
   | PreviewModifiedApplyError
 
+interface PreviewIdentity { previewId: string; reviewId: string; iteration: number }
+type CommitJournal = (commitOid: string, indexBefore: Buffer | null, indexAfter: Buffer) => Promise<void>
+interface FinalizeInput { localPath: string; receipt: PreviewReceipt; commitMessage: string; beforeCommit?: CommitJournal }
+type DirectCommitOptions = PreviewIdentity & {
+  commitMessage: string
+  beforeWrite(receipt: PreviewReceipt, commitOid: string, indexBefore: Buffer | null, indexAfter: Buffer, finalIndexTreeOid: string): Promise<void>
+}
+
 export interface SessionCheckoutApplyEngine {
   inspectReview(input: ApplyPlanInput, files?: readonly string[]): Promise<InspectReviewResult>
   /** Narrow an existing review without accepting new bytes or paths. */
@@ -234,13 +242,9 @@ export interface SessionCheckoutApplyEngine {
     /** Persists the mutation journal before the final Local CAS; no Local write may happen before it resolves. */
     beforeWrite?(): Promise<void>
   }): Promise<RollbackResult>
-  finalize(input: {
-    localPath: string
-    receipt: PreviewReceipt
-    commitMessage: string
-    /** Commit object 已创建但 branch ref 尚未更新时持久化恢复信息。 */
-    beforeCommit?(commitOid: string, indexBefore: Buffer | null, indexAfter: Buffer): Promise<void>
-  }): Promise<FinishResult>
+  finalize(input: FinalizeInput): Promise<FinishResult>
+  /** Prepare and deliver in one journaled operation, without opening a preview. */
+  commitReady(plan: ApplyPlan, options: DirectCommitOptions): Promise<FinishResult>
 }
 
 export interface SessionCheckoutApplyEngineOptions {
@@ -248,6 +252,8 @@ export interface SessionCheckoutApplyEngineOptions {
   beforeFinalLocalValidation?(): Promise<void> | void
   /** 测试/宿主 seam：在 Local 写入完成、独立写后验证开始前执行。 */
   afterLocalWriteBeforeVerification?(): Promise<void> | void
+  /** Test seam between the durable working-tree patch and the ref/index write. */
+  afterDirectPatchBeforeCommit?(): Promise<void> | void
 }
 
 interface GitResult {
@@ -1470,6 +1476,50 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
     }
   }
 
+  private async prepareWrite(stored: StoredPlan, identity: PreviewIdentity, tempRoot: string): Promise<PreviewReceipt | ApplyErrorResult> {
+    if (!identity.previewId.trim() || !identity.reviewId.trim() || !Number.isSafeInteger(identity.iteration) || identity.iteration < 1) {
+      return { status: 'error', error: { code: 'invalid_input', message: hostMessage('invalidPreviewIdentity') } }
+    }
+    const { localGitRoot, isolatedGitRoot, sourceObjects } = stored.scope
+    if (!pathsMatch(await sourceObjectDirectory(localGitRoot), sourceObjects)) {
+      return { status: 'error', error: { code: 'invalid_plan', message: hostMessage('thePreviewPlanSGitRepositoryIdentityHasChanged') } }
+    }
+    const local = await this.captureSnapshot(localGitRoot, join(tempRoot, 'persistent-local.index'), null, null)
+    if (local.fingerprint !== stored.plan.localFingerprint) {
+      return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedAfterPlanningRecalculateThePlan') } }
+    }
+    if (!stored.patch.length) {
+      return { status: 'error', error: { code: 'operation_not_allowed', message: '本次任务没有可写入 Local 的新改动。' } }
+    }
+    await verifyReview(isolatedGitRoot, stored.review, undefined, true)
+    const paths = this.writePaths(stored)
+    // These files can change the visibility or representation of unrelated paths.
+    const metadata = paths.find(path => ['.gitignore', '.gitattributes'].includes(path.split('/').at(-1)?.toLowerCase() ?? ''))
+    if (metadata) {
+      return { status: 'error', error: { code: 'operation_not_allowed', message: `暂不支持交付影响 Git 快照规则的改动：${JSON.stringify(metadata)}；Local 未写入。` } }
+    }
+    const previewWorkingTreeOid = await prepareIndexFromPatch(localGitRoot, join(tempRoot, 'planned-working.index'), local.treeOid, stored.patch)
+    await checkPreviewPatch(localGitRoot, stored.patch, paths, local.treeOid, previewWorkingTreeOid)
+    const isolatedTreeOid = await reviewedTree(localGitRoot, join(tempRoot, 'persistent-reviewed.index'), stored.input.baseOid, stored.review)
+    const isolatedSnapshotOid = await createSnapshotCommit(localGitRoot, isolatedTreeOid, stored.plan.effectiveBaseOid, null, null, 'Reviewed Isolated snapshot')
+    return {
+      previewId: identity.previewId, reviewId: identity.reviewId, iteration: identity.iteration,
+      previewedAt: Date.now(), configuredBaseOid: stored.input.baseOid,
+      effectiveBaseOid: stored.plan.effectiveBaseOid, baseStrategy: stored.plan.baseStrategy,
+      localHeadOid: local.headOid, localHeadRef: local.headRef,
+      localFingerprintBefore: local.fingerprint,
+      localFingerprintPreview: snapshotFingerprint(local.headOid, local.headRef, local.indexEntries, previewWorkingTreeOid),
+      localWorkingTreeOid: local.treeOid, localIndexTreeOid: local.indexTreeOid, previewWorkingTreeOid,
+      isolatedHeadOid: stored.plan.isolatedHeadOid, isolatedFingerprint: stored.plan.isolatedFingerprint,
+      isolatedSnapshotOid, changedFiles: [...stored.plan.changedFiles],
+    }
+  }
+
+  private writePaths(stored: StoredPlan): string[] {
+    const prefix = stored.scope.projectPrefix
+    return stored.plan.changedFiles.map(path => prefix ? `${prefix}/${path}` : path)
+  }
+
   async preview(
     plan: ApplyPlan,
     options: {
@@ -1483,91 +1533,17 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
     if (!stored || !planMatches(stored.plan, plan)) {
       return { status: 'error', error: { code: 'invalid_plan', message: hostMessage('thePreviewPlanIsMissingAlreadyUsedOrModified') } }
     }
-    if (!options.previewId.trim() || !options.reviewId.trim() || !Number.isSafeInteger(options.iteration) || options.iteration < 1) {
-      return { status: 'error', error: { code: 'invalid_input', message: hostMessage('invalidPreviewIdentity') } }
-    }
-
     let tempRoot: string | null = null
     let localWriteStarted = false
     try {
       tempRoot = await mkdtemp(join(tmpdir(), 'pi-wtp-preview-'))
+      const preparedReceipt = await this.prepareWrite(stored, options, tempRoot)
+      if ('status' in preparedReceipt) return preparedReceipt
+      const { previewWorkingTreeOid, localWorkingTreeOid, localFingerprintPreview } = preparedReceipt
+      const repoPaths = this.writePaths(stored)
       const objectDirectory = join(tempRoot, 'objects')
       await mkdir(objectDirectory, { recursive: true })
-      const sourceObjects = await sourceObjectDirectory(stored.scope.localGitRoot)
-      if (!pathsMatch(sourceObjects, stored.scope.sourceObjects)) {
-        return { status: 'error', error: { code: 'invalid_plan', message: hostMessage('thePreviewPlanSGitRepositoryIdentityHasChanged') } }
-      }
-      const local = await this.captureSnapshot(
-        stored.scope.localGitRoot,
-        join(tempRoot, 'local.index'),
-        objectDirectory,
-        sourceObjects,
-      )
-      if (
-        local.headOid !== stored.plan.localHeadOid
-        || local.headRef !== stored.plan.localHeadRef
-        || local.fingerprint !== stored.plan.localFingerprint
-      ) {
-        return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedAfterPlanningRecalculateThePlan') } }
-      }
-      if (!stored.patch.length) {
-        return { status: 'error', error: { code: 'operation_not_allowed', message: '本次任务没有可写入 Local 的新改动。' } }
-      }
-      await verifyReview(stored.scope.isolatedGitRoot, stored.review, undefined, true)
-      const repoPaths = stored.plan.changedFiles.map(path => stored.scope.projectPrefix ? `${stored.scope.projectPrefix}/${path}` : path)
-      // '.gitignore' edits can change the visibility of unrelated paths without
-      // touching their bytes; the generic Local fingerprint cannot verify that.
-      const metadata = repoPaths.find(path => ['.gitignore', '.gitattributes'].includes(path.split('/').at(-1)?.toLowerCase() ?? ''))
-      if (metadata) {
-        return { status: 'error', error: { code: 'operation_not_allowed', message: `暂不支持预览影响 Git 快照规则的改动：${JSON.stringify(metadata)}；Local 未写入。` } }
-      }
-      const persistentLocal = await this.captureSnapshot(
-        stored.scope.localGitRoot,
-        join(tempRoot, 'persistent-local.index'),
-        null,
-        null,
-      )
-      if (persistentLocal.fingerprint !== stored.plan.localFingerprint) {
-        return { status: 'error', error: { code: 'invalid_plan', message: hostMessage('thePersistentPreviewSnapshotDoesNotMatchTheReviewed') } }
-      }
-      const previewWorkingTreeOid = await prepareIndexFromPatch(
-        stored.scope.localGitRoot,
-        join(tempRoot, 'preview-working.index'),
-        persistentLocal.treeOid,
-        stored.patch,
-      )
-      await checkPreviewPatch(stored.scope.localGitRoot, stored.patch, repoPaths, persistentLocal.treeOid, previewWorkingTreeOid)
-      const isolatedTreeOid = await reviewedTree(stored.scope.localGitRoot, join(tempRoot, 'persistent-reviewed.index'), stored.input.baseOid, stored.review)
-      const isolatedSnapshotOid = await createSnapshotCommit(
-        stored.scope.localGitRoot,
-        isolatedTreeOid,
-        stored.plan.effectiveBaseOid,
-        null,
-        null,
-        'Previewed Isolated snapshot',
-      )
-      const preparedReceipt: PreviewReceipt = {
-        previewId: options.previewId,
-        reviewId: options.reviewId,
-        iteration: options.iteration,
-        previewedAt: Date.now(),
-        configuredBaseOid: stored.input.baseOid,
-        effectiveBaseOid: stored.plan.effectiveBaseOid,
-        baseStrategy: stored.plan.baseStrategy,
-        localHeadOid: persistentLocal.headOid,
-        localHeadRef: persistentLocal.headRef,
-        localFingerprintBefore: persistentLocal.fingerprint,
-        localFingerprintPreview: snapshotFingerprint(persistentLocal.headOid, persistentLocal.headRef, persistentLocal.indexEntries, previewWorkingTreeOid),
-        localWorkingTreeOid: persistentLocal.treeOid,
-        localIndexTreeOid: persistentLocal.indexTreeOid,
-        previewWorkingTreeOid,
-        isolatedHeadOid: stored.plan.isolatedHeadOid,
-        // This is the whole review-time Worktree, used only to authorize cleanup.
-        isolatedFingerprint: stored.plan.isolatedFingerprint,
-        isolatedSnapshotOid,
-        changedFiles: [...stored.plan.changedFiles],
-      }
-
+      const sourceObjects = stored.scope.sourceObjects
       await options.beforeWrite?.(preparedReceipt)
       await this.options.beforeFinalLocalValidation?.()
       await verifyReview(stored.scope.isolatedGitRoot, stored.review)
@@ -1580,7 +1556,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       if (finalLocal.headOid !== stored.plan.localHeadOid || finalLocal.fingerprint !== stored.plan.localFingerprint) {
         return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedBeforePreviewWroteItsChangesRecalculateThe') } }
       }
-      await checkPreviewPatch(stored.scope.localGitRoot, stored.patch, repoPaths, persistentLocal.treeOid, previewWorkingTreeOid)
+      await checkPreviewPatch(stored.scope.localGitRoot, stored.patch, repoPaths, localWorkingTreeOid, previewWorkingTreeOid)
       localWriteStarted = true
       await runGit(stored.scope.localGitRoot, ['apply', '-p1', '--binary', '--whitespace=nowarn'], { input: stored.patch })
       await syncPatchedPaths(stored.scope.localGitRoot, repoPaths)
@@ -1591,8 +1567,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         null,
         null,
       )
-      if (previewedLocal.treeOid !== previewWorkingTreeOid || previewedLocal.headOid !== persistentLocal.headOid ||
-          previewedLocal.headRef !== persistentLocal.headRef || !previewedLocal.indexEntries.equals(persistentLocal.indexEntries)) {
+      if (previewedLocal.fingerprint !== localFingerprintPreview) {
         return {
           status: 'error',
           error: { code: 'git_error', message: hostMessage('theLocalSnapshotAfterPreviewDoesNotMatchThe') },
@@ -1695,12 +1670,35 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
     }
   }
 
-  async finalize(input: {
-    localPath: string
-    receipt: PreviewReceipt
-    commitMessage: string
-    beforeCommit?(commitOid: string, indexBefore: Buffer | null, indexAfter: Buffer): Promise<void>
+  async commitReady(plan: ApplyPlan, options: DirectCommitOptions): Promise<FinishResult> {
+    const stored = this.plans.get(plan.revision)
+    if (!stored || !planMatches(stored.plan, plan)) {
+      return { status: 'error', error: { code: 'invalid_plan', message: '直接提交的计划已变化，Local 未写入。' } }
+    }
+    this.plans.delete(plan.revision)
+    let tempRoot: string | null = null
+    try {
+      tempRoot = await mkdtemp(join(tmpdir(), 'pi-wtp-direct-plan-'))
+      const receipt = await this.prepareWrite(stored, options, tempRoot)
+      if ('status' in receipt) return receipt
+      return await this.writeCommit({
+        localPath: stored.input.localPath, receipt, commitMessage: options.commitMessage,
+      }, { stored, beforeWrite: options.beforeWrite })
+    } catch (error) {
+      return { status: 'error', error: { code: error instanceof StaleReviewError ? 'stale_isolated' : 'git_error', message: this.errorMessage(error) } }
+    } finally {
+      if (tempRoot) await this.cleanup(tempRoot)
+    }
+  }
+
+  async finalize(input: FinalizeInput): Promise<FinishResult> {
+    return this.writeCommit(input)
+  }
+
+  private async writeCommit(input: FinalizeInput, delivery?: {
+    stored: StoredPlan; beforeWrite: DirectCommitOptions['beforeWrite']
   }): Promise<FinishResult> {
+    const direct = delivery?.stored
     const commitMessage = input.commitMessage.trim()
     if (!isValidCommitMessage(commitMessage)) {
       return { status: 'error', error: { code: 'invalid_input', message: hostMessage('theCommitMessageMustBeNonemptyAndContainNoNul') } }
@@ -1710,8 +1708,10 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
     let ownedIndexLock: string | null = null
     let backupIndex: string | null = null
     let preserveBackup = false
+    let directJournalRecorded = false
+    let directWriteStarted = false
     try {
-      tempRoot = await mkdtemp(join(tmpdir(), 'pi-wtp-preview-finalize-'))
+      tempRoot = await mkdtemp(join(tmpdir(), 'pi-wtp-commit-'))
       const localGitRoot = await resolveGitRoot(input.localPath)
       const objectDirectory = join(tempRoot, 'objects')
       await mkdir(objectDirectory, { recursive: true })
@@ -1723,14 +1723,27 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         sourceObjects,
       )
       const receipt = input.receipt
-      if (!matchesReceiptIndex(current, receipt)) {
-        return { status: 'error', error: { code: 'stale_local', message: 'Local 自预览后已变化（分支、HEAD 或索引）；停止提交，保留现场。' } }
+      if (!matchesReceiptIndex(current, receipt) || (direct && current.fingerprint !== receipt.localFingerprintBefore)) {
+        return { status: 'error', error: { code: 'stale_local', message: direct ? 'Local 在准备直接提交时已变化，未写入。' : 'Local 自预览后已变化（分支、HEAD 或索引）；停止提交，保留现场。' } }
       }
       const paths = await receiptPaths(localGitRoot, input.localPath, receipt)
       const checkScope = (actual: string) =>
         checkWorkingScope(localGitRoot, actual, receipt.previewWorkingTreeOid, paths, objectDirectory, sourceObjects)
-      const initialError = await checkScope(current.treeOid)
-      if (initialError) return { status: 'error', error: initialError }
+      if (direct) {
+        if (!pathsMatch(sourceObjects, direct.scope.sourceObjects) || localGitRoot !== direct.scope.localGitRoot) {
+          return { status: 'error', error: { code: 'invalid_plan', message: 'Local 仓库身份已变化，未写入。' } }
+        }
+        // Never silently absorb a staged or working edit on a reviewed path,
+        // including a dirty hunk Git dropped because it already matches the task.
+        const dirty = (await Promise.all([current.indexTreeOid, current.treeOid].map(tree =>
+          changedTreePaths(localGitRoot, current.headTreeOid, tree, objectDirectory, sourceObjects)))).flat()
+        const overlapping = dirty.find(path => direct.review.entries.some(entry => pathsOverlap(path, entry.path)))
+        if (overlapping !== undefined) return { status: 'error', error: { code: 'commit_isolation_conflict',
+          message: `Local 原有改动与交付清单重叠：${JSON.stringify(overlapping)}。不能直接提交；请先处理 Local 改动，或使用预览检查。` } }
+      } else {
+        const initialError = await checkScope(current.treeOid)
+        if (initialError) return { status: 'error', error: initialError }
+      }
       const realIndexPath = await resolveIndexPath(localGitRoot)
       const originalIndexBytes = await readIndexBytes(realIndexPath)
       const assessment = await prepareFinalizeAssessment(
@@ -1746,6 +1759,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       }
 
       if (!assessment.commitRequired) {
+        if (direct) return { status: 'error', error: { code: 'operation_not_allowed', message: '没有可直接提交的任务改动。' } }
         await this.options.beforeFinalLocalValidation?.()
         const finalLocal = await this.captureSnapshot(
           localGitRoot,
@@ -1812,13 +1826,15 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         await runGit(localGitRoot, ['ls-files', '--stage', '-z'], { env: { GIT_INDEX_FILE: finalIndexPath } })
       ).stdout
       const intendedIndexBytes = await readFile(finalIndexPath)
-      await input.beforeCommit?.(commitOid, originalIndexBytes, intendedIndexBytes)
-
       const branchRef = current.headRef
       if (!branchRef?.startsWith('refs/heads/')) {
         return { status: 'error', error: { code: 'operation_not_allowed', message: hostMessage('localIsNotOnANormalBranchATask') } }
       }
-      if (originalIndexBytes !== null) {
+      if (delivery) {
+        await delivery.beforeWrite(receipt, commitOid, originalIndexBytes, intendedIndexBytes, assessment.finalIndexTreeOid)
+        directJournalRecorded = true
+      } else await input.beforeCommit?.(commitOid, originalIndexBytes, intendedIndexBytes)
+      if (!direct && originalIndexBytes !== null) {
         backupIndex = `${realIndexPath}.pi-wtp-backup-${randomUUID()}`
         const backup = await open(backupIndex, 'wx', 0o600)
         try { await backup.writeFile(originalIndexBytes); await backup.sync() } finally { await backup.close() }
@@ -1835,18 +1851,19 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         }
         throw error
       }
-      const finalLocal = await this.captureSnapshot(
-        localGitRoot,
-        join(tempRoot, 'final-local.index'),
-        objectDirectory,
-        sourceObjects,
-      )
+      if (direct) await verifyReview(direct.scope.isolatedGitRoot, direct.review)
+      const finalLocal = await this.captureSnapshot(localGitRoot, join(tempRoot, 'final-local.index'), objectDirectory, sourceObjects)
       const finalIndexBytes = await readIndexBytes(realIndexPath)
-      if (!matchesReceiptIndex(finalLocal, receipt) || !sameIndexBytes(finalIndexBytes, originalIndexBytes)) {
-        return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedBeforeThePreviewCommitWasWrittenRetry') } }
+      if (!matchesReceiptIndex(finalLocal, receipt) || !sameIndexBytes(finalIndexBytes, originalIndexBytes) ||
+          (direct && finalLocal.fingerprint !== receipt.localFingerprintBefore)) {
+        return { status: 'error', error: { code: 'stale_local', message: direct ? 'Local 在直接提交前已变化，未写入。' : hostMessage('localChangedBeforeThePreviewCommitWasWrittenRetry') } }
       }
-      const finalError = await checkScope(finalLocal.treeOid)
-      if (finalError) return { status: 'error', error: finalError }
+      if (direct) {
+        await checkPreviewPatch(localGitRoot, direct.patch, paths, receipt.localWorkingTreeOid, receipt.previewWorkingTreeOid)
+      } else {
+        const finalError = await checkScope(finalLocal.treeOid)
+        if (finalError) return { status: 'error', error: finalError }
+      }
 
       // Updating a named branch gives an OID CAS without following a different
       // checkout's HEAD. Recheck the symbolic ref after filesystem verification.
@@ -1858,6 +1875,19 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       let indexReplaced = false
       let writeError: unknown = null
       try {
+        if (direct) {
+          directWriteStarted = true
+          await runGit(localGitRoot, ['apply', '-p1', '--binary', '--whitespace=nowarn'], { input: direct.patch })
+          await syncPatchedPaths(localGitRoot, paths)
+          await this.options.afterDirectPatchBeforeCommit?.()
+          const patched = await this.captureSnapshot(localGitRoot, join(tempRoot, 'direct-patched.index'), objectDirectory, sourceObjects)
+          const scopeError = await checkScope(patched.treeOid)
+          if (scopeError || !matchesReceiptIndex(patched, receipt) || !sameIndexBytes(await readIndexBytes(realIndexPath), originalIndexBytes)) {
+            throw new Error(scopeError?.message ?? 'Local 在写入文件后发生变化。')
+          }
+          const stillOnBranch = await runGit(localGitRoot, ['symbolic-ref', '--quiet', 'HEAD'], { allowedExitCodes: [0, 1] })
+          if (stillOnBranch.exitCode !== 0 || stdoutText(stillOnBranch) !== branchRef) throw new Error('Local 分支在写入文件后发生变化。')
+        }
         await runGit(localGitRoot, ['update-ref', '--no-deref', branchRef, commitOid, current.headOid])
         refUpdated = true
         await rename(ownedIndexLock, realIndexPath)
@@ -1901,6 +1931,11 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
           writeError = error
         }
       }
+
+      // No inverse patch or ref/index compensation for direct delivery: after
+      // the first file write an external editor or Git process may own a change.
+      if (direct) return { status: 'error', error: { code: 'git_error', recoveryState: 'uncertain',
+        message: `未能确认直接提交完成：${this.errorMessage(writeError)}；未自动撤销，保留现场。` } }
 
       const rollbackErrors: string[] = []
       if (refUpdated && !indexReplaced && ownedIndexLock) {
@@ -1989,7 +2024,11 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         },
       }
     } catch (error) {
-      return { status: 'error', error: { code: 'git_error', message: this.errorMessage(error) } }
+      if (direct && !directWriteStarted && error instanceof StaleReviewError) {
+        return { status: 'error', error: { code: 'stale_isolated', message: error.message } }
+      }
+      const recoveryState = directWriteStarted ? 'uncertain' : directJournalRecorded ? 'unchanged' : undefined
+      return { status: 'error', error: { code: 'git_error', recoveryState, message: this.errorMessage(error) } }
     } finally {
       await removeBestEffort(ownedIndexLock)
       if (!preserveBackup) await removeBestEffort(backupIndex)

@@ -13,7 +13,10 @@ const HISTORY_VIEW = `${NAME}-history-view`
 const HISTORY_DIR = 'history-views'
 const HISTORY_HINT = '历史对话 · 发送后在新 Worktree 继续'
 const guardedTools = new Set(['edit', 'write', 'bash', 'powershell', TOOL])
-const labels: Record<Action, string> = { preview: '预览到 Local', rollback: '撤回预览', finalize: '确认提交', discard: '放弃任务' }
+const labels: Record<Action, string> = {
+  preview: '预览到 Local', rollback: '撤回预览', finalize: '确认提交',
+  commit_ready: '跳过预览，直接提交', discard: '放弃任务',
+}
 type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'scope' | 'recover' | 'close'
 const phases = { creating: '创建中断', working: '进行中', ready: '待验收', previewed: '已预览', delivered: '已交付', discarded: '已放弃' }
 const message = (e: unknown) => clean(e instanceof Error ? e.message : String(e))
@@ -669,6 +672,9 @@ export default function extension(pi: ExtensionAPI) {
         const task = currentTask(ctx, isolated, tasks)
         if (!local && !isolated) throw new Error('请从有初始提交的 Git checkout 打开 Pi。')
         const choices: Choice<MenuAction>[] = [...deliveryChoices(task)]
+        if (task?.phase === 'ready' && task.review && !task.journal && !task.recovery) {
+          choices.push({ label: labels.commit_ready, value: 'commit_ready' })
+        }
         if (task?.phase === 'ready' && !task.journal && !task.recovery && (task.review?.files.length ?? 0) > 1 && task.isolatedSession) choices.push(scopeChoice)
         if (task?.phase === 'working' && task.recovery && !task.journal) choices.push(recoverChoice)
         const details = [phaseLabel(!!isolated, task)]
@@ -803,21 +809,23 @@ export default function extension(pi: ExtensionAPI) {
             preview: '只将任务改动写入原 checkout，不暂存、不提交。',
             rollback: '恢复预览前的文件状态；Local 发生漂移时停止。',
             finalize: '只提交本次预览的任务改动，保留原有 Git 改动。',
+            commit_ready: '不打开预览。直接把验收清单中的任务改动写入 Local 并提交；检查不通过则停止。',
             discard: '放弃隔离工作；若能安全核验，将删除隔离 Worktree。',
           }
           const relevantFiles = task.receipt?.changedFiles ?? task.review?.files ?? []
           const summary = relevantFiles.slice(0, 3).map(s => `• ${s}`)
           if (relevantFiles.length > 3) summary.push(`… 共 ${relevantFiles.length} 个文件`)
-          const leavesWorktree = act === 'finalize' && !!isolated
+          const commits = act === 'finalize' || act === 'commit_ready'
+          const leavesWorktree = commits && !!isolated
           const detail = [impact[act], task.local.root, ...summary]
-          const partial = act === 'finalize' && !!task.review?.partial
-          if (act === 'finalize') detail.push(partial ? '清单外还有改动，提交后将保留 Worktree。' : '默认安全清理；也可保留 Worktree 环境供日后检查。')
+          const partial = commits && !!task.review?.partial
+          if (commits) detail.push(partial ? '清单外还有改动，提交后将保留 Worktree。' : '默认安全清理；也可保留 Worktree 环境供日后检查。')
           if (leavesWorktree) detail.unshift('将先切换到原 Local 会话，再提交。')
           const decision = await pick<'execute' | 'keep' | undefined>(ctx, `确认：${labels[act]}`, detail, [
-            { label: partial ? '提交并保留 Worktree' : act === 'finalize' ? '提交并清理 Worktree（默认）' : `执行${labels[act]}`, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
-            ...(act === 'finalize' && !partial ? [{ label: '提交并保留 Worktree', value: 'keep' as const }] : []),
+            { label: partial ? '提交并保留 Worktree' : commits ? '提交并清理 Worktree（默认）' : `执行${labels[act]}`, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
+            ...(commits && !partial ? [{ label: '提交并保留 Worktree', value: 'keep' as const }] : []),
             { label: '取消', value: undefined, tone: 'quiet' },
-          ], { tone: act === 'discard' ? 'danger' : act === 'finalize' || act === 'rollback' ? 'warning' : undefined })
+          ], { tone: act === 'discard' ? 'danger' : commits || act === 'rollback' ? 'warning' : undefined })
           if (!decision || !ctx.isIdle()) return
           const recoverConflict = async (conflict: PreviewConflict) => {
             const plan = conflict.plan
@@ -870,6 +878,11 @@ export default function extension(pi: ExtensionAPI) {
             const result = await data.act(task.id, act, {
               phase: task.phase, reviewId: task.review?.id, previewId: task.receipt?.previewId,
               discardFingerprint, keepWorktree: decision === 'keep',
+            }).catch(error => {
+              if (act === 'commit_ready' && error instanceof PreviewConflict) {
+                throw new Error(`${error.message}。可使用「预览到 Local」查看冲突处理选项。`, { cause: error })
+              }
+              throw error
             })
             const note = result.cleanup?.status === 'retained' ? `；保留 Worktree：${result.isolatedPath}（${result.cleanup.reason}）` : ''
             const preview = act === 'preview' && isolated ? '；仍在 Worktree，可点击「打开 Local 检查」' : ''
@@ -881,7 +894,7 @@ export default function extension(pi: ExtensionAPI) {
             }
           }
           if (leavesWorktree) {
-            // Leave the active cwd before finalize can delete it. A veto or failed
+            // Leave the active cwd before delivery can delete it. A veto or failed
             // switch never authorizes a commit from the old session.
             await data.validateLocal(task)
             const moved = await switchTo(ctx, task.localSession, async next => {

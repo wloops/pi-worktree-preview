@@ -30,12 +30,12 @@ export interface Task {
   recovery?: ConflictRecovery
   receipt?: PreviewReceipt
   // A null indexBefore explicitly records that no index file existed.
-  journal?: { operation: 'preview' | 'rollback' | 'finalize' | 'cleanup'; at: number; commitOid?: string; indexBefore?: string | null; indexAfter?: string }
+  journal?: { operation: 'preview' | 'rollback' | 'finalize' | 'commit_ready' | 'cleanup'; at: number; commitOid?: string; indexBefore?: string | null; indexAfter?: string }
   cleanup?: { status: 'done' | 'retained'; reason?: string; requested?: true; canForce?: true }
   commitOid?: string | null
 }
 interface State { version: 1; tasks: Task[] }
-export type Action = 'preview' | 'rollback' | 'finalize' | 'discard'
+export type Action = 'preview' | 'rollback' | 'finalize' | 'commit_ready' | 'discard'
 const oid = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/
 const missing = (error: unknown) => (error as NodeJS.ErrnoException)?.code === 'ENOENT'
 const errText = (error: unknown) => error instanceof Error ? error.message : String(error)
@@ -379,7 +379,7 @@ export class TaskStore {
           if (await this.discardFingerprint(task) !== expected.discardFingerprint) throw new Error('Worktree 在确认放弃期间已变化。')
           task.phase = 'discarded'
           await this.cleanup(task, expected.discardFingerprint!, save)
-        } else if (action === 'preview' && task.phase === 'ready' && task.review) {
+        } else if ((action === 'preview' || action === 'commit_ready') && task.phase === 'ready' && task.review) {
           await this.validateIsolated(task)
           const res = await engine.plan(this.input(task), task.review)
           if (res.status === 'error') engineError(res)
@@ -388,6 +388,29 @@ export class TaskStore {
             throw new Error('Local 分支或历史已变化；未写入 Local。')
           }
           if (res.status === 'conflict') throw new PreviewConflict(res)
+          if (action === 'commit_ready') {
+            const review = task.review
+            const done = await engine.commitReady(res.plan, {
+              previewId: randomUUID(), reviewId: review.id, iteration: 1, commitMessage: review.message,
+              beforeWrite: async (receipt, commitOid, before, after, finalIndexTreeOid) => {
+                await this.validateLocal(task)
+                await this.validateIsolated(task)
+                await this.recordCommit(task, 'commit_ready', receipt, commitOid, before, after, save, finalIndexTreeOid)
+              },
+            })
+            if (done.status === 'error') {
+              // Clear only when the engine knows it never started Local writes.
+              // A failed journal/artifact write or uncertain patch keeps evidence.
+              const error = done.error
+              if (task.journal && (error.code === 'stale_local' || error.code === 'stale_isolated' ||
+                  (error.code === 'git_error' && error.recoveryState === 'unchanged'))) {
+                await this.clearDirectJournal(task, save)
+              }
+              engineError(done)
+            }
+            await this.completeCommit(task, done.commitOid, review.fingerprint, !!expected.keepWorktree, save)
+            return task
+          }
           const applied = await engine.preview(res.plan, {
             previewId: randomUUID(), reviewId: task.review.id, iteration: 1,
             beforeWrite: async receipt => {
@@ -442,35 +465,10 @@ export class TaskStore {
           const done = await engine.finalize({ localPath: task.local.root, receipt: task.receipt, commitMessage: task.review.message, beforeCommit: async (commitOid, before, after) => {
             await this.validateLocal(task)
             if (expected.keepWorktree) await this.validateIsolatedIdentity(task)
-            const prefix = join(this.directory, `${task.id}-${task.receipt!.previewId}`)
-            const indexBefore = before === null ? null : `${prefix}.index-before`
-            const indexAfter = `${prefix}.index-after`
-            if (before !== null && indexBefore !== null) await saveArtifact(indexBefore, before)
-            await saveArtifact(indexAfter, after)
-            task.journal = { operation: 'finalize', at: Date.now(), commitOid, indexBefore, indexAfter }
-            await save()
-            await this.pin(task, [commitOid], 'commit')
+            await this.recordCommit(task, 'finalize', task.receipt!, commitOid, before, after, save)
           } })
           if (done.status === 'error') engineError(done)
-          task.phase = 'delivered'
-          task.commitOid = done.commitOid
-          if (expected.keepWorktree) task.cleanup = { status: 'retained', reason: '按用户选择保留环境。', requested: true }
-          else if (task.review.partial) task.cleanup = { status: 'retained', reason: '含未纳入交付清单的改动。', canForce: true }
-          const journal = task.journal as Task['journal']
-          delete task.journal
-          // Persist delivery independently before cleanup can do anything destructive.
-          await save()
-          for (const file of [journal?.indexBefore, journal?.indexAfter]) {
-            if (file) await rm(file, { force: true }).catch(() => {})
-          }
-          if (!expected.keepWorktree && !task.review.partial) {
-            try {
-              await this.cleanup(task, task.receipt.isolatedFingerprint, save)
-            } catch (error) {
-              throw new Error(`已提交 ${done.commitOid}，但未能确认 Worktree 清理完成：${errText(error)}`, { cause: error })
-            }
-          }
-          await this.unpin(task).catch(() => {})
+          await this.completeCommit(task, done.commitOid, task.receipt.isolatedFingerprint, !!expected.keepWorktree, save)
         } else throw new Error('当前阶段不允许此操作。')
       } catch (error) {
         if (error instanceof PreviewConflict) throw error
@@ -478,6 +476,65 @@ export class TaskStore {
       }
       return task
     })
+  }
+
+  private async recordCommit(task: Task, operation: 'finalize' | 'commit_ready', receipt: PreviewReceipt,
+    commitOid: string, before: Buffer | null, after: Buffer, save: () => Promise<void>, finalIndexTreeOid?: string) {
+    const prefix = join(this.directory, `${task.id}-${receipt.previewId}`)
+    const indexBefore = before === null ? null : `${prefix}.index-before`
+    const indexAfter = `${prefix}.index-after`
+    if (before !== null && indexBefore !== null) await saveArtifact(indexBefore, before)
+    await saveArtifact(indexAfter, after)
+    if (operation === 'commit_ready') {
+      task.receipt = receipt // Recovery evidence only; the task never enters previewed.
+    }
+    task.journal = { operation, at: Date.now(), commitOid, indexBefore, indexAfter }
+    await save()
+    await this.pin(task, [commitOid, ...(finalIndexTreeOid ? [finalIndexTreeOid, receipt.localHeadOid, receipt.localWorkingTreeOid,
+      receipt.localIndexTreeOid, receipt.previewWorkingTreeOid, receipt.isolatedSnapshotOid, receipt.isolatedHeadOid] : [])], 'commit')
+  }
+
+  private async clearDirectJournal(task: Task, save: () => Promise<void>) {
+    const { journal, receipt } = task
+    delete task.receipt
+    delete task.journal
+    try { await save() }
+    catch (error) {
+      task.journal = journal
+      task.receipt = receipt
+      throw error
+    }
+    await this.deleteIndexArtifacts(journal)
+    await this.unpin(task).catch(() => {})
+  }
+
+  private async deleteIndexArtifacts(journal: Task['journal']) {
+    for (const file of [journal?.indexBefore, journal?.indexAfter]) {
+      if (file) await rm(file, { force: true }).catch(() => {})
+    }
+  }
+
+  private async completeCommit(task: Task, commitOid: string | null, fingerprint: string, keep: boolean, save: () => Promise<void>) {
+    task.phase = 'delivered'
+    task.commitOid = commitOid
+    if (keep) task.cleanup = { status: 'retained', reason: '按用户选择保留环境。', requested: true }
+    else if (task.review?.partial) task.cleanup = { status: 'retained', reason: '含未纳入交付清单的改动。', canForce: true }
+    const { journal, receipt } = task
+    if (journal?.operation === 'commit_ready') delete task.receipt
+    delete task.journal
+    // Persist delivery independently before cleanup can do anything destructive.
+    try { await save() }
+    catch (error) {
+      task.journal = journal
+      task.receipt = receipt
+      throw error
+    }
+    await this.deleteIndexArtifacts(journal)
+    if (!keep && !task.review?.partial) {
+      try { await this.cleanup(task, fingerprint, save) }
+      catch (error) { throw new Error(`已提交 ${commitOid}，但未能确认 Worktree 清理完成：${errText(error)}`, { cause: error }) }
+    }
+    await this.unpin(task).catch(() => {})
   }
 
   private prefix(task: Task) { return `refs/pi-worktree-preview/${task.id}` }
