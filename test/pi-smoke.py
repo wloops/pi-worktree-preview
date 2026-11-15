@@ -29,6 +29,15 @@ import { fileURLToPath } from 'node:url';
 export default function(pi) {
   const veto = fileURLToPath(new URL('./veto-switch', import.meta.url));
   const slowVeto = fileURLToPath(new URL('./slow-veto-switch', import.meta.url));
+  const persistState = fileURLToPath(new URL('./persist-shutdown-state', import.meta.url));
+  const appendContext = fileURLToPath(new URL('./append-shutdown-context', import.meta.url));
+  pi.on('session_shutdown', event => {
+    if (event.reason !== 'resume' || !event.targetSessionFile?.includes('/history-views/')) return;
+    if (existsSync(persistState)) pi.appendEntry('smoke-shutdown-state', { saved: true });
+    if (existsSync(appendContext)) {
+      pi.sendMessage({ customType: 'smoke-shutdown-context', content: 'New model context', display: false }, { triggerTurn: false });
+    }
+  });
   pi.on('session_before_switch', async () => {
     if (existsSync(slowVeto)) await new Promise(resolve => setTimeout(resolve, 700));
     if (existsSync(veto)) return { cancel: true };
@@ -445,6 +454,8 @@ def main():
             pi.until('Pi 取消了切换，未提交。')
             assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'previewed' and first_path.is_dir()
             veto.unlink()
+            state_on_exit = base / 'persist-shutdown-state'
+            state_on_exit.touch()
             (local / 'task.txt').write_text('edited after preview\n')
             pi.click('[ 确认提交 ]')
             pi.click('[ 提交并安全清理 ]')
@@ -466,6 +477,8 @@ def main():
             pi.click('[ 确认提交 ]')
             pi.click('[ 提交并安全清理 ]')
             pi.until('未能安全清理 Worktree')
+            state_on_exit.unlink()
+            assert isolated_session.read_text().count('"customType":"smoke-shutdown-state"') == 2
             pi.click('[ 保留 Worktree ]')
             pi.until('已交付 · 发送后在新 Worktree 继续')
             pi.until('Revision ready.')
@@ -916,6 +929,22 @@ exec {real_git} "$@"
                     assert (local / 'task.txt').read_text() == 'base\n'
                     veto.unlink()
                     slow_veto.unlink()
+                    append_context = base / 'append-shutdown-context'
+                    append_context.touch()
+                    pi.click('⋯ 更多')
+                    pi.click('[ 跳过预览，直接提交 ]')
+                    pi.click('[ 提交并安全清理 ]')
+                    pi.until('任务对话已变化，未提交。')
+                    pi.until('[ 回到 Worktree ]')
+                    append_context.unlink()
+                    assert git('rev-parse', 'HEAD') == head and task() == before
+                    assert (local / 'task.txt').read_text() == 'base\n'
+                    source = Path(before['isolatedSession']['file'])
+                    assert '"type":"custom_message"' in source.read_text() and 'smoke-shutdown-context' in source.read_text()
+                    pi.click('[ 回到 Worktree ]')
+                    pi.until('Worktree · 待验收')
+                    state_on_exit = base / 'persist-shutdown-state'
+                    state_on_exit.touch()
                 pi.click('⋯ 更多')
                 pi.click('[ 跳过预览，直接提交 ]')
                 gate.touch()
@@ -953,7 +982,9 @@ exec {real_git} "$@"
                     assert 'Do not send during delivery.' not in Path(done['isolatedSession']['file']).read_text()
                     pi.send(b'\x15')  # clear the unsent draft before entering a shell command
                     source = Path(done['isolatedSession']['file'])
+                    state_on_exit.unlink()
                     saved = source.read_bytes()
+                    assert b'"customType":"smoke-shutdown-state"' in saved
                     pi.send(b'!touch forbidden-in-history\r')
                     pi.until('请返回原对话再执行 shell')
                     assert not (local / 'forbidden-in-history').exists()
@@ -968,7 +999,9 @@ exec {real_git} "$@"
                     assert not isolated.exists() and source.read_bytes() == saved
                     assert (Path(next_task['isolatedPath']) / 'latest.txt').read_text() == 'post-delivery HEAD\n'
                     assert (Path(next_task['isolatedPath']) / 'user.txt').read_text() == 'user base\n'
-                    assert Path(next_task['isolatedSession']['file']).read_text().count('Follow up from delivery.') == 1
+                    continuation = Path(next_task['isolatedSession']['file']).read_text()
+                    assert continuation.count('Follow up from delivery.') == 1
+                    assert 'smoke-shutdown-state' not in continuation
                     assert 'Follow up from delivery.' not in Path(next_task['localSession']['file']).read_text()
         print('real Pi: direct commit from either side; Worktree transcript remains, and follow-up uses latest HEAD after cleanup', flush=True)
 

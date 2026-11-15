@@ -197,7 +197,9 @@ async function newSession(cwd: string, name: string): Promise<SessionLink> {
   sm.appendSessionInfo(name)
   return { file, id: sm.getSessionId(), cwd: sm.getCwd() }
 }
-type HistoryView = { priorId: string; historyHash: string; returnTo: SessionLink; afterCommit?: true; leaf?: string }
+type HistoryProof = { historyHash: string; historyLines?: number }
+type HistoryView = HistoryProof & { priorId: string; returnTo: SessionLink; afterCommit?: true; leaf?: string }
+const hashHistory = (lines: string[]) => createHash('sha256').update(lines.join('\n')).digest('hex')
 
 async function readHistory(source: SessionLink) {
   if (!isAbsolute(source.file) || !await existing(source.file)) throw new Error('原 Pi 会话文件已不存在，无法续接。')
@@ -220,18 +222,29 @@ async function readHistory(source: SessionLink) {
     }
     if (header.version !== CURRENT_SESSION_VERSION) throw new Error('原 Pi 会话格式版本不兼容，无法续接。')
     const ids = new Set<string>()
-    for (const line of body) {
-      if (!line.trim()) continue
+    let stateSuffixStart = 0
+    for (const [i, line] of body.entries()) {
+      if (!line.trim()) { stateSuffixStart = i + 1; continue }
       const entry = parse(line)
       if (typeof entry?.type !== 'string' || entry.type === 'session' || typeof entry.id !== 'string' ||
           ids.has(entry.id) || (entry.parentId !== null && !ids.has(entry.parentId))) {
         throw new Error('原 Pi 会话的历史链接不完整，无法续接。')
       }
       ids.add(entry.id)
+      if (entry.type !== 'custom' || typeof entry.customType !== 'string' || !entry.customType) stateSuffixStart = i + 1
     }
 
-    return { body, ids, hash: createHash('sha256').update(body.join('\n')).digest('hex') }
+    return { body, ids, stateSuffixStart, hash: hashHistory(body) }
   } finally { await fd.close() }
+}
+
+function matchesHistory(history: Awaited<ReturnType<typeof readHistory>>, proof: HistoryProof) {
+  const n = proof.historyLines
+  if (n === undefined) return history.hash === proof.historyHash
+  // During native switch, shutdown hooks may append custom extension state.
+  // Require the exact original prefix and permit only Pi's non-context `custom`
+  // entries after it, never messages (including custom_message) or context edits.
+  return n >= history.stateSuffixStart && n <= history.body.length && hashHistory(history.body.slice(0, n)) === proof.historyHash
 }
 
 // Publish a native child only after the full history and marker are written.
@@ -264,21 +277,23 @@ async function makeHistoryView(data: TaskStore, task: Task, returnTo: SessionLin
   if (leaf !== undefined && !ids.has(leaf)) throw new Error('当前对话分支尚未保存，无法保留对话。')
   const dir = join(data.directory, HISTORY_DIR)
   await mkdir(dir, { recursive: true, mode: 0o700 })
+  const proof: HistoryProof = { historyHash: hash, ...(delivery ? { historyLines: body.length } : {}) }
   const target = await copyHistory(returnTo.cwd, source, body, sm => {
     if (leaf !== undefined) sm.branch(leaf)
     sm.appendSessionInfo(`${delivery ? 'Worktree · 任务对话' : '历史对话'} · ${task.review?.message ?? shortSessionName(task.id)}`)
-    sm.appendCustomEntry(HISTORY_VIEW, { priorId: task.id, historyHash: hash, returnTo, ...(delivery ? { afterCommit: true, leaf } : {}) } satisfies HistoryView)
+    sm.appendCustomEntry(HISTORY_VIEW, { priorId: task.id, returnTo, ...proof, ...(delivery ? { afterCommit: true, leaf } : {}) } satisfies HistoryView)
   }, dir)
-  return { target, source, hash }
+  return { target, source, proof }
 }
 
 async function forkWorktreeSession(cwd: string, task: Task, prior: Task, view: HistoryView): Promise<SessionLink> {
   const source = prior.isolatedSession!
-  const { body, ids, hash } = await readHistory(source)
-  if (hash !== view.historyHash || (view.leaf !== undefined && !ids.has(view.leaf))) {
+  const history = await readHistory(source)
+  if (!matchesHistory(history, view) || (view.leaf !== undefined && !history.ids.has(view.leaf))) {
     throw new Error('原 Pi 会话在打开后已变化；请返回原对话后重新打开任务历史。')
   }
-  return copyHistory(cwd, source, body, fork => {
+  // Inherit the same snapshot that was shown, not state appended on exit.
+  return copyHistory(cwd, source, history.body.slice(0, view.historyLines ?? history.body.length), fork => {
     if (view.leaf !== undefined) fork.branch(view.leaf)
     fork.appendSessionInfo(shortSessionName(task.id))
     fork.appendCustomMessageEntry(`${NAME}-follow-up`, [
@@ -490,7 +505,8 @@ export default function extension(pi: ExtensionAPI) {
         const view = marker?.type === 'custom' ? marker.data as Partial<HistoryView> | undefined : undefined
         if (view?.returnTo?.cwd === ctx.cwd && typeof view.returnTo.id === 'string' && typeof view.returnTo.file === 'string' &&
             typeof view.priorId === 'string' && typeof view.historyHash === 'string' && /^[a-f0-9]{64}$/.test(view.historyHash) &&
-            (view.afterCommit === undefined || view.afterCommit === true) && (view.leaf === undefined || typeof view.leaf === 'string')) {
+            (view.afterCommit === undefined || view.afterCommit === true) && (view.leaf === undefined || typeof view.leaf === 'string') &&
+            (view.historyLines === undefined || (view.afterCommit && Number.isSafeInteger(view.historyLines) && view.historyLines >= 0))) {
           historyView = view as HistoryView
         }
         await refresh(ctx)
@@ -985,7 +1001,7 @@ export default function extension(pi: ExtensionAPI) {
             // Move off the old cwd before cleanup, but keep the task transcript on
             // screen. This view blocks tools and prompt delivery until handoff.
             const leaf = ctx.sessionManager.getLeafId()
-            const { target, source, hash } = await withLoading(ctx, '正在保留任务对话…', async () => {
+            const { target, source, proof } = await withLoading(ctx, '正在保留任务对话…', async () => {
               await data.validateLocal(task)
               await validateSession(task.localSession)
               return makeHistoryView(data, task, task.localSession, { leaf })
@@ -1000,7 +1016,7 @@ export default function extension(pi: ExtensionAPI) {
                   if (!inProject || !isBoundSession(next, target) || !next.isIdle()) {
                     throw new Error('未进入预期的任务对话，未提交。')
                   }
-                  if ((await readHistory(source)).hash !== hash) throw new Error('任务对话已变化，未提交。')
+                  if (!matchesHistory(await readHistory(source), proof)) throw new Error('任务对话已变化，未提交。')
                   await execute(next)
                 } catch (error) {
                   next.ui.notify(message(error), 'error')
