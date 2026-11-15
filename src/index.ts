@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { link, lstat, mkdir, mkdtemp, open, realpath, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { checkout, PreviewConflict, shortSessionName, TaskStore, type Action, type SessionLink, type Task } from './store.ts'
-import { clean, pick, toolbar, withLoading, type Choice } from './ui.ts'
+import { clean, pick, toolbar, withLoading, type Choice, type ToolbarChoice } from './ui.ts'
 
 const NAME = 'worktree-preview'
 const TOOL = 'worktree_ready_for_review'
@@ -16,6 +16,17 @@ const guardedTools = new Set(['edit', 'write', 'bash', 'powershell', TOOL])
 const labels: Record<Action, string> = {
   preview: '预览到 Local', rollback: '撤回预览', finalize: '确认提交',
   commit_ready: '跳过预览，直接提交', discard: '放弃任务',
+}
+const confirmationCopy: Record<Action, { title: string; lead: string; button: string }> = {
+  preview: { title: '预览到 Local？', lead: '写入文件，不暂存、不提交。', button: '预览' },
+  rollback: { title: '撤回预览？', lead: '只还原本次预览。', button: '撤回' },
+  finalize: { title: '提交本次预览？', lead: '只提交任务改动。', button: '提交并安全清理' },
+  commit_ready: { title: '跳过预览，直接提交？', lead: '写入 Local 并提交。', button: '提交并安全清理' },
+  discard: { title: '放弃任务？', lead: '安全检查通过后删除隔离目录，Local 不变。', button: '放弃' },
+}
+const completed: Record<Action, string> = {
+  preview: '已预览到 Local，未暂存、未提交。', rollback: '已撤回本次预览。',
+  finalize: '已提交本次预览', commit_ready: '已直接提交本次任务', discard: '任务已放弃，Local 未改动。',
 }
 const progress: Record<Action, string> = {
   preview: '正在预览到 Local…', rollback: '正在撤回预览…', finalize: '正在提交预览…',
@@ -61,8 +72,8 @@ async function chooseReviewFiles(ctx: ExtensionContext, files: readonly string[]
     toggle() { if (!selected.delete(path)) selected.add(path) },
   }))
   const apply = await pick(ctx, narrow ? '调整交付清单' : '选择交付文件', [
-    narrow ? '取消勾选即可从已有验收中移除文件，不会重读未交付内容。' : '只勾选本次任务要交付的文件。',
-    '清单外的文件不会写入 Local。',
+    narrow ? '取消勾选即可移除文件；保留文件的验收内容不变。' : '只勾选本次任务要交付的文件。',
+    '保存只更新验收清单，不会写入 Local。',
   ], [...choices, { label: '保存交付清单', value: true, tone: 'primary' }, { label: '取消', value: false, tone: 'quiet' }])
   if (!apply) return
   if (!selected.size) throw new Error('请选择至少一个要交付的改动文件。')
@@ -317,7 +328,7 @@ export default function extension(pi: ExtensionAPI) {
 
   const openMenu = () => pi.sendUserMessage(`/${NAME}`, { expandPromptTemplates: true })
   function installToolbar<T>(ctx: ExtensionContext, view: () => {
-    status: Parameters<typeof toolbar<T>>[2]; buttons: Choice<T>[]
+    status: Parameters<typeof toolbar<T>>[2]; buttons: ToolbarChoice<T>[]
   }, activate: (value: T) => void) {
     ctx.ui.setWidget(NAME, (_tui, theme) => {
       let hits: ReturnType<typeof toolbar<T>>['hits'] = []
@@ -375,10 +386,10 @@ export default function extension(pi: ExtensionAPI) {
     installToolbar<MenuAction | 'menu'>(ctx, () => ({
       status: { label: phaseLabel(!!state.isolated, active), tone: phaseTone(active) },
       buttons: [
-        ...(showCreate ? [{ label: `[${selected() ? 'x' : ' '}] 新建 Worktree`, value: 'arm' as const, tone: 'primary' as const }] : []),
+        ...(showCreate ? [{ label: `[${selected() ? 'x' : ' '}] 新建 Worktree`, value: 'arm' as const, tone: 'primary' as const, checked: selected() }] : []),
         ...direct.map(({ label, ...choice }) => ({ ...choice, label: `[ ${label} ]` })),
         ...(historyTasks(state.tasks).length ? [{ label: '[ 任务历史 ]', value: 'history' as const }] : []),
-        ...(showMenu ? [{ label: '[ 工作树操作 ]', value: 'menu' as const }] : []),
+        ...(showMenu ? [{ label: ' ⋯ 更多 ', value: 'menu' as const, trailing: true }] : []),
       ],
     }), choice => {
       if (choice === 'menu') openMenu()
@@ -688,13 +699,14 @@ export default function extension(pi: ExtensionAPI) {
         }
         if (task?.phase === 'ready' && !task.journal && !task.recovery && (task.review?.files.length ?? 0) > 1 && task.isolatedSession) choices.push(scopeChoice)
         if (task?.phase === 'working' && task.recovery && !task.journal) choices.push(recoverChoice)
-        const details = [phaseLabel(!!isolated, task)]
-        if (task?.review) details.push(`验收：${task.review.message} · ${task.review.files.length} 个文件`)
-        if (task) {
-          if (task.journal || task.phase === 'creating') details.push(`已停止自动操作 · ${data.statePath}`, task.isolatedPath)
-          if (task.cleanup?.status === 'retained') details.push(`保留 Worktree：${task.cleanup.reason}`, task.isolatedPath)
+        const details: string[] = []
+        if (task?.journal || task?.phase === 'creating') {
+          details.push('操作已停止', `恢复记录：${data.statePath}`, `隔离目录：${task.isolatedPath}`)
+        } else if (task?.cleanup?.status === 'retained') {
+          details.push(`已保留 · ${task.cleanup.reason ?? 'Worktree'}`)
+        } else if (task?.review) {
+          details.push(`${task.review.message} · ${task.review.files.length} 个文件`)
         }
-        details.push(`目录：${cwd}`)
         if (isolated && task) {
           choices.push(task.phase === 'previewed' && !task.journal ? localCheck : { label: '返回 Local', value: 'return' })
           if (!task.journal && ['working', 'ready'].includes(task.phase)) choices.push({ label: '标记待验收（手动）', value: 'mark' })
@@ -714,7 +726,7 @@ export default function extension(pi: ExtensionAPI) {
         if (intent && (intent.sessionId !== ctx.sessionManager.getSessionId() || intent.taskVersion !== taskVersion(task) ||
             !choices.some(option => option.value === intent.choice))) throw new Error('任务状态已变化，请重新选择。')
         const tone = phaseTone(task)
-        const choice = intent?.choice ?? await pick(ctx, 'Worktree 预览工作台', details, choices, {
+        const choice = intent?.choice ?? await pick(ctx, 'Worktree · 更多', details, choices, {
           tone: tone === 'danger' || tone === 'warning' ? tone : undefined,
         })
         if (!choice || choice === 'close' || !ctx.isIdle()) return
@@ -826,27 +838,20 @@ export default function extension(pi: ExtensionAPI) {
           const act = choice as Action
           const discardFingerprint = act === 'discard'
             ? await withLoading(ctx, '正在检查可放弃的 Worktree…', () => data.discardFingerprint(task)) : undefined
-          const impact: Record<Action, string> = {
-            preview: '只将任务改动写入原 checkout，不暂存、不提交。',
-            rollback: '恢复预览前的文件状态；Local 发生漂移时停止。',
-            finalize: '只提交本次预览的任务改动，保留原有 Git 改动。',
-            commit_ready: '不打开预览。直接把验收清单中的任务改动写入 Local 并提交；检查不通过则停止。',
-            discard: '放弃隔离工作；若能安全核验，将删除隔离 Worktree。',
-          }
-          const relevantFiles = task.receipt?.changedFiles ?? task.review?.files ?? []
-          const summary = relevantFiles.slice(0, 3).map(s => `• ${s}`)
-          if (relevantFiles.length > 3) summary.push(`… 共 ${relevantFiles.length} 个文件`)
+          const copy = confirmationCopy[act]
           const commits = act === 'finalize' || act === 'commit_ready'
           const leavesWorktree = commits && !!isolated
-          const detail = [impact[act], task.local.root, ...summary]
           const partial = commits && !!task.review?.partial
-          if (commits) detail.push(partial ? '清单外还有改动，提交后将保留 Worktree。' : '默认安全清理；也可保留 Worktree 环境供日后检查。')
-          if (leavesWorktree) detail.unshift('将先切换到原 Local 会话，再提交。')
-          const decision = await pick<'execute' | 'keep' | undefined>(ctx, `确认：${labels[act]}`, detail, [
-            { label: partial ? '提交并保留 Worktree' : commits ? '提交并清理 Worktree（默认）' : `执行${labels[act]}`, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
-            ...(commits && !partial ? [{ label: '提交并保留 Worktree', value: 'keep' as const }] : []),
+          const relevantFiles = task.receipt?.changedFiles ?? task.review?.files ?? []
+          const detail = [act === 'discard' ? '隔离 Worktree' : `Local${relevantFiles.length ? ` · ${relevantFiles.length} 个文件` : ''}`,
+            act === 'discard' ? task.isolatedPath : task.local.root]
+          if (leavesWorktree) detail.push('先回到原 Local 会话。')
+          if (partial) detail.push('清单外有改动，将保留 Worktree。')
+          const decision = await pick<'execute' | 'keep' | undefined>(ctx, copy.title, detail, [
+            { label: partial ? '提交并保留' : copy.button, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
+            ...(commits && !partial ? [{ label: '提交并保留', value: 'keep' as const }] : []),
             { label: '取消', value: undefined, tone: 'quiet' },
-          ], { tone: act === 'discard' ? 'danger' : commits || act === 'rollback' ? 'warning' : undefined })
+          ], { compactActions: true, lead: copy.lead, tone: act === 'discard' ? 'danger' : commits || act === 'rollback' ? 'warning' : undefined })
           if (!decision || !ctx.isIdle()) return
           const recoverConflict = async (conflict: PreviewConflict) => {
             const plan = conflict.plan
@@ -907,10 +912,13 @@ export default function extension(pi: ExtensionAPI) {
               }
               throw error
             })
-            const note = result.cleanup?.status === 'retained' ? `；保留 Worktree：${result.isolatedPath}（${result.cleanup.reason}）` : ''
-            const preview = act === 'preview' && isolated ? '；仍在 Worktree，可点击「打开 Local 检查」' : ''
-            activeCtx.ui.notify(`${labels[act]}完成${result.commitOid ? ` · ${result.commitOid.slice(0, 12)}` : ''}${preview}${note}`,
-              note && !result.cleanup?.requested ? 'warning' : 'info')
+            const oid = commits && result.commitOid ? ` · ${result.commitOid.slice(0, 12)}` : ''
+            const followUp = act === 'preview' && isolated ? '可点「打开 Local 检查」。' : ''
+            const cleanup = result.cleanup?.status === 'retained'
+              ? ` Worktree 已保留：${result.isolatedPath}${result.cleanup.reason ? `（${result.cleanup.reason}）` : ''}`
+              : result.cleanup?.status === 'done' ? ' Worktree 已清理。' : ''
+            activeCtx.ui.notify(`${completed[act]}${oid}${followUp}${cleanup}`,
+              result.cleanup?.status === 'retained' && !result.cleanup.requested ? 'warning' : 'info')
             if (result.cleanup?.canForce && !partial && activeCtx.isIdle()) {
               try { await confirmRemoval(activeCtx, data, result, '未能安全清理 Worktree') }
               catch (error) { activeCtx.ui.notify(`Worktree 清理已停止：${message(error)}`, 'warning') }

@@ -248,11 +248,15 @@ def main():
             assert (local / 'task.txt').read_text() == 'base\n'
         git('switch', '--quiet', 'main')
         with Pi(local, agent, provider) as pi:
+            create_x, create_y = pi.until('[ ] 新建 Worktree')
+            assert pi.screen.buffer[create_y - 1][create_x - 1].bg == '4669a3'
             pi.click('[ ] 新建 Worktree')
-            pi.until('[x] 新建 Worktree')
+            create_x, create_y = pi.until('[x] 新建 Worktree')
+            assert pi.screen.buffer[create_y - 1][create_x - 1].bg == '294f94'
             assert not state_path.exists(), 'checking must not create anything'
             pi.click('[x] 新建 Worktree')
-            pi.until('[ ] 新建 Worktree')
+            create_x, create_y = pi.until('[ ] 新建 Worktree')
+            assert pi.screen.buffer[create_y - 1][create_x - 1].bg == '4669a3'
             pi.send(b'Local only.\r')
             pi.until('Acknowledged without edits.')
             assert not state_path.exists(), 'unchecked send must stay in Local'
@@ -285,12 +289,12 @@ def main():
             unrelated.click('[x] 新建 Worktree')
             unrelated.until('[ ] 新建 Worktree')
             unrelated.send(b'/worktree-preview\r')
-            unrelated.until('Worktree 预览工作台')
+            unrelated.until('Worktree · 更多')
             assert '待验收' not in unrelated.dump() and '[ 进入 / 恢复 Worktree ]' not in unrelated.dump()
             assert '[ 预览到 Local ]' not in unrelated.dump() and '[ 放弃任务 ]' not in unrelated.dump()
             unrelated.until('[ 下次发送时新建 Worktree ]')
             unrelated.send(b'\x1b')
-            unrelated.until_gone('Worktree 预览工作台')
+            unrelated.until_gone('Worktree · 更多')
             unrelated.send(b'Local only.\r')
             unrelated.until('Acknowledged without edits.')
             assert tasks() == before
@@ -302,43 +306,50 @@ def main():
                 assert '预览只写入 Local' not in pi.dump()
                 primary = pi.screen.buffer[action_y - 1][action_x - 1]
                 assert primary.bold and primary.bg == {'light': '274c97', 'dark': '305ba6'}[theme]
-                pi.click('[ 工作树操作 ]')
-                pi.until('Worktree 预览工作台')
+                more_x, more_y = pi.until('⋯ 更多')
+                assert more_x > cols - 12
+                if cols == 110:
+                    assert more_y == action_y
+                pi.click('⋯ 更多')
+                pi.until('Worktree · 更多')
                 pi.send(b'\r')  # Enter closes the menu by default.
-                pi.until_gone('Worktree 预览工作台')
+                pi.until_gone('Worktree · 更多')
                 assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'ready'
-                pi.click('[ 工作树操作 ]')
+                pi.click('⋯ 更多')
                 _, border_y = pi.until('╭───')
                 border_x = pi.screen.display[border_y - 1].index('╭')
                 right_x = pi.screen.display[border_y - 1].index('╮', border_x)
-                title_x, title_y = pi.until('Worktree 预览工作台')
+                title_x, title_y = pi.until('Worktree · 更多')
                 title = pi.screen.buffer[title_y - 1]
                 assert title[title_x - 1].bold and title[title_x - 1].bg == {'light': 'dee8fa', 'dark': '253651'}[theme]
                 _, cancel_y = pi.until('[ 关闭 ]')
                 cancel = pi.screen.buffer[cancel_y - 1]
                 assert cancel[border_x + 1].bg == cancel[right_x - 1].bg != 'default'
                 assert cancel[border_x + 1].bg != title[title_x - 1].bg
-                if cols == 42:
-                    pi.until('详情 1–')
-                    pi.click('详情 1–')
-                    pi.until_gone('详情 1–')
-                    pi.send(b'\x1b[5~')  # Page Up scrolls detail without moving the action selection.
-                    pi.until('详情 1–')
-                    pi.until('▸ [ 关闭 ]')
+                assert '当前目录：' not in pi.dump()
                 pi.click_at(border_x + 1, cancel_y)  # the frame is not a button
                 pi.click_at(right_x - 1, cancel_y)  # neither is the trailing space
                 pi.until('▸ [ 关闭 ]')  # Closing remains selected after frame clicks.
                 pi.send(b'\x1b[B')  # Wrap from the last (close) to the first (preview) action.
                 pi.until('▸ [ 预览到 Local ]')
                 pi.send(b'\r')
-                pi.until('确认：预览到 Local')
+                pi.until('预览到 Local？')
+                lead_x, lead_y = pi.until('写入文件，不暂存、不提交。')
+                assert pi.screen.buffer[lead_y - 1][lead_x - 1].bold
+                _, confirm_y = pi.until('[ 预览 ]')
+                _, cancel_y = pi.until('▸ [ 取消 ]')
+                assert confirm_y == cancel_y
+                pi.send(b'\x1b[D')
+                pi.until('▸ [ 预览 ]')
+                pi.send(b'\x1b[C')
+                pi.until('▸ [ 取消 ]')
                 pi.send(b'\r')  # Enter also cancels a confirmation by default.
-                pi.until_gone('确认：预览到 Local')
+                pi.until_gone('预览到 Local？')
                 assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'ready'
         print('real Pi: phase and primary-action contrast, hit targets and keyboard cancellation in light and narrow dark terminals', flush=True)
         with Pi(local, agent, provider, session=origin) as pi:
             pi.until('Local · Worktree 待验收')
-            pi.click('[ 工作树操作 ]')
+            pi.click('⋯ 更多')
             pi.click('[ 进入 / 恢复 Worktree ]')
             pi.until('Worktree · 待验收')
             pi.until('Worktree ready.')
@@ -357,7 +368,7 @@ def main():
             assert (first_path / 'task.txt').read_text() == 'ready revision\n'
             assert (local / 'task.txt').read_text() == 'base\n'
             pi.click('[ 预览到 Local ]')
-            pi.click('[ 执行预览到 Local ]')
+            pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             preview_task = task()
             pi.send(b'Try to write during review.\r')
@@ -397,40 +408,42 @@ def main():
                 (root / '.pi/loops.json').write_text(value)
             baseline = git('status', '--porcelain')
             pi.click('[ 预览到 Local ]')
-            pi.until('确认：预览到 Local')
+            pi.until('预览到 Local？')
             pi.click('[ 取消 ]')
-            pi.until_gone('确认：预览到 Local')
+            pi.until_gone('预览到 Local？')
             assert (local / 'task.txt').read_text() == 'base\n'
             pi.click('[ 预览到 Local ]')
-            pi.click('[ 执行预览到 Local ]')
+            pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             assert (local / 'task.txt').read_text() == 'previewed revision\n'
             assert git('rev-parse', 'HEAD') == head
             (local / '.pi/loops.json').write_text('Local loop edited after preview')
             pi.click('[ 撤回预览 ]')
-            pi.click('[ 执行撤回预览 ]')
+            pi.until('只还原本次预览。')
+            pi.click('[ 撤回 ]')
             pi.until('Worktree · 待验收')
             assert git('status', '--porcelain') == baseline
             pi.click('[ 预览到 Local ]')
-            pi.click('[ 执行预览到 Local ]')
+            pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             pi.click('[ 打开 Local 检查 ]')
             pi.until('Local · Worktree 已预览')
             pi.until('[ 撤回预览 ]')
             pi.until('[ 确认提交 ]')
-            pi.click('[ 工作树操作 ]')
+            pi.click('⋯ 更多')
             pi.click('[ 进入 / 恢复 Worktree ]')
             pi.until('Worktree · 已预览')
             veto = base / 'veto-switch'
             veto.touch()
             pi.click('[ 确认提交 ]')
-            pi.click('[ 提交并清理 Worktree（默认） ]')
+            pi.until('只提交任务改动。')
+            pi.click('[ 提交并安全清理 ]')
             pi.until('Pi 取消了切换，未提交。')
             assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'previewed' and first_path.is_dir()
             veto.unlink()
             (local / '.pi/loops.json').write_text('Local loop edited before finalizing')
             pi.click('[ 确认提交 ]')
-            pi.click('[ 提交并清理 Worktree（默认） ]')
+            pi.click('[ 提交并安全清理 ]')
             pi.until('未能安全清理 Worktree')
             pi.click('[ 保留 Worktree ]')
             pi.until('Local · Worktree 已交付')
@@ -442,7 +455,7 @@ def main():
             delivered_head = git('rev-parse', 'HEAD')
             first_id = task()['id'][:8]
             def inspect_removal():
-                pi.click('[ 工作树操作 ]')
+                pi.click('⋯ 更多')
                 pi.click('[ 已保留的 Worktree ]')
                 pi.click(f'[ {first_id} · Isolated smoke change ]')
                 pi.click('[ 检查并清理… ]')
@@ -453,7 +466,7 @@ def main():
             pi.click('[x] 新建 Worktree')
             pi.until('[ ] 新建 Worktree')
             with Pi(local, agent, provider) as other:
-                other.click('[ 工作树操作 ]')
+                other.click('⋯ 更多')
                 other.click('[ 已保留的 Worktree ]')
                 other.click(f'[ {first_id} · Isolated smoke change ]')
                 other.click('[ 恢复会话检查 ]')
@@ -461,7 +474,7 @@ def main():
                 inspect_removal()
                 pi.until('另一个 Pi 会话正在使用此 Worktree')
                 assert first_path.is_dir()
-                other.click('[ 工作树操作 ]')
+                other.click('⋯ 更多')
                 other.click('[ 返回 Local ]')
                 other.until('Local · Worktree 已交付')
                 inspect_removal()
@@ -523,12 +536,12 @@ def main():
             assert (follow_path / 'task.txt').read_text() == 'previewed revision\n'
             assert (follow_path / 'new-base.txt').read_text() == 'current Local commit\n'
             assert (follow_path / 'user.txt').read_text() == 'original\n' and not (follow_path / '.pi/loops.json').exists()
-            pi.click('[ 工作树操作 ]')
+            pi.click('⋯ 更多')
             pi.click('[ 返回 Local ]')
             pi.until('Local · Worktree 进行中')
-            pi.click('[ 工作树操作 ]')
+            pi.click('⋯ 更多')
             pi.click('[ 放弃任务 ]')
-            pi.click('[ 执行放弃任务 ]')
+            pi.click('[ 放弃 ]')
             pi.until('Local · Worktree 已放弃')
             assert not follow_path.exists()
             print('real Pi: history rendered before creating a Worktree; follow-up used HEAD at send time', flush=True)
@@ -548,12 +561,12 @@ def main():
             assert Path(task()['isolatedSession']['file']).read_text().count(image_prompt) == 1
             assert image_prompt not in Path(task()['localSession']['file']).read_text()
             (second_path / 'discard.txt').write_text('discarded')
-            pi.click('[ 工作树操作 ]')
+            pi.click('⋯ 更多')
             pi.click('[ 返回 Local ]')
             pi.until('Local · Worktree 进行中')
-            pi.click('[ 工作树操作 ]')
+            pi.click('⋯ 更多')
             pi.click('[ 放弃任务 ]')
-            pi.click('[ 执行放弃任务 ]')
+            pi.click('[ 放弃 ]')
             pi.until('Local · Worktree 已放弃')
             assert not second_path.exists()
             assert not (local / 'discard.txt').exists()
@@ -634,11 +647,11 @@ def main():
             assert task()['localSession']['id'] == original_id
             assert kickoff not in Path(task()['localSession']['file']).read_text()
             pi.click('[ 预览到 Local ]')
-            pi.click('[ 执行预览到 Local ]')
+            pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             assert not index.exists()
             pi.click('[ 确认提交 ]')
-            pi.click('[ 提交并保留 Worktree ]')
+            pi.click('[ 提交并保留 ]')
             pi.until('Local · Worktree 已交付')
             assert index.is_file()
             assert git('rev-parse', 'HEAD^') == head
@@ -654,13 +667,13 @@ def main():
         isolated_git_dir = Path(task()['isolated']['gitDir'])
         (isolated_git_dir / 'CHERRY_PICK_HEAD').write_text(head + '\n')
         with Pi(local, agent, provider) as pi:
-            pi.click('[ 工作树操作 ]')
+            pi.click('⋯ 更多')
             pi.click('[ 已保留的 Worktree ]')
             pi.click(f'[ {task_id} · Isolated smoke change ]')
             pi.click('[ 恢复会话检查 ]')
             pi.until('Worktree · 已交付')
             pi.until('Worktree ready.')
-            pi.click('[ 工作树操作 ]')
+            pi.click('⋯ 更多')
             pi.click('[ 返回 Local ]')
             pi.until('Local · Worktree 已交付')
             print('real Pi: explicit retention with absent Local index; environment and session reopen after restart', flush=True)
@@ -684,16 +697,16 @@ def main():
             head = git('rev-parse', 'HEAD')
             (local / 'untracked.txt').write_text('private\n')
             pi.click('[ 预览到 Local ]')
-            pi.click('[ 执行预览到 Local ]')
+            pi.click('[ 预览 ]')
             pi.until('预览冲突 · Local 未修改')
             pi.click('[ 关闭 ]')
             assert task()['review']['id'] == previous
             assert git('status', '--porcelain') == '?? untracked.txt'
-            pi.click('[ 工作树操作 ]')
+            pi.click('⋯ 更多')
             pi.click('[ 返回 Local ]')
             pi.until('Local · Worktree 待验收')
             pi.click('[ 预览到 Local ]')
-            pi.click('[ 执行预览到 Local ]')
+            pi.click('[ 预览 ]')
             pi.click('[ 让 Agent 解决冲突 ]')
             pi.until('Conflict resolved in Worktree.', 45)
             assert task()['phase'] == 'ready'
@@ -703,7 +716,7 @@ def main():
             assert git('status', '--porcelain') == '?? untracked.txt'
             assert (local / 'task.txt').read_text() == 'committed upstream\n'
             pi.click('[ 预览到 Local ]')
-            pi.click('[ 执行预览到 Local ]')
+            pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             assert (local / 'task.txt').read_text() == 'merged task\n'
             print('real Pi: cancelled conflict recovery, then approved from Local; Agent resolved in original Worktree and re-reviewed', flush=True)
@@ -727,7 +740,7 @@ def main():
                 original = task()['review']
                 assert original['files'] == (['.pi/loops.json', 'task.txt'] if broad else ['task.txt'])
                 pi.click('[ 预览到 Local ]')
-                pi.click('[ 执行预览到 Local ]')
+                pi.click('[ 预览 ]')
                 if broad:
                     pi.until('预览冲突 · Local 未修改')
                     pi.click('[ 调整交付清单 ]')
@@ -739,12 +752,12 @@ def main():
                     assert task()['review']['files'] == ['task.txt']
                     assert (local / 'task.txt').read_text() == 'base\n'
                     pi.click('[ 预览到 Local ]')
-                    pi.click('[ 执行预览到 Local ]')
+                    pi.click('[ 预览 ]')
                 pi.until('Worktree · 已预览')
                 assert (local / 'task.txt').read_text() == 'task edit\n'
                 assert (local / '.pi/loops.json').read_text() == 'local'
                 pi.click('[ 确认提交 ]')
-                pi.click('[ 提交并保留 Worktree ]')
+                pi.click('[ 提交并保留 ]')
                 pi.until('Local · Worktree 已交付')
                 delivered = task()
                 assert git('show', '--format=', '--name-only') == 'task.txt'
@@ -767,7 +780,7 @@ def main():
             first.until('Worktree ready.', 40)
             first_task = task()
             first.click('[ 预览到 Local ]')
-            first.click('[ 执行预览到 Local ]')
+            first.click('[ 预览 ]')
             first.until('Worktree · 已预览')
             with Pi(local, agent, provider) as second:
                 second.click('[ ] 新建 Worktree')
@@ -780,15 +793,15 @@ def main():
                 assert (local / 'task.txt').read_text() == 'task edit\n'
                 before = tasks()
                 second.click('[ 预览到 Local ]')
-                second.click('[ 执行预览到 Local ]')
+                second.click('[ 预览 ]')
                 second.until('正在预览另一个任务')
                 assert tasks() == before
                 first.click('[ 撤回预览 ]')
-                first.click('[ 执行撤回预览 ]')
+                first.click('[ 撤回 ]')
                 first.until('Worktree · 待验收')
                 assert (local / 'task.txt').read_text() == 'base\n'
                 second.click('[ 预览到 Local ]')
-                second.click('[ 执行预览到 Local ]')
+                second.click('[ 预览 ]')
                 second.until('Worktree · 已预览')
                 assert task()['phase'] == 'previewed'
                 assert (local / 'task.txt').read_text() == 'task edit\n'
@@ -838,16 +851,18 @@ exec {real_git} "$@"
                 before = task()
                 isolated = Path(before['isolatedPath'])
                 if not from_worktree:
-                    pi.click('[ 工作树操作 ]')
+                    pi.click('⋯ 更多')
                     pi.click('[ 返回 Local ]')
                     pi.until('Local · Worktree 待验收')
                 assert '跳过预览，直接提交' not in pi.dump(), 'direct commit is menu-only'
-                pi.click('[ 工作树操作 ]')
+                pi.click('⋯ 更多')
                 pi.click('[ 跳过预览，直接提交 ]')
-                pi.until('确认：跳过预览，直接提交')
+                pi.until('跳过预览，直接提交？')
+                pi.until('写入 Local 并提交。')
+                pi.until('Local · 1 个文件')
                 assert '正在直接提交' not in pi.dump()
                 pi.send(b'\r')  # Cancel is preselected.
-                pi.until_gone('确认：跳过预览，直接提交')
+                pi.until_gone('跳过预览，直接提交？')
                 assert git('rev-parse', 'HEAD') == head and task() == before
                 assert (local / 'task.txt').read_text() == 'base\n'
                 if from_worktree:
@@ -855,9 +870,9 @@ exec {real_git} "$@"
                     slow_veto = base / 'slow-veto-switch'
                     veto.touch()
                     slow_veto.touch()
-                    pi.click('[ 工作树操作 ]')
+                    pi.click('⋯ 更多')
                     pi.click('[ 跳过预览，直接提交 ]')
-                    pi.click('[ 提交并清理 Worktree（默认） ]')
+                    pi.click('[ 提交并安全清理 ]')
                     pi.until('正在切换到 Local 提交')
                     pi.until('Pi 取消了切换，未提交。')
                     pi.until_gone('正在切换到 Local 提交')
@@ -865,11 +880,11 @@ exec {real_git} "$@"
                     assert (local / 'task.txt').read_text() == 'base\n'
                     veto.unlink()
                     slow_veto.unlink()
-                pi.click('[ 工作树操作 ]')
+                pi.click('⋯ 更多')
                 pi.click('[ 跳过预览，直接提交 ]')
                 gate.touch()
                 try:
-                    pi.click('[ 提交并清理 Worktree（默认） ]' if from_worktree else '[ 提交并保留 Worktree ]')
+                    pi.click('[ 提交并安全清理 ]' if from_worktree else '[ 提交并保留 ]')
                     pi.until('正在直接提交')
                     frame = next(line for line in pi.screen.display if '正在直接提交' in line)
                     end = time.monotonic() + 3
