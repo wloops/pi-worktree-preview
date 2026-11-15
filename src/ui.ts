@@ -4,7 +4,7 @@ import { Key, matchesKey, rgbColor, truncateToWidth, visibleWidth, wrapTextWithA
 export const clean = (text: string) => text.replace(/[\p{Cc}\p{Cf}]/gu, '?')
 
 type Tone = 'primary' | 'danger' | 'quiet'
-export interface Choice<T> { label: string; value: T; tone?: Tone }
+export interface Choice<T> { label: string; value: T; tone?: Tone; toggle?: () => void }
 type PanelOptions = { tone?: 'warning' | 'danger'; signal?: AbortSignal; requiredDetails?: number }
 
 const light = {
@@ -87,6 +87,14 @@ export async function pick<T>(ctx: ExtensionContext, title: string, detail: stri
     let renderedSize = ''
     let press: string | undefined
     let actionHits: { index: number; from: number; to: number }[] = []
+    const activate = (index: number) => {
+      if (tooSmall || terminalSize() !== renderedSize) return finish(undefined)
+      const choice = choices[index]
+      if (!choice.toggle) return finish(choice.value)
+      choice.toggle()
+      selected = index
+      tui.requestRender()
+    }
     const move = (delta: number) => {
       if (tooSmall) return
       selected = (selected + delta + choices.length) % choices.length
@@ -178,7 +186,7 @@ export async function pick<T>(ctx: ExtensionContext, title: string, detail: stri
         if (keys.matches(data, 'tui.select.cancel')) cancel()
         else if (keys.matches(data, 'tui.select.up')) move(-1)
         else if (keys.matches(data, 'tui.select.down')) move(1)
-        else if (keys.matches(data, 'tui.select.confirm')) finish(tooSmall || terminalSize() !== renderedSize ? undefined : choices[selected].value)
+        else if (keys.matches(data, 'tui.select.confirm')) activate(selected)
         else if (matchesKey(data, Key.pageUp)) scroll(-Math.max(1, detailRows))
         else if (matchesKey(data, Key.pageDown)) scroll(Math.max(1, detailRows))
       },
@@ -204,7 +212,7 @@ export async function pick<T>(ctx: ExtensionContext, title: string, detail: stri
           press = undefined
           if (confirmed) {
             if (detailHit) scroll(Math.max(1, detailRows), true)
-            else finish(tooSmall ? undefined : choices[action.index].value)
+            else activate(action.index)
             return { handled: true }
           }
         }

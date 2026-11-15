@@ -45,11 +45,14 @@ export default function(pi) {
       const recover = text?.startsWith("只在当前 detached Worktree 解决冲突") && text.match(/--no-overwrite-ignore ([0-9a-f]{40,64})/);
       const revise = () => tool("worktree_begin_revision");
       const badWrite = () => tool("write", {path:"forbidden.txt",content:"must not be written"});
-      const edit = () => tool("bash", {command:`printf '${revision ? (text === "Revise before preview." ? "ready revision" : "previewed revision") : "task edit"}\\\\n' > task.txt`});
+      const runtime = text === "Edit with runtime state." || text === "Edit with overbroad review.";
+      const edit = () => tool("bash", {command:`printf '${revision ? (text === "Revise before preview." ? "ready revision" : "previewed revision") : "task edit"}\\\\n' > task.txt${runtime ? " && mkdir -p .pi && printf isolated > .pi/loops.json" : ""}`});
       let content;
       if (last?.role === "toolResult") {
         switch (last.toolName) {
-          case "bash": content = last.isError ? say("Worktree command failed.") : [tool("worktree_ready_for_review", {commitMessage:"Isolated smoke change"})]; break;
+          case "bash": content = last.isError ? say("Worktree command failed.") : [tool("worktree_ready_for_review", {
+            commitMessage:"Isolated smoke change", files: text === "Edit with overbroad review." ? ["task.txt", ".pi/loops.json"] : ["task.txt"],
+          })]; break;
           case "read": content = say("Explained without edits."); break;
           case "write": content = say(last.isError ? "Write was blocked." : "Unexpected write."); break;
           case "worktree_begin_revision": content = last.isError ? say(text === "Revise after Local drift." ? "Revision blocked by Local drift." : "Revision stopped.") : [edit()]; break;
@@ -699,6 +702,50 @@ def main():
             pi.until('Worktree · 已预览')
             assert (local / 'task.txt').read_text() == 'merged task\n'
             print('real Pi: cancelled conflict recovery, then approved from Local; Agent resolved in original Worktree and re-reviewed', flush=True)
+
+        for broad in (False, True):
+            local = base / ('narrow-local' if broad else 'explicit-local')
+            local.mkdir()
+            git('init', '-q', '-b', 'main')
+            git('config', 'user.name', 'Smoke Test')
+            git('config', 'user.email', 'smoke@example.invalid')
+            (local / 'task.txt').write_text('base\n')
+            git('add', '.')
+            git('commit', '-m', 'base')
+            (local / '.pi').mkdir()
+            (local / '.pi/loops.json').write_text('local')
+            with Pi(local, agent, provider) as pi:
+                pi.click('[ ] 新建 Worktree')
+                pi.until('[x] 新建 Worktree')
+                pi.send(b'Edit with overbroad review.\r' if broad else b'Edit with runtime state.\r')
+                pi.until('Worktree ready.', 40)
+                original = task()['review']
+                assert original['files'] == (['.pi/loops.json', 'task.txt'] if broad else ['task.txt'])
+                pi.click('[ 预览到 Local ]')
+                pi.click('[ 执行预览到 Local ]')
+                if broad:
+                    pi.until('预览冲突 · Local 未修改')
+                    pi.click('[ 调整交付清单 ]')
+                    pi.click('[ [x] ".pi/loops.json" ]')
+                    pi.until('[ [ ] ".pi/loops.json" ]')
+                    pi.click('[ 保存交付清单 ]')
+                    pi.until('已更新交付清单')
+                    assert task()['review']['id'] != original['id']
+                    assert task()['review']['files'] == ['task.txt']
+                    assert (local / 'task.txt').read_text() == 'base\n'
+                    pi.click('[ 预览到 Local ]')
+                    pi.click('[ 执行预览到 Local ]')
+                pi.until('Worktree · 已预览')
+                assert (local / 'task.txt').read_text() == 'task edit\n'
+                assert (local / '.pi/loops.json').read_text() == 'local'
+                pi.click('[ 确认提交 ]')
+                pi.click('[ 提交并保留 Worktree ]')
+                pi.until('Local · Worktree 已交付')
+                delivered = task()
+                assert git('show', '--format=', '--name-only') == 'task.txt'
+                assert delivered['cleanup']['status'] == 'retained'
+                assert (Path(delivered['isolatedPath']) / '.pi/loops.json').read_text() == 'isolated'
+        print('real Pi: explicit review and mouse narrowing after conflict preserve unrelated runtime state in both checkouts', flush=True)
 
         local = base / 'parallel-local'
         local.mkdir()

@@ -55,6 +55,8 @@ export interface ReviewSnapshotResult {
   isolatedIndexTreeOid: string
   changedFiles: string[]
   snapshot: FrozenReview
+  /** At least one changed working, index or HEAD path is outside the delivery. */
+  partial: boolean
 }
 
 export type InspectReviewResult = ReviewSnapshotResult | ApplyPlanErrorResult
@@ -214,7 +216,9 @@ export type ApplyError =
   | PreviewModifiedApplyError
 
 export interface SessionCheckoutApplyEngine {
-  inspectReview(input: ApplyPlanInput): Promise<InspectReviewResult>
+  inspectReview(input: ApplyPlanInput, files?: readonly string[]): Promise<InspectReviewResult>
+  /** Narrow an existing review without accepting new bytes or paths. */
+  restrictReview(input: ApplyPlanInput, expected: ExpectedReview, files: readonly string[]): Promise<FrozenReview>
   /** Merge only the frozen review scope; do not modify either checkout. */
   plan(input: ApplyPlanInput, review: ExpectedReview): Promise<ApplyPlanResult>
   preview(plan: ApplyPlan, options: {
@@ -463,6 +467,25 @@ function entryMap(raw: Buffer, kind: 'tree' | 'index', paths: ReadonlySet<string
 function reviewEntryPath(path: string, prefix: string): boolean {
   return isProjectPath(path, prefix) && path.split('/').every(part =>
     !!part && part !== '.' && part !== '..' && part.toLowerCase() !== '.git' && !part.includes('\0'))
+}
+
+function selectReviewPaths(available: readonly string[], files: readonly string[]): string[] {
+  if (!files.length) throw new Error('请选择至少一个要交付的改动文件。')
+  const known = new Set(available)
+  const selected = new Set(files)
+  if (selected.size !== files.length || files.some(path => !known.has(path))) {
+    throw new Error('交付清单必须包含实际有改动的文件路径，且不能有重复路径。')
+  }
+  return available.filter(path => selected.has(path))
+}
+
+function validateReview(review: FrozenReview, expected: ExpectedReview, prefix: string) {
+  const files = new Set(expected.files)
+  if (review.version !== 1 || !files.size || files.size !== expected.files.length ||
+      new Set(review.entries.map(entry => entry.path)).size !== files.size || review.entries.length !== files.size ||
+      review.entries.some(entry => !reviewEntryPath(entry.path, prefix) || !files.has(toProjectPath(entry.path, prefix)))) {
+    throw new StaleReviewError()
+  }
 }
 
 class StaleReviewError extends Error {
@@ -1231,7 +1254,38 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
     return captureSnapshot(checkoutPath, indexPath, objectDirectory, sourceObjects)
   }
 
-  async inspectReview(input: ApplyPlanInput, legacy?: ExpectedReview): Promise<InspectReviewResult> {
+  inspectReview(input: ApplyPlanInput, files?: readonly string[]): Promise<InspectReviewResult> {
+    return this.captureReview(input, files)
+  }
+
+  async restrictReview(input: ApplyPlanInput, expected: ExpectedReview, files: readonly string[]): Promise<FrozenReview> {
+    const selected = new Set(selectReviewPaths(expected.files, files))
+    const root = await resolveGitRoot(input.isolatedPath)
+    const prefix = projectPrefix(root, input.isolatedPath)
+    if (prefix === null) throw new StaleReviewError()
+    let review = expected.snapshot
+    if (!review) {
+      const inspected = await this.captureReview(input, undefined, expected)
+      if (inspected.status === 'error') throw new Error(inspected.error.message)
+      review = inspected.snapshot
+    }
+    validateReview(review, expected, prefix)
+    const narrowed: FrozenReview = {
+      version: 1, entries: review.entries.filter(entry => selected.has(toProjectPath(entry.path, prefix))),
+    }
+    const temp = await mkdtemp(join(tmpdir(), 'pi-wtp-review-scope-'))
+    try {
+      const objects = join(temp, 'objects')
+      await mkdir(objects)
+      const source = await sourceObjectDirectory(root)
+      await verifyReview(root, narrowed, gitObjectEnvironment(objects, source), true)
+      // A file/directory replacement may require more than one listed path.
+      await reviewedTree(root, join(temp, 'review.index'), input.baseOid, narrowed, objects, source)
+      return narrowed
+    } finally { await this.cleanup(temp) }
+  }
+
+  private async captureReview(input: ApplyPlanInput, files?: readonly string[], legacy?: ExpectedReview): Promise<InspectReviewResult> {
     if (!OID_PATTERN.test(input.baseOid)) {
       return { status: 'error', error: { code: 'invalid_input', message: hostMessage('invalidSessionBaseOIDFormat') } }
     }
@@ -1259,14 +1313,19 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         objectDirectory,
         localObjects,
       )
-      const changedFiles = legacy
+      const allChanged = legacy
         ? legacy.files.map(path => localPrefix ? `${localPrefix}/${path}` : path)
         : await changedTreePaths(isolatedGitRoot, input.baseOid, isolated.treeOid, objectDirectory, localObjects)
-      if (changedFiles.some((path) => !isProjectPath(path, localPrefix))) {
+      if (allChanged.some((path) => !isProjectPath(path, localPrefix))) {
         return { status: 'error', error: { code: 'invalid_input', message: hostMessage('isolatedContainsChangesOutsideTheProjectRootAReview') } }
       }
-      if (changedFiles.some(path => !reviewEntryPath(path, localPrefix))) throw new Error('待验收文件包含无效 Git 路径。')
+      if (allChanged.some(path => !reviewEntryPath(path, localPrefix))) throw new Error('待验收文件包含无效 Git 路径。')
+      const changedFiles = files ? selectReviewPaths(allChanged, files.map(path => localPrefix ? `${localPrefix}/${path}` : path)) : allChanged
       const paths = new Set(changedFiles)
+      const partial = changedFiles.length !== allChanged.length || (!!files && (await Promise.all(
+        [...new Set([isolated.indexTreeOid, isolated.headTreeOid])].filter(tree => tree !== isolated.treeOid)
+          .map(tree => changedTreePaths(isolatedGitRoot, input.baseOid, tree, objectDirectory, localObjects)),
+      )).some(delta => delta.some(path => !paths.has(path))))
       const working = entryMap((await runGit(isolatedGitRoot, ['ls-tree', '-rz', isolated.treeOid], {
         env: gitObjectEnvironment(objectDirectory, localObjects),
       })).stdout, 'tree', paths)
@@ -1274,6 +1333,9 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       const snapshot: FrozenReview = {
         version: 1,
         entries: changedFiles.map(path => ({ path, working: working.get(path) ?? null, index: index.get(path) ?? null })),
+      }
+      if (partial) {
+        await reviewedTree(isolatedGitRoot, join(tempRoot, 'selected-review.index'), input.baseOid, snapshot, objectDirectory, localObjects)
       }
       if (legacy) {
         // Prove that the reconstructed tree plus the exact old HEAD and index
@@ -1291,7 +1353,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         isolatedHeadOid: isolated.headOid, isolatedHeadRef: isolated.headRef,
         isolatedTreeOid: isolated.treeOid, isolatedIndexTreeOid: isolated.indexTreeOid,
         changedFiles: changedFiles.map((path) => toProjectPath(path, localPrefix)).sort(),
-        snapshot,
+        snapshot, partial,
       }
     } catch (error) {
       return { status: 'error', error: { code: error instanceof StaleReviewError ? 'stale_isolated' : 'git_error', message: this.errorMessage(error) } }
@@ -1328,13 +1390,11 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       // only when that exact checkout can still be proven, never from file names alone.
       let review = expected.snapshot
       if (!review) {
-        const inspected = await this.inspectReview(input, expected)
+        const inspected = await this.captureReview(input, undefined, expected)
         if (inspected.status === 'error') return inspected
         review = inspected.snapshot
       }
-      if (review.version !== 1 || !review.entries.length || review.entries.length !== expected.files.length ||
-          review.entries.some(entry => !reviewEntryPath(entry.path, localPrefix) ||
-            !expected.files.includes(toProjectPath(entry.path, localPrefix)))) throw new StaleReviewError()
+      validateReview(review, expected, localPrefix)
       const isolatedEnv = gitObjectEnvironment(objectDirectory, localObjects)
       await verifyReview(isolatedGitRoot, review, isolatedEnv, true)
       const isolatedHeadOid = stdoutText(await runGit(isolatedGitRoot, ['rev-parse', 'HEAD']))

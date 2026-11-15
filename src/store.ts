@@ -7,7 +7,7 @@ import { createSessionCheckoutApplyEngine, runGit, type ApplyConflictPlanResult,
 export interface Checkout { root: string; gitDir: string; commonDir: string; rootIdentity: string; gitIdentity: string; commonIdentity: string }
 export interface SessionLink { id: string; file: string; cwd: string }
 type Phase = 'creating' | 'working' | 'ready' | 'previewed' | 'delivered' | 'discarded'
-interface Review { id: string; fingerprint: string; files: string[]; message: string; snapshot?: FrozenReview }
+interface Review { id: string; fingerprint: string; files: string[]; message: string; snapshot?: FrozenReview; partial?: true }
 interface ConflictRecovery {
   localHeadOid: string
   isolatedHeadOid: string
@@ -220,6 +220,7 @@ export class TaskStore {
       const task = state.tasks.find(t => t.id === id)
       if (!task || task.phase !== 'ready' || task.review?.id !== reviewId || task.receipt || task.journal || task.recovery ||
           !boundIsolatedSession(task, session)) throw new Error('待验收状态或隔离会话已变化，请重新预览。')
+      if (task.review.partial) throw new Error('交付清单未覆盖整个 Worktree，不能自动合并冲突。')
       assertLocalAcceptanceAvailable(state, task, this.statePath)
       await this.validateLocal(task)
       await this.validateIsolated(task)
@@ -265,9 +266,34 @@ export class TaskStore {
     })
   }
 
-  async markReady(id: string, session: SessionLink, message: string): Promise<Review> {
+  async reviewCandidates(task: Task): Promise<string[]> {
+    await this.validateIsolated(task)
+    const result = await this.engineFactory().inspectReview({ ...this.input(task), baseOid: task.recovery?.localHeadOid ?? task.baseOid })
+    if (result.status === 'error') engineError(result)
+    return result.changedFiles
+  }
+
+  async restrictReview(id: string, session: SessionLink, reviewId: string, files: readonly string[]): Promise<Review> {
+    return this.locked(async (state, save) => {
+      const task = state.tasks.find(t => t.id === id)
+      if (!task || task.phase !== 'ready' || task.review?.id !== reviewId || task.journal || task.receipt || task.recovery ||
+          !(boundIsolatedSession(task, session) || sameSession(task.localSession, session))) {
+        throw new Error('待验收状态或绑定会话已变化，请重新选择文件。')
+      }
+      if (files.length >= task.review.files.length) throw new Error('这里只能缩小交付清单。')
+      await this.validateIsolated(task)
+      const snapshot = await this.engineFactory().restrictReview(this.input(task), task.review, files)
+      const review: Review = { ...task.review, id: randomUUID(), files: [...files].sort(), snapshot, partial: true }
+      task.review = review
+      await save()
+      return review
+    })
+  }
+
+  async markReady(id: string, session: SessionLink, message: string, files: readonly string[]): Promise<Review> {
     const title = message.trim()
     if (!title || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) throw new Error('请提供 1–200 字符的单行提交说明。')
+    if (!Array.isArray(files) || !files.length) throw new Error('请明确列出本次任务要交付的改动文件。')
     return this.locked(async (state, save) => {
       const task = state.tasks.find(t => t.id === id)
       if (!task || task.journal || !['working', 'ready'].includes(task.phase) || !boundIsolatedSession(task, session)) {
@@ -276,9 +302,10 @@ export class TaskStore {
       await this.validateIsolated(task)
       const recovery = task.recovery
       const baseOid = recovery?.localHeadOid ?? task.baseOid
-      const inspected = await this.engineFactory().inspectReview({ ...this.input(task), baseOid })
+      const inspected = await this.engineFactory().inspectReview({ ...this.input(task), baseOid }, files)
       if (inspected.status === 'error') engineError(inspected)
       if (recovery) {
+        if (inspected.partial) throw new Error('合并完成后的交付清单必须包含相对合并目标的全部改动。')
         const [firstParent, mergedParent, ...others] = (await out(task.isolatedPath,
           ['show', '-s', '--format=%P', inspected.isolatedHeadOid])).split(' ')
         if (inspected.isolatedHeadRef || !oid.test(firstParent) || mergedParent !== baseOid || others.length ||
@@ -302,7 +329,8 @@ export class TaskStore {
         delete task.recovery
       }
       if (!inspected.changedFiles.length) throw new Error(recovery ? '合并后无需交付：任务改动已在 Local HEAD 中。可返回 Local 放弃此任务。' : '没有可验收的 Git 改动。')
-      const review = { id: randomUUID(), fingerprint: inspected.isolatedFingerprint, files: inspected.changedFiles, message: title, snapshot: inspected.snapshot }
+      const review: Review = { id: randomUUID(), fingerprint: inspected.isolatedFingerprint, files: inspected.changedFiles,
+        message: title, snapshot: inspected.snapshot, ...(inspected.partial ? { partial: true } : {}) }
       task.review = review
       task.phase = 'ready'
       await save()
@@ -427,6 +455,7 @@ export class TaskStore {
           task.phase = 'delivered'
           task.commitOid = done.commitOid
           if (expected.keepWorktree) task.cleanup = { status: 'retained', reason: '按用户选择保留环境。', requested: true }
+          else if (task.review.partial) task.cleanup = { status: 'retained', reason: '含未纳入交付清单的改动。', canForce: true }
           const journal = task.journal as Task['journal']
           delete task.journal
           // Persist delivery independently before cleanup can do anything destructive.
@@ -434,7 +463,7 @@ export class TaskStore {
           for (const file of [journal?.indexBefore, journal?.indexAfter]) {
             if (file) await rm(file, { force: true }).catch(() => {})
           }
-          if (!expected.keepWorktree) {
+          if (!expected.keepWorktree && !task.review.partial) {
             try {
               await this.cleanup(task, task.receipt.isolatedFingerprint, save)
             } catch (error) {

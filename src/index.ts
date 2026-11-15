@@ -14,7 +14,7 @@ const HISTORY_DIR = 'history-views'
 const HISTORY_HINT = '历史对话 · 发送后在新 Worktree 继续'
 const guardedTools = new Set(['edit', 'write', 'bash', 'powershell', TOOL])
 const labels: Record<Action, string> = { preview: '预览到 Local', rollback: '撤回预览', finalize: '确认提交', discard: '放弃任务' }
-type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'recover' | 'close'
+type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'scope' | 'recover' | 'close'
 const phases = { creating: '创建中断', working: '进行中', ready: '待验收', previewed: '已预览', delivered: '已交付', discarded: '已放弃' }
 const message = (e: unknown) => clean(e instanceof Error ? e.message : String(e))
 function sessionLink(ctx: ExtensionContext): SessionLink | undefined {
@@ -43,6 +43,24 @@ const retainedChoice = { label: '已保留的 Worktree', value: 'retained' } as 
 const historyChoice = { label: '任务历史', value: 'history' } as const
 const recoverChoice = { label: '让 Agent 继续解决冲突', value: 'recover', tone: 'primary' } as const
 const resumeChoice = { label: '进入 / 恢复 Worktree', value: 'resume' } as const
+const scopeChoice = { label: '调整交付清单', value: 'scope' } as const
+
+async function chooseReviewFiles(ctx: ExtensionContext, files: readonly string[], narrow: boolean) {
+  if (!files.length) throw new Error('没有可验收的 Git 改动。')
+  const selected = new Set(narrow ? files : [])
+  const choices: Choice<boolean>[] = files.map(path => ({
+    get label() { return `[${selected.has(path) ? 'x' : ' '}] ${JSON.stringify(path)}` },
+    value: false,
+    toggle() { if (!selected.delete(path)) selected.add(path) },
+  }))
+  const apply = await pick(ctx, narrow ? '调整交付清单' : '选择交付文件', [
+    narrow ? '取消勾选即可从已有验收中移除文件，不会重读未交付内容。' : '只勾选本次任务要交付的文件。',
+    '清单外的文件不会写入 Local。',
+  ], [...choices, { label: '保存交付清单', value: true, tone: 'primary' }, { label: '取消', value: false, tone: 'quiet' }])
+  if (!apply) return
+  if (!selected.size) throw new Error('请选择至少一个要交付的改动文件。')
+  return files.filter(path => selected.has(path))
+}
 
 function phaseLabel(isolated: boolean, task?: Task) {
   const scope = isolated ? 'Worktree' : 'Local'
@@ -58,7 +76,7 @@ function phaseTone(task?: Task) {
 }
 
 function conflictPrompt(recovery: NonNullable<Task['recovery']>) {
-  return `只在当前 detached Worktree 解决冲突，不写 Local。若未开始，先将已验收改动提交为 checkpoint，再运行 git -c core.hooksPath=/dev/null -c rerere.enabled=false -c merge.renames=false -c merge.directoryRenames=false merge --no-edit --no-autostash --no-overwrite-ignore ${recovery.localHeadOid}。已在合并中就继续，已合并就不要重做。只解决 Git 报出的冲突，保留其余自动合并结果；提交时禁用 Git hooks。只跑相关测试，再调用 ${TOOL}；有歧义就停下问我，不要预览。`
+  return `只在当前 detached Worktree 解决冲突，不写 Local。若未开始，先将已验收改动提交为 checkpoint，再运行 git -c core.hooksPath=/dev/null -c rerere.enabled=false -c merge.renames=false -c merge.directoryRenames=false merge --no-edit --no-autostash --no-overwrite-ignore ${recovery.localHeadOid}。已在合并中就继续，已合并就不要重做。只解决 Git 报出的冲突，保留其余自动合并结果；提交时禁用 Git hooks。只跑相关测试，再用 ${TOOL} 提交相对合并目标的完整任务文件清单；有歧义就停下问我，不要预览。`
 }
 const historyTasks = (tasks: Task[]) => tasks.filter(task =>
   ['delivered', 'discarded'].includes(task.phase) && !task.journal && task.isolatedSession?.cwd === task.isolatedPath)
@@ -464,7 +482,7 @@ export default function extension(pi: ExtensionAPI) {
     if (!task) return
     const canWork = isBoundSession(ctx, task.isolatedSession) && !task.journal && ['working', 'ready', 'previewed'].includes(task.phase)
     const guidance = canWork
-      ? `Status at the start of this request: ${task.phase}. For questions, explanations, and discussion, use read-only tools; do not invalidate a review or ask to roll back. If the user actually requests changes after a review was marked ready (including when a Local preview is active), call ${REVISE} alone before editing or running shell commands. The tool handles any required user confirmation. Wait for its success, then implement the existing request yourself in this Worktree, in the same turn, without asking the user to repeat it. If cancelled or unsuccessful, do not edit or retry unless asked again. After completing and verifying the edits, call ${TOOL} with a short commit title and stop editing.`
+      ? `Status at the start of this request: ${task.phase}. For questions, explanations, and discussion, use read-only tools; do not invalidate a review or ask to roll back. If the user actually requests changes after a review was marked ready (including when a Local preview is active), call ${REVISE} alone before editing or running shell commands. The tool handles any required user confirmation. Wait for its success, then implement the existing request yourself in this Worktree, in the same turn, without asking the user to repeat it. If cancelled or unsuccessful, do not edit or retry unless asked again. After verifying, call ${TOOL} with a short commit title and only the exact repo-relative paths for the entire task, including earlier rounds and both sides of renames. Never blindly submit git status or include unrelated runtime/generated files. Then stop editing.`
       : 'This session or task is not editable. Use it for inspection only; do not modify files or mark it ready.'
     return { systemPrompt: `${event.systemPrompt}\n\nThis is a managed isolated Git worktree. Work only in the active Worktree cwd. ${guidance} Do not write to Local yourself; the user alone controls preview, rollback, delivery and discard.` }
   })
@@ -538,13 +556,16 @@ export default function extension(pi: ExtensionAPI) {
   })
   pi.registerTool({
     name: TOOL, label: '标记待验收', executionMode: 'sequential', description: 'Mark the current managed Worktree ready for user review. Does not write to Local or commit. Call after edits and tests.',
-    parameters: Type.Object({ commitMessage: Type.String({ description: 'A one-line commit title (1–200 characters).' }) }),
+    parameters: Type.Object({
+      commitMessage: Type.String({ description: 'A one-line commit title (1–200 characters).' }),
+      files: Type.Array(Type.String(), { minItems: 1, description: 'Exact repo-relative paths intentionally changed for this task, including deletions and both sides of a rename. Exclude unrelated runtime state and test artifacts.' }),
+    }),
     async execute(_id, params, signal, _update, ctx) {
       if (signal?.aborted) throw new Error('已取消。')
       const state = await context(ctx)
       const link = sessionLink(ctx)
       if (!state.isolated || !link) throw new Error('只能在受管 Worktree 的原始 Pi 会话中标记待验收。')
-      const review = await state.data.markReady(state.isolated.id, link, params.commitMessage)
+      const review = await state.data.markReady(state.isolated.id, link, params.commitMessage, params.files)
       await refresh(ctx)
       return { content: [{ type: 'text', text: `已标记待验收（${review.files.length} 个文件）；未修改 Local。用户可直接点击「预览到 Local」。` }], details: { reviewId: review.id } }
     },
@@ -648,6 +669,7 @@ export default function extension(pi: ExtensionAPI) {
         const task = currentTask(ctx, isolated, tasks)
         if (!local && !isolated) throw new Error('请从有初始提交的 Git checkout 打开 Pi。')
         const choices: Choice<MenuAction>[] = [...deliveryChoices(task)]
+        if (task?.phase === 'ready' && !task.journal && !task.recovery && (task.review?.files.length ?? 0) > 1 && task.isolatedSession) choices.push(scopeChoice)
         if (task?.phase === 'working' && task.recovery && !task.journal) choices.push(recoverChoice)
         const details = [phaseLabel(!!isolated, task)]
         if (task?.review) details.push(`验收：${task.review.message} · ${task.review.files.length} 个文件`)
@@ -763,8 +785,17 @@ export default function extension(pi: ExtensionAPI) {
         } else if (choice === 'mark' && isolated) {
           const link = sessionLink(ctx)
           if (!link) throw new Error('没有可保存的 Pi 会话。')
-          await data.markReady(isolated.id, link, 'Worktree task changes')
+          const files = await chooseReviewFiles(ctx, await data.reviewCandidates(isolated), false)
+          if (!files || !ctx.isIdle()) return
+          await data.markReady(isolated.id, link, isolated.review?.message ?? 'Worktree task changes', files)
           ctx.ui.notify('已标记待验收；未修改 Local。', 'info')
+        } else if (choice === 'scope' && task?.review && task.isolatedSession) {
+          const files = await chooseReviewFiles(ctx, task.review.files, true)
+          if (!files || files.length === task.review.files.length || !ctx.isIdle()) return
+          const link = sessionLink(ctx)
+          if (!link) throw new Error('找不到绑定的 Pi 会话。')
+          await data.restrictReview(task.id, link, task.review.id, files)
+          ctx.ui.notify('已更新交付清单；未修改 Local。', 'info')
         } else if (task && choice in labels) {
           const act = choice as Action
           const discardFingerprint = act === 'discard' ? await data.discardFingerprint(task) : undefined
@@ -779,29 +810,40 @@ export default function extension(pi: ExtensionAPI) {
           if (relevantFiles.length > 3) summary.push(`… 共 ${relevantFiles.length} 个文件`)
           const leavesWorktree = act === 'finalize' && !!isolated
           const detail = [impact[act], task.local.root, ...summary]
-          if (act === 'finalize') detail.push('默认安全清理；也可保留 Worktree 环境供日后检查。')
+          const partial = act === 'finalize' && !!task.review?.partial
+          if (act === 'finalize') detail.push(partial ? '清单外还有改动，提交后将保留 Worktree。' : '默认安全清理；也可保留 Worktree 环境供日后检查。')
           if (leavesWorktree) detail.unshift('将先切换到原 Local 会话，再提交。')
           const decision = await pick<'execute' | 'keep' | undefined>(ctx, `确认：${labels[act]}`, detail, [
-            { label: act === 'finalize' ? '提交并清理 Worktree（默认）' : `执行${labels[act]}`, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
-            ...(act === 'finalize' ? [{ label: '提交并保留 Worktree', value: 'keep' as const }] : []),
+            { label: partial ? '提交并保留 Worktree' : act === 'finalize' ? '提交并清理 Worktree（默认）' : `执行${labels[act]}`, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
+            ...(act === 'finalize' && !partial ? [{ label: '提交并保留 Worktree', value: 'keep' as const }] : []),
             { label: '取消', value: undefined, tone: 'quiet' },
           ], { tone: act === 'discard' ? 'danger' : act === 'finalize' || act === 'rollback' ? 'warning' : undefined })
           if (!decision || !ctx.isIdle()) return
           const recoverConflict = async (conflict: PreviewConflict) => {
             const plan = conflict.plan
             const target = task.isolatedSession
-            const canRecover = !!target && !!task.review && !!plan.cleanEntries && plan.committedConflictingFiles.length > 0
+            const canRecover = !!target && !!task.review && !task.review.partial && !!plan.cleanEntries && plan.committedConflictingFiles.length > 0
+            const canNarrow = !!target && !!task.review && task.review.files.length > 1 && !task.recovery
             const paths = plan.conflictingFiles.slice(0, 6).map(path => `• ${JSON.stringify(path)}`)
             if (plan.conflictingFiles.length > paths.length) paths.push(`… 共 ${plan.conflictingFiles.length} 个冲突文件`)
             const recover = await pick(ctx, '预览冲突 · Local 未修改', [
-              !plan.committedConflictingFiles.length ? '请先处理这些 Local 未提交改动，再重新预览。' :
+              !plan.committedConflictingFiles.length ? '如果冲突文件不是任务改动，可调整交付清单；否则请先处理 Local 未提交改动。' :
                 canRecover ? `只在 Worktree 合并 Local ${plan.localHeadOid.slice(0, 12)}，生成新验收。` : '这组冲突不能安全地自动交给 Agent。',
               ...(canRecover && plan.dirtyConflict ? ['冲突路径也有 Local 未提交的改动，不会带入 Worktree。'] : []),
               ...paths,
-            ], [...(canRecover ? [{ label: '让 Agent 解决冲突', value: true, tone: 'primary' as const }] : []),
-              { label: '关闭', value: false, tone: 'quiet' }], { tone: 'warning' })
-            if (!recover || !target || !task.review || !ctx.isIdle()) return
+            ], [...(canRecover ? [{ label: '让 Agent 解决冲突', value: 'recover' as const, tone: 'primary' as const }] : []),
+              ...(canNarrow ? [scopeChoice] : []), { label: '关闭', value: 'close', tone: 'quiet' }], { tone: 'warning' })
+            if (!recover || recover === 'close' || !target || !task.review || !ctx.isIdle()) return
             const reviewId = task.review.id
+            if (recover === 'scope') {
+              const files = await chooseReviewFiles(ctx, task.review.files, true)
+              if (!files || files.length === task.review.files.length || !ctx.isIdle()) return
+              const link = sessionLink(ctx)
+              if (!link) throw new Error('找不到绑定的 Pi 会话。')
+              await data.restrictReview(task.id, link, reviewId, files)
+              ctx.ui.notify('已更新交付清单；请重新点击预览。', 'info')
+              return
+            }
             const begin = async (next: ExtensionContext, send: (text: string) => unknown) => {
               if (!isBoundSession(next, target) || !next.isIdle()) throw new Error('未进入预期的空闲 Worktree 会话。')
               const recovery = await data.beginConflictRecovery(task.id, target, reviewId, plan)
@@ -833,7 +875,7 @@ export default function extension(pi: ExtensionAPI) {
             const preview = act === 'preview' && isolated ? '；仍在 Worktree，可点击「打开 Local 检查」' : ''
             activeCtx.ui.notify(`${labels[act]}完成${result.commitOid ? ` · ${result.commitOid.slice(0, 12)}` : ''}${preview}${note}`,
               note && !result.cleanup?.requested ? 'warning' : 'info')
-            if (result.cleanup?.canForce && activeCtx.isIdle()) {
+            if (result.cleanup?.canForce && !partial && activeCtx.isIdle()) {
               try { await confirmRemoval(activeCtx, data, result, '未能安全清理 Worktree') }
               catch (error) { activeCtx.ui.notify(`Worktree 清理已停止：${message(error)}`, 'warning') }
             }
