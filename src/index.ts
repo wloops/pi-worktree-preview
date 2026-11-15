@@ -432,8 +432,10 @@ export default function extension(pi: ExtensionAPI) {
     }
     const history = historyView !== undefined
     if (history && (!historyView || event.source !== 'interactive' || !ctx.hasUI)) return { action: 'handled' }
-    if (event.source !== 'interactive' || !ctx.hasUI || !event.text.trim() || (!history && /^[!/]/.test(event.text.trimStart()))) return
+    if (event.source !== 'interactive' || !ctx.hasUI || !event.text.trim()) return
     const sessionId = ctx.sessionManager.getSessionId()
+    // Pi handles UI/extension commands outside this hook. Keep task prompts,
+    // including skills, templates, and pasted paths, as raw input until switch.
     if (!history && armed?.sessionId !== sessionId) return
     if (busy || draft || !ctx.isIdle() || event.streamingBehavior) {
       restoreDraft(ctx, event.text)
@@ -572,7 +574,7 @@ export default function extension(pi: ExtensionAPI) {
           try {
             if (!isBoundSession(next, target)) throw new Error('Pi 未进入预期的隔离 Worktree。')
             if (view) await rm(active.file, { force: true }).catch(() => {})
-            await next.sendUserMessage(images?.length ? [{ type: 'text', text }, ...images] : text)
+            await next.sendUserMessage(images?.length ? [{ type: 'text', text }, ...images] : text, { expandPromptTemplates: true })
           } catch (error) {
             restoreDraft(next, text)
             next.ui.notify(`无法在 Worktree 发送消息：${message(error)}${images?.length ? '；请重新附加图片。' : ''}`, 'error')

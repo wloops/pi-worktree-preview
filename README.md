@@ -20,7 +20,7 @@ pi --tui-mode fullscreen
 
 若已经从源码目录安装过，请先用 `pi list` 和 `pi remove /path/to/pi-worktree-preview` 移除旧入口，避免同时加载两份扩展。源码开发时也可直接运行 `pi --tui-mode fullscreen -e /path/to/pi-worktree-preview/src/index.ts`。
 
-1. 勾选编辑器上方的 **[ ] 新建 Worktree**，输入任务并发送。勾选本身不会创建目录；发送时才创建隔离 Worktree、切换到新会话，并只把这条消息发到新会话。再次点击可取消勾选；斜杠命令和 `!` shell 命令不会触发创建。退出 Pi 后，用 Pi 的会话选择器（`pi --resume`）恢复创建任务的那条 Local 会话，再点 **工作树操作 → 进入 / 恢复 Worktree**，也可直接恢复原 Worktree 会话。
+1. 勾选编辑器上方的 **[ ] 新建 Worktree**，输入任务并发送。勾选本身不会创建目录；发送时才创建隔离 Worktree、切换到新会话，并只把这条消息发到新会话。再次点击可取消勾选。`/skill:…` 和提示词模板也是任务输入，会先切进 Worktree 再展开；Pi 界面命令（如 `/settings`）、扩展命令和 `!` shell 命令由 Pi 直接处理，不触发创建。退出 Pi 后，用 Pi 的会话选择器（`pi --resume`）恢复创建任务的那条 Local 会话，再点 **工作树操作 → 进入 / 恢复 Worktree**，也可直接恢复原 Worktree 会话。
 2. Agent 调用工具标记 **待验收**（也可从菜单手动标记）。这一步锁定当时的任务路径和内容，不改 Local。
 3. 在 Worktree 编辑器旁点击 **预览到 Local → 执行预览到 Local**。预览不暂存、不提交，也不会自动切换会话。想在 Pi 里对原目录运行测试时，再点 **打开 Local 检查**；仍可从 Local 的操作菜单回 Worktree。如果 Local 的新提交与任务冲突，点 **让 Agent 解决冲突**：回到原 Worktree，仅合并确认时的 Local `HEAD`，解决后重新标记待验收。新版本仍需你重新点击预览；Local 的未提交改动不会被搬进 Worktree。
 4. 想返修时，在原 Worktree 会话直接发送修改要求。未预览时，Agent 开始返修前会作废旧验收，无需确认。已预览时，Agent 会显示 **撤回预览，继续返修**；点一次，Local 撤回成功后 Agent 会接着处理刚才的要求，无需重发。取消或撤回失败则不开始修改；单纯提问不会作废验收。若只想恢复 Local、不需要返修，两边的 **撤回预览** 仍可单独执行，保留旧验收。

@@ -63,14 +63,16 @@ export default function(pi) {
       else if (text === "Try to write during review.") content = [badWrite()];
       else if (text === "Explain the change.") content = [tool("read", {path:"task.txt"})];
       else if (text?.startsWith("Follow up from ")) {
-        const previous = text.endsWith("delivery.") ? "Edit task.txt and mark ready." : "Open a task to discard.";
+        const previous = text.endsWith("delivery.") ? "Edit task.txt and mark ready." : "/var/folders/pi-clipboard-regression.png Open a task to discard.";
         const inherited = context.messages.some(message => message.role === 'user' &&
           (typeof message.content === 'string' ? message.content === previous : message.content.some(part => part.type === 'text' && part.text === previous)));
         const boundary = context.messages.some(message => message.role === 'user' &&
           Array.isArray(message.content) && message.content.some(part => part.type === 'text' && part.text.includes('Only conversation history was inherited')));
         content = say(inherited && boundary ? "Received follow-up with original context." : "Missing inherited context.");
       }
-      else if (text === "Local only." || text === "Open a task to discard.") content = say("Acknowledged without edits.");
+      else if (text === "Local only." || text === "/var/folders/pi-clipboard-regression.png Open a task to discard.") content = say("Acknowledged without edits.");
+      else if (text?.trim() === "Registered Worktree prompt.") content = say("Expanded Worktree template.");
+      else if (text?.includes('Worktree skill marker.') && text.endsWith('smoke argument')) content = say("Expanded Worktree skill.");
       else content = [edit()];
       const tools = content[0].type === "toolCall";
       const msg = {role:"assistant", content, api:model.api, provider:model.provider, model:model.id, stopReason:tools ? "toolUse" : "stop",
@@ -99,6 +101,8 @@ class Pi:
             extension = [] if PACKAGE else ['-ne', '-e', str(ROOT / 'src/index.ts')]
             os.execvp('pi', ['pi', '--tui-mode', 'fullscreen', '--no-mcp', '-ns', '-np', '-na',
                              '--provider', 'wtp-smoke', '--model', 'model', *extension, '-e', str(provider),
+                             '--prompt-template', str(provider.with_name('smoke-task.md')),
+                             '--skill', str(provider.with_name('smoke-worktree') / 'SKILL.md'),
                              *(['--session', str(session)] if session else [])])
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 
@@ -190,6 +194,10 @@ def main():
                            env={**os.environ, 'PI_CODING_AGENT_DIR': str(agent)})
         provider = base / 'offline.ts'
         provider.write_text(PROVIDER)
+        provider.with_name('smoke-task.md').write_text('Registered Worktree prompt.\n')
+        skill_dir = provider.with_name('smoke-worktree')
+        skill_dir.mkdir()
+        (skill_dir / 'SKILL.md').write_text('---\nname: smoke-worktree\ndescription: Verify skill routing.\n---\nWorktree skill marker.\n')
         # Test extension imports resolve through Pi's extension loader; this link keeps offline
         # provider imports resolvable even when pi is launched from an isolated agent profile.
         (base / 'node_modules').symlink_to(ROOT / 'node_modules', target_is_directory=True)
@@ -519,10 +527,18 @@ def main():
 
             pi.click('[ ] 新建 Worktree')
             pi.until('[x] 新建 Worktree')
-            pi.send(b'Open a task to discard.\r')
+            before = tasks()
+            pi.send(b'/smoke-session-id\r')
+            pi.until('Smoke session')
+            pi.until('[x] 新建 Worktree')
+            assert tasks() == before
+            image_prompt = '/var/folders/pi-clipboard-regression.png Open a task to discard.'
+            pi.send(image_prompt.encode() + b'\r')
             pi.until('Worktree · 进行中')
             pi.until('Acknowledged without edits.')
             second_path = Path(task()['isolatedPath'])
+            assert Path(task()['isolatedSession']['file']).read_text().count(image_prompt) == 1
+            assert image_prompt not in Path(task()['localSession']['file']).read_text()
             (second_path / 'discard.txt').write_text('discarded')
             pi.click('[ 工作树操作 ]')
             pi.click('[ 返回 Local ]')
@@ -533,7 +549,7 @@ def main():
             pi.until('Local · Worktree 已放弃')
             assert not second_path.exists()
             assert not (local / 'discard.txt').exists()
-            print('real Pi: discarded an unpreviewed task with safe cleanup', flush=True)
+            print('real Pi: extension command stayed Local; path-prefixed read-only request went to Worktree, then safely discarded', flush=True)
 
             discarded = task()
             discarded_id = discarded['id'][:8]
@@ -725,6 +741,22 @@ def main():
                 assert task()['phase'] == 'previewed'
                 assert (local / 'task.txt').read_text() == 'task edit\n'
         print('real Pi: parallel Worktrees from different Local sessions; Local preview held and released independently', flush=True)
+
+        for prompt, response, expanded in [
+            (b'/smoke-task', 'Expanded Worktree template.', 'Registered Worktree prompt.'),
+            (b'/skill:smoke-worktree smoke argument', 'Expanded Worktree skill.', 'Worktree skill marker.'),
+        ]:
+            with Pi(local, agent, provider) as pi:
+                pi.click('[ ] 新建 Worktree')
+                pi.until('[x] 新建 Worktree')
+                before = len(tasks())
+                pi.send(prompt + b'\r')
+                pi.until('Worktree · 进行中', 40)
+                pi.until(response)
+                assert len(tasks()) == before + 1
+                assert expanded in Path(task()['isolatedSession']['file']).read_text()
+                assert expanded not in Path(task()['localSession']['file']).read_text()
+        print('real Pi: template and skill prompts were expanded only after switching to Worktree', flush=True)
 
 
 if __name__ == '__main__':
