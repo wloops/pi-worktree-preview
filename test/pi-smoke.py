@@ -23,7 +23,7 @@ PACKAGE = os.environ.get('PI_WORKTREE_PREVIEW_PACKAGE')
 COLS, ROWS = 110, 35
 # Use a deterministic offline provider, but run the real agent, bash tool, and review tool.
 PROVIDER = '''
-import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, getCurrentTools } from "@earendil-works/pi-ai";
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 export default function(pi) {
@@ -60,6 +60,8 @@ export default function(pi) {
       const recover = text?.startsWith("只在当前 detached Worktree 解决冲突") && text.match(/--no-overwrite-ignore ([0-9a-f]{40,64})/);
       const revise = () => tool("worktree_begin_revision");
       const badWrite = () => tool("write", {path:"forbidden.txt",content:"must not be written"});
+      const declared = getCurrentTools(context.messages.filter(message => message.role === 'system'));
+      const routesHistory = declared.some(tool => tool.name === 'worktree_start_follow_up');
       const runtime = text === "Edit with runtime state." || text === "Edit with overbroad review.";
       const extra = text === "Edit many files." ? Array.from({length: 32}, (_, i) => `extra-${String(i + 1).padStart(2, '0')}.txt`) : [];
       const edit = () => tool("bash", {command:`printf '${revision ? (text === "Revise before preview." ? "ready revision" : "previewed revision") : "task edit"}\\\\n' > task.txt${runtime ? " && mkdir -p .pi && printf isolated > .pi/loops.json" : ""}${extra.map(path => ` && touch ${path}`).join('')}`});
@@ -81,13 +83,16 @@ export default function(pi) {
       else if (text === "Try a parallel write.") content = [revise(), badWrite()];
       else if (text === "Try to write during review.") content = [badWrite()];
       else if (text === "Explain the change.") content = [tool("read", {path:"task.txt"})];
+      else if (text === 'Could we change this?') content = say('Discussed without starting a task.');
+      else if (text?.startsWith("Follow up from ") && routesHistory) content = [tool('worktree_start_follow_up')];
       else if (text?.startsWith("Follow up from ")) {
         const previous = text.endsWith("delivery.") ? "Edit task.txt and mark ready." : "/var/folders/pi-clipboard-regression.png Open a task to discard.";
         const inherited = context.messages.some(message => message.role === 'user' &&
           (typeof message.content === 'string' ? message.content === previous : message.content.some(part => part.type === 'text' && part.text === previous)));
         const boundary = context.messages.some(message => message.role === 'user' &&
           Array.isArray(message.content) && message.content.some(part => part.type === 'text' && part.text.includes('Only conversation history was inherited')));
-        content = say(inherited && boundary ? "Received follow-up with original context." : "Missing inherited context.");
+        const fullTools = declared.some(tool => tool.name === 'bash') && !routesHistory;
+        content = say(inherited && boundary && fullTools ? "Received follow-up with original context." : "Missing inherited context or Worktree tools.");
       }
       else if (text === "Local only." || text === "/var/folders/pi-clipboard-regression.png Open a task to discard.") content = say("Acknowledged without edits.");
       else if (text?.trim() === "Registered Worktree prompt.") content = say("Expanded Worktree template.");
@@ -480,7 +485,7 @@ def main():
             state_on_exit.unlink()
             assert isolated_session.read_text().count('"customType":"smoke-shutdown-state"') == 2
             pi.click('[ 保留 Worktree ]')
-            pi.until('已交付 · 发送后在新 Worktree 继续')
+            pi.until('已交付 · 只读对话')
             pi.until('Revision ready.')
             assert '[ ] 新建 Worktree' not in pi.dump()
             pi.click('[ 返回原对话 ]')
@@ -507,7 +512,7 @@ def main():
                 other.click('⋯ 更多')
                 other.click('[ 已保留的 Worktree ]')
                 other.click(f'[ {first_id} · Isolated smoke change ]')
-                other.click('[ 恢复会话检查 ]')
+                other.click('[ 检查保留目录 ]')
                 other.until('Worktree · 已交付')
                 inspect_removal()
                 pi.until('另一个 Pi 会话正在使用此 Worktree')
@@ -546,13 +551,21 @@ def main():
             history_views = agent / 'worktree-preview/history-views'
             pi.click('[ 任务历史 ]')
             pi.click(f'[ {first_id} · 已交付 · Isolated smoke change ]')
-            pi.until('历史对话 · 发送后在新 Worktree 继续')
+            pi.until('历史对话 · 只读')
             pi.until('Revise after preview.')  # actually rendered by Pi, before the next send
             pi.until('Revision ready.')
             assert tasks() == [first] and not first_path.exists()
             assert len(list(history_views.glob('*.jsonl'))) == 1
             assert isolated_session.read_bytes() == first_history
             assert git('rev-parse', 'HEAD') == delivered_head and git('status', '--porcelain') == baseline
+            pi.send(b'Explain the change.\r')
+            pi.until('Explained without edits.')
+            pi.send(b'Could we change this?\r')
+            pi.until('Discussed without starting a task.')
+            pi.send(b'Try to write during review.\r')
+            pi.until('Write was blocked.')
+            assert tasks() == [first] and isolated_session.read_bytes() == first_history
+            assert git('status', '--porcelain') == baseline and not (local / 'forbidden.txt').exists()
             # Advance Local while viewing: the new base must be resolved on send.
             (local / 'new-base.txt').write_text('current Local commit\n')
             git('add', 'new-base.txt')
@@ -569,6 +582,8 @@ def main():
             assert header['parentSession'] == str(isolated_session) and header['cwd'] == str(follow_path)
             assert header['id'] != first['isolatedSession']['id'] and isolated_session.read_bytes() == first_history
             assert child.read_text().count('Follow up from delivery.') == 1
+            assert 'Discussed without starting a task.' in child.read_text()
+            assert 'worktree_start_follow_up' not in child.read_text()
             assert 'Follow up from delivery.' not in Path(follow['localSession']['file']).read_text()
             assert follow['baseOid'] == follow_head and follow_path != first_path
             assert (follow_path / 'task.txt').read_text() == 'previewed revision\n'
@@ -578,11 +593,30 @@ def main():
             pi.click('[ 返回原对话 ]')
             pi.until('项目目录 · Worktree 进行中')
             pi.click('⋯ 更多')
+            pi.until('Worktree · 更多')
+            assert '[ 放弃任务 ]' not in pi.dump()
+            pi.send(b'\x1b')
+            pi.until_gone('Worktree · 更多')
+            pi.click('[ 进入 / 恢复 Worktree ]')
+            pi.until('Worktree · 进行中')
+            pi.click('⋯ 更多')
+            pi.click('[ 放弃任务 ]')
+            pi.click('[ 取消 ]')
+            pi.until_gone('放弃任务？')
+            assert task()['phase'] == 'working' and follow_path.exists()
+            veto.touch()
+            pi.click('⋯ 更多')
+            pi.click('[ 放弃任务 ]')
+            pi.click('[ 放弃 ]')
+            pi.until('Pi 取消了切换，任务未放弃')
+            assert task()['phase'] == 'working' and follow_path.exists()
+            veto.unlink()
+            pi.click('⋯ 更多')
             pi.click('[ 放弃任务 ]')
             pi.click('[ 放弃 ]')
             pi.until('项目目录 · Worktree 已放弃')
             assert not follow_path.exists()
-            print('real Pi: history rendered before creating a Worktree; follow-up used HEAD at send time', flush=True)
+            print('real Pi: history questions stayed read-only; edits continued at latest HEAD; Worktree-only discard canceled safely', flush=True)
 
             pi.click('[ ] 新建 Worktree')
             pi.until('[x] 新建 Worktree')
@@ -600,9 +634,6 @@ def main():
             assert image_prompt not in Path(task()['localSession']['file']).read_text()
             (second_path / 'discard.txt').write_text('discarded')
             pi.click('⋯ 更多')
-            pi.click('[ 返回原对话 ]')
-            pi.until('项目目录 · Worktree 进行中')
-            pi.click('⋯ 更多')
             pi.click('[ 放弃任务 ]')
             pi.click('[ 放弃 ]')
             pi.until('项目目录 · Worktree 已放弃')
@@ -617,23 +648,26 @@ def main():
             before = tasks()
             pi.click('[ 任务历史 ]')
             pi.click(f'[ {discarded_id} · 已放弃 · Worktree ]')
-            pi.until('历史对话 · 发送后在新 Worktree 继续')
+            pi.until('历史对话 · 只读')
             pi.until('Open a task to discard.')
             pi.send(b'!touch shell-from-history.txt\r')
-            pi.until('请返回原对话再执行 shell')
+            pi.until('历史对话不执行 shell')
             assert not (local / 'shell-from-history.txt').exists() and tasks() == before
+            pi.send(b'Unsent history draft.')
             pi.click('[ 返回原对话 ]')
             pi.until('[ ] 新建 Worktree')
+            pi.until('Unsent history draft.')
+            pi.send(b'\x15')
             assert tasks() == before and old_file.read_bytes() == old_history
             assert not list(history_views.glob('*.jsonl'))
             pi.click('[ 任务历史 ]')
             pi.click(f'[ {discarded_id} · 已放弃 · Worktree ]')
-            pi.until('历史对话 · 发送后在新 Worktree 继续')
+            pi.until('历史对话 · 只读')
             old_file.unlink()
             pi.send(b'Follow up from discard.\r')
             pi.until('原 Pi 会话文件已不存在')
             pi.until('Follow up from discard.')  # original draft restored
-            pi.until('历史对话 · 发送后在新 Worktree 继续')
+            pi.until('历史对话 · 只读')
             assert tasks() == before
             damaged = old_history + b'{partial record'
             old_file.write_bytes(damaged)
@@ -649,6 +683,8 @@ def main():
             assert next_task['baseOid'] == follow_head and git('rev-parse', 'HEAD') == follow_head
             assert old_file.read_bytes() == without_newline and not second_path.exists()
             assert not (Path(next_task['isolatedPath']) / 'discard.txt').exists()
+            retried = Path(next_task['isolatedSession']['file']).read_text()
+            assert retried.count('Follow up from discard.') == 1 and 'worktree_start_follow_up' not in retried
             assert 'Follow up from discard.' not in Path(next_task['localSession']['file']).read_text()
             print('real Pi: discarded history survived cleanup; missing source stopped safely and retried without sending to Local', flush=True)
 
@@ -690,7 +726,7 @@ def main():
             assert not index.exists()
             pi.click('[ 确认提交 ]')
             pi.click('[ 提交并保留 ]')
-            pi.until('已交付 · 发送后在新 Worktree 继续')
+            pi.until('已交付 · 只读对话')
             pi.until('Worktree ready.')
             assert index.is_file()
             assert git('rev-parse', 'HEAD^') == head
@@ -709,7 +745,7 @@ def main():
             pi.click('⋯ 更多')
             pi.click('[ 已保留的 Worktree ]')
             pi.click(f'[ {task_id} · Isolated smoke change ]')
-            pi.click('[ 恢复会话检查 ]')
+            pi.click('[ 检查保留目录 ]')
             pi.until('Worktree · 已交付')
             pi.until('Worktree ready.')
             pi.click('⋯ 更多')
@@ -797,7 +833,7 @@ def main():
                 assert (local / '.pi/loops.json').read_text() == 'local'
                 pi.click('[ 确认提交 ]')
                 pi.click('[ 提交并保留 ]')
-                pi.until('已交付 · 发送后在新 Worktree 继续')
+                pi.until('已交付 · 只读对话')
                 pi.until('Worktree ready.')
                 delivered = task()
                 assert git('show', '--format=', '--name-only') == 'task.txt'
@@ -964,7 +1000,7 @@ exec {real_git} "$@"
                         assert 'Do not send during delivery.' not in Path(before['localSession']['file']).read_text()
                 finally:
                     gate.unlink()
-                pi.until('已交付 · 发送后在新 Worktree 继续' if from_worktree else '项目目录 · Worktree 已交付')
+                pi.until('已交付 · 只读对话' if from_worktree else '项目目录 · Worktree 已交付')
                 pi.until_gone('正在直接提交')
                 done = task()
                 assert done['phase'] == 'delivered' and not done.get('receipt') and not done.get('journal')
@@ -986,8 +1022,11 @@ exec {real_git} "$@"
                     saved = source.read_bytes()
                     assert b'"customType":"smoke-shutdown-state"' in saved
                     pi.send(b'!touch forbidden-in-history\r')
-                    pi.until('请返回原对话再执行 shell')
+                    pi.until('历史对话不执行 shell')
                     assert not (local / 'forbidden-in-history').exists()
+                    pi.send(b'Could we change this?\r')
+                    pi.until('Discussed without starting a task.')
+                    assert task() == done and not isolated.exists()
                     (local / 'latest.txt').write_text('post-delivery HEAD\n')
                     git('add', 'latest.txt')
                     git('commit', '--only', '-m', 'Advance project before continuation', '--', 'latest.txt')

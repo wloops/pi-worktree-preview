@@ -9,9 +9,11 @@ import { clean, pick, toolbar, withLoading, type Choice, type ToolbarChoice } fr
 const NAME = 'worktree-preview'
 const TOOL = 'worktree_ready_for_review'
 const REVISE = 'worktree_begin_revision'
+const FOLLOW_UP = 'worktree_start_follow_up'
 const HISTORY_VIEW = `${NAME}-history-view`
 const HISTORY_DIR = 'history-views'
-const HISTORY_HINT = '历史对话 · 发送后在新 Worktree 继续'
+const HISTORY_HINT = '历史对话 · 只读'
+const historyReadTools = new Set(['read', 'grep', 'find', 'ls'])
 // Native session replacement reloads the extension. Share only the transient
 // delivery lock across the two instances, not UI or session contexts.
 const deliveryKey = Symbol.for('pi-worktree-preview.pending-delivery-views')
@@ -286,15 +288,49 @@ async function makeHistoryView(data: TaskStore, task: Task, returnTo: SessionLin
   return { target, source, proof }
 }
 
-async function forkWorktreeSession(cwd: string, task: Task, prior: Task, view: HistoryView): Promise<SessionLink> {
+type FollowUpHistory = { body: string[]; leaf: string | null }
+
+function captureFollowUp(ctx: ExtensionContext, leaf: string | null): FollowUpHistory {
+  if (!leaf) throw new Error('缺少原对话记录，未开启下一轮。')
+  const entries = ctx.sessionManager.getEntries()
+  const marker = entries.map(entry => entry.type === 'custom' ? entry.customType : undefined).lastIndexOf(HISTORY_VIEW)
+  const end = entries.findIndex(entry => entry.id === leaf)
+  if (marker < 0 || end < marker) throw new Error('无法保存当前对话分支，未开启下一轮。')
+  const prefix = entries.slice(0, end + 1)
+  const failedRouting = new Set<string>()
+  let turnStart = marker + 1
+  for (let i = turnStart; i < prefix.length; i++) {
+    const entry = prefix[i]
+    if (entry.type !== 'message') continue
+    if (entry.message.role === 'user') turnStart = i
+    if (entry.message.role === 'toolResult' && entry.message.toolName === FOLLOW_UP && !entry.message.isError) {
+      // A previous attempt to switch may have failed. Do not carry that
+      // routing turn into the new task alongside the retried user request.
+      for (const routed of prefix.slice(turnStart, i + 1)) failedRouting.add(routed.id)
+    }
+  }
+  const parentOf = new Map<string, string | null>()
+  const body: string[] = []
+  for (const [i, entry] of prefix.entries()) {
+    const parentId = entry.parentId === null ? null : parentOf.get(entry.parentId) ?? null
+    // Keep earlier Q&A, but let Pi restore the original Worktree loadout.
+    const skip = i === marker || failedRouting.has(entry.id) || (i > marker && entry.type === 'message' && entry.message.role === 'system')
+    parentOf.set(entry.id, skip ? parentId : entry.id)
+    if (!skip) body.push(JSON.stringify({ ...entry, parentId }))
+  }
+  return { body, leaf: parentOf.get(leaf) ?? null }
+}
+
+async function forkWorktreeSession(cwd: string, task: Task, prior: Task, view: HistoryView, inherited: FollowUpHistory): Promise<SessionLink> {
   const source = prior.isolatedSession!
   const history = await readHistory(source)
   if (!matchesHistory(history, view) || (view.leaf !== undefined && !history.ids.has(view.leaf))) {
     throw new Error('原 Pi 会话在打开后已变化；请返回原对话后重新打开任务历史。')
   }
-  // Inherit the same snapshot that was shown, not state appended on exit.
-  return copyHistory(cwd, source, history.body.slice(0, view.historyLines ?? history.body.length), fork => {
-    if (view.leaf !== undefined) fork.branch(view.leaf)
+  // Carry the read-only Q&A, but not the routing turn, which is replayed once
+  // in the new environment with its original text and attachments.
+  return copyHistory(cwd, source, inherited.body, fork => {
+    if (inherited.leaf !== null) fork.branch(inherited.leaf)
     fork.appendSessionInfo(shortSessionName(task.id))
     fork.appendCustomMessageEntry(`${NAME}-follow-up`, [
       `New isolated task from Local's HEAD at creation (${task.baseOid}).`,
@@ -326,7 +362,8 @@ function restoreDraft(ctx: ExtensionContext, text: string) {
 }
 
 type Armed = { sessionId: string }
-type Draft = Pick<InputEvent, 'text' | 'images'> & Armed & { token: string }
+type Prompt = Pick<InputEvent, 'text' | 'images'> & Armed
+type Draft = Prompt & { token: string; inherited?: FollowUpHistory }
 type ClickIntent = { token: string; sessionId: string; taskVersion: ReturnType<typeof taskVersion>; choice: MenuAction }
 
 async function confirmRemoval(ctx: ExtensionContext, data: TaskStore, task: Task, title: string) {
@@ -349,6 +386,8 @@ export default function extension(pi: ExtensionAPI) {
   let armed: Armed | undefined
   let historyView: HistoryView | null | undefined
   let historyCanFollowUp = false
+  let pendingHistoryPrompt: Prompt | undefined
+  let historyTurn: { prompt: Prompt; source: SessionLink; leaf: string | null; requested: boolean } | undefined
   let draft: Draft | undefined
   let clickIntent: ClickIntent | undefined
   let activeHold: { data: TaskStore; id: string } | undefined
@@ -415,7 +454,7 @@ export default function extension(pi: ExtensionAPI) {
       installToolbar<'back' | 'resume'>(ctx, () => ({
         status: {
           label: !view ? '历史会话记录无效 · 请退出此会话' : pending ? '任务对话' : !view.afterCommit ? HISTORY_HINT :
-            historyCanFollowUp ? `${prior?.phase === 'discarded' ? '已放弃' : '已交付'} · 发送后在新 Worktree 继续` :
+            historyCanFollowUp ? `${prior?.phase === 'discarded' ? '已放弃' : '已交付'} · 只读对话` :
             prior?.journal ? '操作已停止 · 请检查恢复记录' : '任务对话 · 尚未交付',
           tone: view?.afterCommit && historyCanFollowUp ? 'success' : 'warning',
         },
@@ -532,7 +571,7 @@ export default function extension(pi: ExtensionAPI) {
     }
     const history = historyView !== undefined
     if (history && (!historyView || event.source !== 'interactive' || !ctx.hasUI)) return { action: 'handled' }
-    if (event.source !== 'interactive' || !ctx.hasUI || !event.text.trim()) return
+    if (event.source !== 'interactive' || !ctx.hasUI || (!event.text.trim() && (!history || !event.images?.length))) return
     if (history && !historyCanFollowUp) {
       restoreDraft(ctx, event.text)
       ctx.ui.notify(delivering(ctx) ? '请等待提交操作结束；消息未发送。' : '目前不能从此处继续。请回到 Worktree，或检查恢复记录。', 'warning')
@@ -542,13 +581,18 @@ export default function extension(pi: ExtensionAPI) {
     // Pi handles UI/extension commands outside this hook. Keep task prompts,
     // including skills, templates, and pasted paths, as raw input until switch.
     if (!history && armed?.sessionId !== sessionId) return
-    if (busy || draft || !ctx.isIdle() || event.streamingBehavior) {
+    if (busy || draft || historyTurn || !ctx.isIdle() || event.streamingBehavior) {
       restoreDraft(ctx, event.text)
       ctx.ui.notify('请等待当前操作结束再发送；消息未发送。', 'warning')
       return { action: 'handled' }
     }
+    const prompt = { sessionId, text: event.text, images: event.images }
+    if (history) {
+      pendingHistoryPrompt = prompt
+      return { action: 'continue' }
+    }
     const token = randomUUID()
-    draft = { sessionId, text: event.text, images: event.images, token }
+    draft = { ...prompt, token }
     // Only commands can replace a session. Wait for input preflight to unwind and
     // pass just a nonce to the command, never the message text or attachments.
     setImmediate(() => { if (draft?.token === token) pi.sendUserMessage(`/${NAME} ${token}`, { expandPromptTemplates: true }) })
@@ -556,16 +600,29 @@ export default function extension(pi: ExtensionAPI) {
   })
   pi.on('session_before_fork', () => historyView !== undefined ? { cancel: true } : undefined)
   pi.on('session_before_compact', () => historyView !== undefined ? { cancel: true } : undefined)
-  // Follow-up inherits the branch that was on screen at delivery, not a branch
-  // selected later in the read-only copy. Tree browsing must not run a summary.
-  pi.on('session_before_tree', () => historyView?.afterCommit ? { cancel: true } : undefined)
+  // Tree navigation can run a summary and change the context silently.
+  pi.on('session_before_tree', () => historyView !== undefined ? { cancel: true } : undefined)
   pi.on('user_bash', (_event, ctx) => {
     if (historyView === undefined) return
-    if (ctx.hasUI) ctx.ui.notify('此处仅展示任务对话；请返回原对话再执行 shell。', 'warning')
+    if (ctx.hasUI) ctx.ui.notify('历史对话不执行 shell；请返回原对话。', 'warning')
     return { result: { output: '历史对话未执行 shell。', exitCode: 1, cancelled: false, truncated: false } }
   })
+  const canReadInHistory = (name: string) => historyReadTools.has(name) &&
+    pi.getAllTools().some(tool => tool.name === name && tool.sourceInfo.path === `builtin:${name}`)
+
   pi.on('before_agent_start', async (event, ctx) => {
-    if (historyView !== undefined) { ctx.abort(); return }
+    if (historyView !== undefined) {
+      const prompt = pendingHistoryPrompt
+      pendingHistoryPrompt = undefined
+      const source = sessionLink(ctx)
+      if (!prompt || prompt.sessionId !== source?.id || event.messageType !== 'user' || !historyCanFollowUp || delivering(ctx)) {
+        ctx.abort()
+        return
+      }
+      historyTurn = { prompt, source, leaf: ctx.sessionManager.getLeafId(), requested: false }
+      event.systemPromptOptions.selectedTools = [...pi.getActiveTools().filter(canReadInHistory), FOLLOW_UP]
+      return
+    }
     revisionStopped = false
     const state = await context(ctx).catch(() => undefined)
     const task = state?.isolated
@@ -579,7 +636,19 @@ export default function extension(pi: ExtensionAPI) {
   // Shell cannot be reliably classified as read-only. Keep built-in mutators
   // behind the revision step, including sibling calls while confirmation is open.
   pi.on('tool_call', async (event, ctx) => {
-    if (historyView !== undefined) return { block: true, reason: '历史对话只用于查看；请在新 Worktree 继续。' }
+    if (historyView !== undefined) {
+      if (historyTurn && !historyTurn.requested && !event.parentToolCallId && canReadInHistory(event.toolName)) return
+      if (event.toolName === FOLLOW_UP && historyTurn && !historyTurn.requested && !event.parentToolCallId) {
+        const last = ctx.sessionManager.getBranch().reverse().find(entry => entry.type === 'message' && entry.message.role === 'assistant')
+        if (last?.type === 'message' && last.message.role === 'assistant') {
+          const calls = last.message.content.filter(part => part.type === 'toolCall')
+          if (calls.length === 1 && calls[0].id === event.toolCallId && calls[0].name === FOLLOW_UP) return
+        }
+        return { block: true, reason: 'Call the follow-up tool by itself.' }
+      }
+      return { block: true, reason: '历史对话只读，不执行修改或 shell。' }
+    }
+    if (event.toolName === FOLLOW_UP) return { block: true, reason: 'Only available in ended task conversations.' }
     if ((!guardedTools.has(event.toolName) && event.toolName !== REVISE) || (!activeHold && !incomingHoldFailed)) return
     const assistant = ctx.sessionManager.getBranch().reverse().find(entry => entry.type === 'message' && entry.message.role === 'assistant')
     const calls = assistant?.type === 'message' && assistant.message.role === 'assistant'
@@ -602,6 +671,39 @@ export default function extension(pi: ExtensionAPI) {
       ? `当前处于验收阶段。如果用户要求改动，先单独调用 ${REVISE}；如果只是讨论，请用只读工具。`
       : '当前会话不允许编辑或执行 shell；请勿绕过。'
     return { block: true, reason }
+  })
+  pi.registerTool({
+    name: FOLLOW_UP, label: '开启下一轮 Worktree', defaultActive: false, exposure: 'model-only', executionMode: 'sequential',
+    description: 'Answer or clarify here read-only; call this tool alone only if the user explicitly asks for project changes.',
+    parameters: Type.Object({}),
+    async execute(_id, _params, signal, _update, ctx) {
+      const turn = historyTurn
+      if (!turn || !historyCanFollowUp || delivering(ctx) || turn.requested || !isBoundSession(ctx, turn.source) || signal?.aborted) {
+        return { content: [{ type: 'text', text: '未开启下一轮。' }], details: {}, isError: true }
+      }
+      turn.requested = true
+      return { content: [{ type: 'text', text: '将在新 Worktree 继续。' }], details: {}, terminate: true }
+    },
+  })
+  pi.on('agent_settled', async (event, ctx) => {
+    const turn = historyTurn
+    historyTurn = undefined
+    if (!turn?.requested || !isBoundSession(ctx, turn.source)) return
+    if (event.aborted) {
+      restoreDraft(ctx, turn.prompt.text)
+      return
+    }
+    const token = randomUUID()
+    // Capture only what preceded this turn. Most recent on disk includes the
+    // decision tool call/result; they must never become the next task prompt.
+    try {
+      draft = { ...turn.prompt, token, inherited: captureFollowUp(ctx, turn.leaf) }
+      pi.sendUserMessage(`/${NAME} ${token}`, { expandPromptTemplates: true })
+    } catch (error) {
+      draft = undefined
+      restoreDraft(ctx, turn.prompt.text)
+      ctx.ui.notify(message(error), 'error')
+    }
   })
   pi.registerTool({
     name: REVISE, label: '开始返修', executionMode: 'sequential',
@@ -664,7 +766,7 @@ export default function extension(pi: ExtensionAPI) {
     },
   })
 
-  async function sendInNewWorktree(ctx: ExtensionCommandContext, { text, images, sessionId }: Draft) {
+  async function sendInNewWorktree(ctx: ExtensionCommandContext, { text, images, sessionId, inherited }: Draft) {
     let replaced = false
     const view = historyView
     const create = async (current: ExtensionCommandContext, send: (text: string) => unknown) => {
@@ -680,8 +782,9 @@ export default function extension(pi: ExtensionAPI) {
             task.localSession.cwd === source.cwd && isOpenTask(task))) throw new Error(sessionBusy)
         const created = await withLoading(current, '正在创建 Worktree…', async () => {
           await validateSession(source)
-          return data.create(local, source, (path, task, prior) => prior && view
-            ? forkWorktreeSession(path, task, prior, view)
+          if (view && !inherited) throw new Error('缺少续接对话记录。')
+          return data.create(local, source, (path, task, prior) => prior && view && inherited
+            ? forkWorktreeSession(path, task, prior, view, inherited)
             : newSession(path, shortSessionName(task.id)), view?.priorId)
         })
         const target = created.isolatedSession!
@@ -756,7 +859,7 @@ export default function extension(pi: ExtensionAPI) {
           const moved = await switchTo(ctx, target, args === 'resume' ? '正在回到 Worktree…' : '正在返回原对话…', async next => {
             replaced = true
             if (isBoundSession(next, target)) {
-              if (args === 'resume' && text) restoreDraft(next, text)
+              if (text) restoreDraft(next, text)
               if (viewFile) await rm(viewFile, { force: true }).catch(() => {})
             }
           })
@@ -791,7 +894,9 @@ export default function extension(pi: ExtensionAPI) {
         }
         if (isolated && task) {
           choices.push(task.phase === 'previewed' && !task.journal ? localCheck : { label: '返回原对话', value: 'return' })
-          if (!task.journal && ['working', 'ready'].includes(task.phase)) choices.push({ label: '标记待验收（手动）', value: 'mark' })
+          if (!task.journal && ['working', 'ready'].includes(task.phase)) {
+            choices.push({ label: '标记待验收（手动）', value: 'mark' }, { label: labels.discard, value: 'discard', tone: 'danger' })
+          }
         } else if (local) {
           if (!task || !isOpenTask(task)) {
             choices.push({ label: armed?.sessionId === ctx.sessionManager.getSessionId() ? '取消下次发送时创建' : '下次发送时新建 Worktree', value: 'arm' })
@@ -799,7 +904,6 @@ export default function extension(pi: ExtensionAPI) {
           if (historyTasks(tasks).length) choices.push(historyChoice)
           if (task && isOpenTask(task) && !task.journal && task.phase !== 'creating') {
             if (task.isolatedSession) choices.push({ ...resumeChoice, tone: choices.length ? undefined : 'primary' })
-            if (task.phase === 'working' || task.phase === 'ready') choices.push({ label: labels.discard, value: 'discard', tone: 'danger' })
           }
         }
         const retained = retainedTasks(tasks)
@@ -818,8 +922,7 @@ export default function extension(pi: ExtensionAPI) {
           armed = armed?.sessionId === id ? undefined : { sessionId: id }
         } else if (choice === 'history' && local) {
           const prior = await pick<Task | undefined>(ctx, '打开历史对话', [
-            '立即打开旧任务对话；发送后从项目目录当前 HEAD 新建 Worktree。',
-            '只继承对话，不复制原 Worktree 的未提交文件。',
+            '可以继续提问；明确要求改动时才从项目目录当前 HEAD 新建 Worktree。',
           ], [
             ...historyTasks(tasks).map(item => ({ label: `${item.id.slice(0, 8)} · ${phases[item.phase]} · ${item.review?.message ?? 'Worktree'}`, value: item })),
             { label: '取消', value: undefined },
@@ -853,7 +956,7 @@ export default function extension(pi: ExtensionAPI) {
             const next = await pick(ctx, '管理保留的 Worktree', [
               `原因：${target.cleanup?.reason ?? '保留环境'}`, `目录：${target.isolatedPath}`,
             ], [
-              ...(target.isolatedSession ? [{ label: '恢复会话检查', value: 'resume' }] : []),
+              ...(target.isolatedSession ? [{ label: '检查保留目录', value: 'resume' }] : []),
               { label: '检查并清理…', value: 'remove' }, { label: '关闭', value: 'close' },
             ])
             if (!ctx.isIdle()) return
@@ -905,6 +1008,7 @@ export default function extension(pi: ExtensionAPI) {
           ctx.ui.notify('已更新交付清单；未修改项目目录。', 'info')
         } else if (task && choice in labels) {
           const act = choice as Action
+          if (act === 'discard' && (!isolated || !isBoundSession(ctx, task.isolatedSession))) throw new Error('只能在任务的 Worktree 对话中放弃。')
           const discardFingerprint = act === 'discard'
             ? await withLoading(ctx, '正在检查可放弃的 Worktree…', () => data.discardFingerprint(task)) : undefined
           const copy = confirmationCopy[act]
@@ -917,14 +1021,16 @@ export default function extension(pi: ExtensionAPI) {
             act === 'discard' ? '隔离 Worktree' : `项目目录${relevantFiles.length ? ` · ${relevantFiles.length} 个文件` : ''}`,
             act === 'discard' ? task.isolatedPath : task.local.root,
           ]
-          if (leavesWorktree) detail.push('提交后保留当前对话，可直接发下一条继续。')
+          if (act === 'discard') detail.unshift(copy.lead)
+          if (leavesWorktree) detail.push('提交后保留当前对话。')
           if (partial) detail.push('清单外有改动，将保留 Worktree。')
           if (commits) detail.push(...relevantFiles.map(path => `• ${JSON.stringify(path)}`))
           const decision = await pick<'execute' | 'keep' | undefined>(ctx, copy.title, detail, [
             { label: partial ? '提交并保留' : copy.button, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
             ...(commits && !partial ? [{ label: '提交并保留', value: 'keep' as const }] : []),
             { label: '取消', value: undefined, tone: 'quiet' },
-          ], { compactActions: true, lead: copy.lead, tone: act === 'discard' ? 'danger' : commits || act === 'rollback' ? 'warning' : undefined })
+          ], { compactActions: true, lead: act === 'discard' ? undefined : copy.lead, requiredDetails: act === 'discard' ? detail.length : undefined,
+            tone: act === 'discard' ? 'danger' : commits || act === 'rollback' ? 'warning' : undefined })
           if (!decision || !ctx.isIdle()) return
           const recoverConflict = async (conflict: PreviewConflict) => {
             const plan = conflict.plan
@@ -997,7 +1103,22 @@ export default function extension(pi: ExtensionAPI) {
               catch (error) { activeCtx.ui.notify(`Worktree 清理已停止：${message(error)}`, 'warning') }
             }
           }
-          if (leavesWorktree) {
+          if (act === 'discard') {
+            const text = ctx.ui.getEditorText()
+            await withLoading(ctx, '正在检查原对话…', () => data.validateLocalIdentity(task))
+            const moved = await switchTo(ctx, task.localSession, '正在返回原对话…', async next => {
+              switching = true
+              if (!isBoundSession(next, task.localSession) || !next.isIdle()) {
+                next.ui.notify('未进入预期的原对话，任务未放弃。', 'error')
+                return
+              }
+              if (text) restoreDraft(next, text)
+              try { await execute(next) }
+              catch (error) { next.ui.notify(message(error), 'error') }
+              finally { await next.sendUserMessage(`/${NAME} refresh`, { expandPromptTemplates: true }).catch(() => {}) }
+            })
+            if (moved.cancelled) throw new Error('Pi 取消了切换，任务未放弃。')
+          } else if (leavesWorktree) {
             // Move off the old cwd before cleanup, but keep the task transcript on
             // screen. This view blocks tools and prompt delivery until handoff.
             const leaf = ctx.sessionManager.getLeafId()
