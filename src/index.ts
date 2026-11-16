@@ -44,6 +44,14 @@ const progress: Record<Action, string> = {
 type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'scope' | 'recover' | 'close'
 const phases = { creating: '创建中断', working: '进行中', ready: '待验收', previewed: '已预览', delivered: '已交付', discarded: '已放弃' }
 const message = (e: unknown) => clean(e instanceof Error ? e.message : String(e))
+function taskSummary(text: string) {
+  // A pasted screenshot can precede the actual request, on the same line or above it.
+  const attachment = /^(?:@?(?:\/|~\/|\.\.?\/).+?\.(?:png|jpe?g|webp|gif|bmp|heic)|\[Image[^\]]*\])(?:\s+|$)/iu
+  const line = text.split(/\r?\n/u).map(line => line.trim().replace(attachment, '').trim()).find(Boolean)
+  if (!line) return undefined
+  const chars = Array.from(clean(line.replace(/\s+/gu, ' ')))
+  return chars.length > 48 ? `${chars.slice(0, 48).join('')}…` : chars.join('')
+}
 function sessionLink(ctx: ExtensionContext): SessionLink | undefined {
   const file = ctx.sessionManager.getSessionFile()
   if (file) return { file, id: ctx.sessionManager.getSessionId(), cwd: ctx.cwd }
@@ -142,7 +150,7 @@ async function isWorktreePath(root: string, path: string) {
 // Pi 1.5 keeps the origin of a first-message Worktree in memory. Publish its
 // own native header and entries, then reopen it so Pi knows the file is saved.
 // Do not substitute a new session, or add a fake chat message to force a flush.
-async function withSavedLocal(ctx: ExtensionCommandContext, run: (next: ExtensionCommandContext, send: (text: string) => unknown) => Promise<void>) {
+async function withSavedLocal(ctx: ExtensionCommandContext, run: (next: ExtensionCommandContext, send: (text: string) => unknown) => Promise<void>, initialName = '原对话 · Worktree 任务') {
   const source = sessionLink(ctx)
   if (!source) throw new Error('无有效的持久化 Pi 会话。')
   if (await existing(source.file)) { await run(ctx, () => {}); return }
@@ -158,7 +166,7 @@ async function withSavedLocal(ctx: ExtensionCommandContext, run: (next: Extensio
     const fd = await open(staged, 'wx', 0o600)
     try {
       await fd.writeFile(body)
-      if (!ctx.sessionManager.getSessionName()) SessionManager.open(staged).appendSessionInfo('原对话 · Worktree 任务')
+      if (!ctx.sessionManager.getSessionName()) SessionManager.open(staged).appendSessionInfo(initialName)
       await fd.sync()
     } finally { await fd.close() }
     const identity = await lstat(staged, { bigint: true })
@@ -190,16 +198,6 @@ async function withSavedLocal(ctx: ExtensionCommandContext, run: (next: Extensio
   } finally { await rm(stage, { recursive: true }) }
 }
 
-async function newSession(cwd: string, name: string): Promise<SessionLink> {
-  // Native Pi creates files lazily. Reserve its allocated path and let SessionManager.open
-  // initialize an empty persisted header, without submitting any prompt to a model.
-  const file = SessionManager.create(cwd).getSessionFile()!
-  const fd = await open(file, 'wx', 0o600)
-  await fd.close()
-  const sm = SessionManager.open(file, undefined, cwd)
-  sm.appendSessionInfo(name)
-  return { file, id: sm.getSessionId(), cwd: sm.getCwd() }
-}
 type HistoryProof = { historyHash: string; historyLines?: number }
 type HistoryView = HistoryProof & { priorId: string; returnTo: SessionLink; afterCommit?: true; leaf?: string }
 const hashHistory = (lines: string[]) => createHash('sha256').update(lines.join('\n')).digest('hex')
@@ -250,12 +248,12 @@ function matchesHistory(history: Awaited<ReturnType<typeof readHistory>>, proof:
   return n >= history.stateSuffixStart && n <= history.body.length && hashHistory(history.body.slice(0, n)) === proof.historyHash
 }
 
-// Publish a native child only after the full history and marker are written.
-async function copyHistory(cwd: string, source: SessionLink, body: string[], decorate: (sm: SessionManager) => void, sessionDir?: string): Promise<SessionLink> {
+// Publish a native child only after its header, history and metadata are written.
+async function createChildSession(cwd: string, parent: SessionLink, body: string[], decorate: (sm: SessionManager) => void, sessionDir?: string): Promise<SessionLink> {
   const dir = SessionManager.create(cwd, sessionDir).getSessionDir()
   const staging = await mkdtemp(join(dir, '.worktree-follow-up-'))
   try {
-    const child = SessionManager.create(cwd, staging, { parentSession: source.file })
+    const child = SessionManager.create(cwd, staging, { parentSession: parent.file })
     const path = child.getSessionFile()!
     const out = await open(path, 'wx', 0o600)
     try { await out.writeFile([JSON.stringify(child.getHeader()), ...body, ''].join('\n')) } finally { await out.close() }
@@ -265,8 +263,8 @@ async function copyHistory(cwd: string, source: SessionLink, body: string[], dec
     try { await copy.sync() } finally { await copy.close() }
     const file = join(dir, basename(path))
     await link(path, file)
-    const parent = await open(dir, 'r')
-    try { await parent.sync() } finally { await parent.close() }
+    const directory = await open(dir, 'r')
+    try { await directory.sync() } finally { await directory.close() }
     return { file, id: fork.getSessionId(), cwd: fork.getCwd() }
   } finally { await rm(staging, { recursive: true }) }
 }
@@ -281,7 +279,7 @@ async function makeHistoryView(data: TaskStore, task: Task, returnTo: SessionLin
   const dir = join(data.directory, HISTORY_DIR)
   await mkdir(dir, { recursive: true, mode: 0o700 })
   const proof: HistoryProof = { historyHash: hash, ...(delivery ? { historyLines: body.length } : {}) }
-  const target = await copyHistory(returnTo.cwd, source, body, sm => {
+  const target = await createChildSession(returnTo.cwd, source, body, sm => {
     if (leaf !== undefined) sm.branch(leaf)
     sm.appendSessionInfo(`${delivery ? 'Worktree · 任务对话' : '历史对话'} · ${task.review?.message ?? shortSessionName(task.id)}`)
     sm.appendCustomEntry(HISTORY_VIEW, { priorId: task.id, returnTo, ...proof, ...(delivery ? { afterCommit: true, leaf } : {}) } satisfies HistoryView)
@@ -322,17 +320,17 @@ function captureFollowUp(ctx: ExtensionContext, leaf: string | null): FollowUpHi
   return { body, leaf: parentOf.get(leaf) ?? null }
 }
 
-async function forkWorktreeSession(cwd: string, task: Task, prior: Task, view: HistoryView, inherited: FollowUpHistory): Promise<SessionLink> {
+async function forkWorktreeSession(cwd: string, task: Task, prior: Task, view: HistoryView, inherited: FollowUpHistory, name: string): Promise<SessionLink> {
   const source = prior.isolatedSession!
   const history = await readHistory(source)
   if (!matchesHistory(history, view) || (view.leaf !== undefined && !history.ids.has(view.leaf))) {
     throw new Error('原 Pi 会话在打开后已变化；请返回原对话后重新打开任务历史。')
   }
-  // Carry the read-only Q&A, but not the routing turn, which is replayed once
-  // in the new environment with its original text and attachments.
-  return copyHistory(cwd, source, inherited.body, fork => {
+  // Carry the read-only Q&A without the routing turn. Keep later rounds under
+  // their origin in Pi's picker, independently of where their history came from.
+  return createChildSession(cwd, task.localSession, inherited.body, fork => {
     if (inherited.leaf !== null) fork.branch(inherited.leaf)
-    fork.appendSessionInfo(shortSessionName(task.id))
+    fork.appendSessionInfo(name)
     fork.appendCustomMessageEntry(`${NAME}-follow-up`, [
       `New isolated task from Local's HEAD at creation (${task.baseOid}).`,
       `The prior task was ${prior.phase === 'delivered' ? 'delivered' : 'discarded'}.`,
@@ -772,6 +770,7 @@ export default function extension(pi: ExtensionAPI) {
   async function sendInNewWorktree(ctx: ExtensionCommandContext, { text, images, sessionId, inherited }: Draft) {
     let replaced = false
     const view = historyView
+    const summary = taskSummary(text)
     const create = async (current: ExtensionCommandContext, send: (text: string) => unknown) => {
       let entered = false
       try {
@@ -786,11 +785,19 @@ export default function extension(pi: ExtensionAPI) {
         const created = await withLoading(current, '正在创建 Worktree…', async () => {
           await validateSession(source)
           if (view && !inherited) throw new Error('缺少续接对话记录。')
-          return data.create(local, source, (path, task, prior) => prior && view && inherited
-            ? forkWorktreeSession(path, task, prior, view, inherited)
-            : newSession(path, shortSessionName(task.id)), view?.priorId)
+          return data.create(local, source, (path, task, prior) => {
+            const name = summary ? `Worktree · ${summary}` : shortSessionName(task.id)
+            return prior && view && inherited
+              ? forkWorktreeSession(path, task, prior, view, inherited, name)
+              : createChildSession(path, task.localSession, [], sm => sm.appendSessionInfo(name))
+          }, view?.priorId)
         })
         const target = created.isolatedSession!
+        if (!view && current === ctx && summary && !ctx.sessionManager.getSessionName()) {
+          // An already-persisted unnamed origin does not pass through the bootstrap above.
+          // A display-name write must not block entering an already-created task.
+          try { pi.setSessionName(`原对话 · ${summary}`) } catch { /* optional metadata */ }
+        }
         const result = await switchTo(current, target, '正在进入 Worktree…', async next => {
           entered = replaced = true
           try {
@@ -818,7 +825,7 @@ export default function extension(pi: ExtensionAPI) {
       else await withSavedLocal(ctx, async (current, send) => {
         if (current !== ctx) replaced = true
         await create(current, send)
-      })
+      }, summary ? `原对话 · ${summary}` : undefined)
     } catch (error) {
       if (!replaced) {
         restoreDraft(ctx, text)

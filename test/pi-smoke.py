@@ -77,7 +77,10 @@ export default function(pi) {
               revision ? { commitBody: "Apply the requested revision.\\n\\n- Keep unrelated files out." } : {}),
             files: text === "Edit with overbroad review." ? ["task.txt", ".pi/loops.json"] : ["task.txt", ...extra],
           })]; break;
-          case "read": content = say("Explained without edits."); break;
+          case "read": content = say(text === 'Read from resumed Worktree.'
+            ? last.content.some(part => part.type === 'text' && part.text.trim() === 'task edit')
+              ? 'Read isolated task content.' : 'Read the wrong checkout.'
+            : 'Explained without edits.'); break;
           case "write": content = say(last.isError ? "Write was blocked." : "Unexpected write."); break;
           case "worktree_begin_revision": content = last.isError ? say(text === "Revise after Local drift." ? "Revision blocked by Local drift." : "Revision stopped.") : [edit()]; break;
           default: content = say(last.isError ? "Review failed." : recover ? "Conflict resolved in Worktree." : revision ? "Revision ready." : "Worktree ready.");
@@ -88,7 +91,7 @@ export default function(pi) {
       else if (revision) content = [revise()];
       else if (text === "Try a parallel write.") content = [revise(), badWrite()];
       else if (text === "Try to write during review.") content = [badWrite()];
-      else if (text === "Explain the change.") content = [tool("read", {path:"task.txt"})];
+      else if (text === "Explain the change." || text === 'Read from resumed Worktree.') content = [tool("read", {path:"task.txt"})];
       else if (text === 'Could we change this?') content = say('Discussed without starting a task.');
       else if (text?.startsWith("Follow up from ") && routesHistory) content = [tool('worktree_start_follow_up')];
       else if (text?.startsWith("Follow up from ")) {
@@ -118,7 +121,7 @@ export default function(pi) {
 
 
 class Pi:
-    def __init__(self, cwd, agent, provider, theme='dark', cols=COLS, rows=ROWS, session=None, git_bin=None):
+    def __init__(self, cwd, agent, provider, theme='dark', cols=COLS, rows=ROWS, session=None, git_bin=None, resume=False):
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
         settings_path = agent / 'settings.json'
@@ -135,7 +138,7 @@ class Pi:
                              '--provider', 'wtp-smoke', '--model', 'model', *extension, '-e', str(provider),
                              '--prompt-template', str(provider.with_name('smoke-task.md')),
                              '--skill', str(provider.with_name('smoke-worktree') / 'SKILL.md'),
-                             *(['--session', str(session)] if session else [])])
+                             *(['--session', str(session)] if session else []), *(['-r'] if resume else [])])
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, cols, 0, 0))
 
     def dump(self):
@@ -257,6 +260,10 @@ def main():
         def task():
             return tasks()[-1]
 
+        def user_prompt_count(file, text):
+            entries = map(json.loads, Path(file).read_text().splitlines())
+            return sum(e['type'] == 'message' and e['message']['role'] == 'user' and text in json.dumps(e['message']) for e in entries)
+
         kickoff = 'Edit task.txt and mark ready.'
         git('switch', '--detach', '--quiet')
         with Pi(local, agent, provider) as pi:
@@ -290,8 +297,8 @@ def main():
             pi.until('Worktree ready.')
             first_path = Path(task()['isolatedPath'])
             assert first_path.is_dir()
-            assert Path(task()['isolatedSession']['file']).read_text().count(kickoff) == 1
-            assert kickoff not in Path(task()['localSession']['file']).read_text()
+            assert user_prompt_count(task()['isolatedSession']['file'], kickoff) == 1
+            assert user_prompt_count(task()['localSession']['file'], kickoff) == 0
             deadline = time.monotonic() + 25
             while task()['phase'] != 'ready' and time.monotonic() < deadline:
                 pi.read()
@@ -300,6 +307,27 @@ def main():
             assert (local / 'task.txt').read_text() == 'base\n'
         print('real Pi: checkbox delayed creation; unchecked send stayed Local; checked draft sent only once in Worktree', flush=True)
         origin = task()['localSession']['file']
+        first_session = Path(task()['isolatedSession']['file'])
+        header = json.loads(first_session.read_text().splitlines()[0])
+        assert header['parentSession'] == origin and header['cwd'] == str(first_path)
+        with Pi(local, agent, provider, cols=230, resume=True) as pi:
+            pi.until('Resume Session (Current Folder)')
+            pi.until(f'原对话 · {kickoff}')
+            assert f'Worktree · {kickoff}' not in pi.dump()
+            pi.send(b'\t')
+            pi.until('Resume Session (All)')
+            _, parent_y = pi.until(f'原对话 · {kickoff}')
+            _, child_y = pi.until(f'└─ Worktree · {kickoff}')
+            assert child_y == parent_y + 1, pi.dump()
+            pi.send(f'"Worktree · {kickoff}"'.encode())
+            pi.until('› Worktree · ' + kickoff)
+            pi.send(b'\r')
+            pi.until('Worktree · 待验收')
+            pi.until(str(first_path))
+            pi.send(b'Read from resumed Worktree.\r')
+            pi.until('Read isolated task content.')
+            assert task()['isolatedSession']['file'] == str(first_session)
+        print('real Pi: startup -r shows the native child in All / Threaded and resumes the isolated cwd', flush=True)
         with Pi(local, agent, provider) as unrelated:
             before = tasks()
             unrelated.until('[ ] 新建 Worktree')
@@ -589,9 +617,9 @@ def main():
             child = Path(follow['isolatedSession']['file'])
             header = json.loads(child.read_text().splitlines()[0])
             assert len(tasks()) == 2 and tasks()[0] == first and follow['followUpOf'] == first['id']
-            assert header['parentSession'] == str(isolated_session) and header['cwd'] == str(follow_path)
+            assert header['parentSession'] == follow['localSession']['file'] and header['cwd'] == str(follow_path)
             assert header['id'] != first['isolatedSession']['id'] and isolated_session.read_bytes() == first_history
-            assert child.read_text().count('Follow up from delivery.') == 1
+            assert user_prompt_count(child, 'Follow up from delivery.') == 1
             assert 'Discussed without starting a task.' in child.read_text()
             assert 'worktree_start_follow_up' not in child.read_text()
             assert 'Follow up from delivery.' not in Path(follow['localSession']['file']).read_text()
@@ -640,8 +668,11 @@ def main():
             pi.until('Worktree · 进行中')
             pi.until('Acknowledged without edits.')
             second_path = Path(task()['isolatedPath'])
-            assert Path(task()['isolatedSession']['file']).read_text().count(image_prompt) == 1
-            assert image_prompt not in Path(task()['localSession']['file']).read_text()
+            image_session = task()['isolatedSession']['file']
+            image_entries = map(json.loads, Path(image_session).read_text().splitlines())
+            assert [e['name'] for e in image_entries if e['type'] == 'session_info'][-1] == 'Worktree · Open a task to discard.'
+            assert user_prompt_count(image_session, image_prompt) == 1
+            assert user_prompt_count(task()['localSession']['file'], image_prompt) == 0
             (second_path / 'discard.txt').write_text('discarded')
             pi.click('⋯ 更多')
             pi.click('[ 放弃任务 ]')
@@ -694,7 +725,10 @@ def main():
             assert old_file.read_bytes() == without_newline and not second_path.exists()
             assert not (Path(next_task['isolatedPath']) / 'discard.txt').exists()
             retried = Path(next_task['isolatedSession']['file']).read_text()
-            assert retried.count('Follow up from discard.') == 1 and 'worktree_start_follow_up' not in retried
+            retried_header, *retried_entries = map(json.loads, retried.splitlines())
+            assert retried_header['parentSession'] == next_task['localSession']['file']
+            assert [e['name'] for e in retried_entries if e['type'] == 'session_info'][-1] == 'Worktree · Follow up from discard.'
+            assert user_prompt_count(next_task['isolatedSession']['file'], 'Follow up from discard.') == 1 and 'worktree_start_follow_up' not in retried
             assert 'Follow up from discard.' not in Path(next_task['localSession']['file']).read_text()
             print('real Pi: discarded history survived cleanup; missing source stopped safely and retried without sending to Local', flush=True)
 
@@ -729,7 +763,9 @@ def main():
             pi.send(b'\r')
             pi.until('Worktree ready.', 40)
             assert task()['localSession']['id'] == original_id
-            assert kickoff not in Path(task()['localSession']['file']).read_text()
+            local_entries = list(map(json.loads, Path(task()['localSession']['file']).read_text().splitlines()))
+            assert [entry['name'] for entry in local_entries if entry['type'] == 'session_info'][-1] == f'原对话 · {kickoff}'
+            assert user_prompt_count(task()['localSession']['file'], kickoff) == 0
             pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
@@ -1054,10 +1090,10 @@ exec {real_git} "$@"
                     assert not isolated.exists() and source.read_bytes() == saved
                     assert (Path(next_task['isolatedPath']) / 'latest.txt').read_text() == 'post-delivery HEAD\n'
                     assert (Path(next_task['isolatedPath']) / 'user.txt').read_text() == 'user base\n'
-                    continuation = Path(next_task['isolatedSession']['file']).read_text()
-                    assert continuation.count('Follow up from delivery.') == 1
-                    assert 'smoke-shutdown-state' not in continuation
-                    assert 'Follow up from delivery.' not in Path(next_task['localSession']['file']).read_text()
+                    continuation = Path(next_task['isolatedSession']['file'])
+                    assert user_prompt_count(continuation, 'Follow up from delivery.') == 1
+                    assert 'smoke-shutdown-state' not in continuation.read_text()
+                    assert user_prompt_count(next_task['localSession']['file'], 'Follow up from delivery.') == 0
         print('real Pi: direct commit from either side; Worktree transcript remains, and follow-up uses latest HEAD after cleanup', flush=True)
 
         for prompt, response, expanded in [
