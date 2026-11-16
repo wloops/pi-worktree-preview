@@ -3,6 +3,7 @@ import { Type } from 'typebox'
 import { createHash, randomUUID } from 'node:crypto'
 import { link, lstat, mkdir, mkdtemp, open, realpath, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { MAX_COMMIT_BODY } from './commit-message.ts'
 import { checkout, PreviewConflict, shortSessionName, TaskStore, type Action, type SessionLink, type Task } from './store.ts'
 import { clean, pick, toolbar, withLoading, type Choice, type ToolbarChoice } from './ui.ts'
 
@@ -89,7 +90,7 @@ async function chooseReviewFiles(ctx: ExtensionContext, files: readonly string[]
 }
 
 function phaseLabel(isolated: boolean, task?: Task) {
-  const scope = isolated ? 'Worktree' : '项目目录'
+  const scope = isolated ? 'Worktree' : '原对话'
   if (!task) return scope
   const phase = task.journal ? '恢复记录：已停止' : phases[task.phase]
   return `${scope} · ${isolated ? '' : 'Worktree '}${phase}`
@@ -157,7 +158,7 @@ async function withSavedLocal(ctx: ExtensionCommandContext, run: (next: Extensio
     const fd = await open(staged, 'wx', 0o600)
     try {
       await fd.writeFile(body)
-      if (!ctx.sessionManager.getSessionName()) SessionManager.open(staged).appendSessionInfo('项目目录 · Worktree 任务')
+      if (!ctx.sessionManager.getSessionName()) SessionManager.open(staged).appendSessionInfo('原对话 · Worktree 任务')
       await fd.sync()
     } finally { await fd.close() }
     const identity = await lstat(staged, { bigint: true })
@@ -751,7 +752,8 @@ export default function extension(pi: ExtensionAPI) {
   pi.registerTool({
     name: TOOL, label: '标记待验收', executionMode: 'sequential', description: 'Mark the current managed Worktree ready for user review. Does not write to Local or commit. Call after edits and tests.',
     parameters: Type.Object({
-      commitMessage: Type.String({ description: 'A one-line commit title (1–200 characters).' }),
+      commitMessage: Type.String({ description: 'A one-line commit title (1–200 characters). Follow the language of the current task conversation, not UI labels, tool output, or automatic recovery instructions. Honor any explicit title or language requested by the user.' }),
+      commitBody: Type.Optional(Type.String({ maxLength: MAX_COMMIT_BODY, description: 'Optional commit body, without the title. Add only necessary details, such as why the change was made, important behavior, or compatibility impact. Use the title language unless the user requests otherwise. Omit when the title is enough.' })),
       files: Type.Array(Type.String(), { minItems: 1, description: 'Exact repo-relative paths intentionally changed for this task, including deletions and both sides of a rename. Exclude unrelated runtime state and test artifacts.' }),
     }),
     async execute(_id, params, signal, _update, ctx) {
@@ -760,7 +762,8 @@ export default function extension(pi: ExtensionAPI) {
       const link = sessionLink(ctx)
       if (!state.isolated || !link) throw new Error('只能在受管 Worktree 的原始 Pi 会话中标记待验收。')
       const id = state.isolated.id
-      const review = await withLoading(ctx, '正在标记待验收…', () => state.data.markReady(id, link, params.commitMessage, params.files))
+      const review = await withLoading(ctx, '正在标记待验收…', () =>
+        state.data.markReady(id, link, params.commitMessage, params.files, { body: params.commitBody }))
       await refresh(ctx)
       return { content: [{ type: 'text', text: `已标记待验收（${review.files.length} 个文件）；未修改项目目录。可点击「预览改动」。` }], details: { reviewId: review.id } }
     },
@@ -996,7 +999,9 @@ export default function extension(pi: ExtensionAPI) {
           const files = await chooseReviewFiles(ctx, candidates, false)
           if (!files || !ctx.isIdle()) return
           await withLoading(ctx, '正在标记待验收…', () =>
-            data.markReady(isolated.id, link, isolated.review?.message ?? 'Worktree task changes', files))
+            data.markReady(isolated.id, link, isolated.review?.message ?? 'Worktree task changes', files, {
+              body: isolated.review?.body, expectedReview: { id: isolated.review?.id },
+            }))
           ctx.ui.notify('已标记待验收；未修改项目目录。', 'info')
         } else if (choice === 'scope' && task?.review && task.isolatedSession) {
           const files = await chooseReviewFiles(ctx, task.review.files, true)
@@ -1024,13 +1029,16 @@ export default function extension(pi: ExtensionAPI) {
           if (act === 'discard') detail.unshift(copy.lead)
           if (leavesWorktree) detail.push('提交后保留当前对话。')
           if (partial) detail.push('清单外有改动，将保留 Worktree。')
-          if (commits) detail.push(...relevantFiles.map(path => `• ${JSON.stringify(path)}`))
+          if (commits) {
+            if (task.review?.body) detail.push('提交正文：', ...task.review.body.split('\n').map(line => line.replaceAll('\t', '    ')), '')
+            detail.push(...relevantFiles.map(path => `• ${JSON.stringify(path)}`))
+          }
           const decision = await pick<'execute' | 'keep' | undefined>(ctx, copy.title, detail, [
             { label: partial ? '提交并保留' : copy.button, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
             ...(commits && !partial ? [{ label: '提交并保留', value: 'keep' as const }] : []),
             { label: '取消', value: undefined, tone: 'quiet' },
           ], { compactActions: true, lead: act === 'discard' ? undefined : copy.lead, requiredDetails: act === 'discard' ? detail.length : undefined,
-            tone: act === 'discard' ? 'danger' : commits || act === 'rollback' ? 'warning' : undefined })
+            requireDetailViewport: commits, tone: act === 'discard' ? 'danger' : commits || act === 'rollback' ? 'warning' : undefined })
           if (!decision || !ctx.isIdle()) return
           const recoverConflict = async (conflict: PreviewConflict) => {
             const plan = conflict.plan

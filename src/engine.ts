@@ -977,8 +977,8 @@ async function createUserCommit(
 ): Promise<string> {
   return stdoutText(await runGit(
     checkoutPath,
-    ['commit-tree', treeOid, '-p', parentOid],
-    { input: `${commitMessage.trim()}\n` },
+    ['-c', 'i18n.commitEncoding=UTF-8', 'commit-tree', treeOid, '-p', parentOid],
+    { input: `${commitMessage}\n` },
   ))
 }
 

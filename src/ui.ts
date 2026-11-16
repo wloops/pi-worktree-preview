@@ -5,7 +5,7 @@ export const clean = (text: string) => text.replace(/[\p{Cc}\p{Cf}]/gu, '?')
 
 type Tone = 'primary' | 'danger' | 'quiet'
 export interface Choice<T> { label: string; value: T; tone?: Tone; toggle?: () => void }
-type PanelOptions = { tone?: 'warning' | 'danger'; signal?: AbortSignal; requiredDetails?: number; lead?: string; compactActions?: boolean }
+type PanelOptions = { tone?: 'warning' | 'danger'; signal?: AbortSignal; requiredDetails?: number; requireDetailViewport?: boolean; lead?: string; compactActions?: boolean }
 export type ToolbarChoice<T> = Choice<T> & { trailing?: boolean; checked?: boolean }
 
 const light = {
@@ -87,7 +87,7 @@ export function toolbar<T>(
 }
 
 export async function pick<T>(ctx: ExtensionContext, title: string, detail: string[], choices: Choice<T>[], options: PanelOptions = {}): Promise<T | undefined> {
-  const { signal, tone, requiredDetails = 0, lead, compactActions = false } = options
+  const { signal, tone, requiredDetails = 0, requireDetailViewport = false, lead, compactActions = false } = options
   if (!choices.length || signal?.aborted) return
   return ctx.ui.custom<T | undefined>((tui, theme, keys, done) => {
     let finished = false
@@ -165,8 +165,9 @@ export async function pick<T>(ctx: ExtensionContext, title: string, detail: stri
         const required = showLead ? headline : wrap(detail.slice(0, requiredDetails))
         const paragraphs = wrap(detail.slice(requiredDetails))
         const labelCols = Math.max(1, inner - (inner > 10 ? 7 : 0))
-        tooSmall = requiredDetails > 0 && (required.length + choices.length > budget ||
-          choices.some(({ label }) => visibleWidth(clean(label)) > labelCols))
+        tooSmall = (requiredDetails > 0 && required.length + choices.length > budget) ||
+          (requireDetailViewport && (!footer || budget - required.length < 2)) ||
+          ((requiredDetails > 0 || requireDetailViewport) && choices.some(({ label }) => visibleWidth(clean(label)) > labelCols))
         const fixed = tooSmall ? ['请放大终端后再确认。'].slice(0, budget - 1) : required
         const room = budget - fixed.length
         // Keep the deletion warning and target pinned; extra context scrolls independently.

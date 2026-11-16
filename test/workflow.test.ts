@@ -37,8 +37,8 @@ async function fixture(t: TestContext, engine?: typeof createSessionCheckoutAppl
     phase: current.phase, reviewId: current.review?.id, previewId: current.receipt?.previewId, revision,
     discardFingerprint: action === 'discard' ? await store.discardFingerprint(current) : undefined,
   })
-  const ready = async (files?: string[]) => store.markReady(task.id, task.isolatedSession!, 'Task only',
-    files ?? await store.reviewCandidates(await latest()))
+  const ready = async (files?: string[], body?: string) => store.markReady(task.id, task.isolatedSession!, 'Task only',
+    files ?? await store.reviewCandidates(await latest()), { body })
   return { dir, local, isolated, store, base, latest, act, ready, task }
 }
 
@@ -56,7 +56,8 @@ test('journaled preview, rollback, re-preview and task-only commit preserve Loca
   const status = await git(local, 'status', '--porcelain=v1')
   const staged = await git(local, 'diff', '--cached')
   const unstaged = await git(local, 'diff')
-  await ready()
+  const body = 'Retain user changes.\n\n- Include the binary artifact.\n- Keep staged and unstaged layers separate.'
+  await ready(undefined, body)
   assert.equal(await git(local, 'status', '--porcelain=v1'), status)
   const preview = await act('preview', await latest())
   assert.equal(preview.phase, 'previewed')
@@ -68,6 +69,7 @@ test('journaled preview, rollback, re-preview and task-only commit preserve Loca
   const rolled = await act('rollback', await latest())
   assert.equal(rolled.phase, 'ready')
   assert.equal(rolled.review?.id, preview.review?.id)
+  assert.equal(rolled.review?.body, body)
   assert.equal(await git(local, 'status', '--porcelain=v1'), status)
   assert.equal(await git(local, 'diff'), unstaged)
   assert.equal(await git(local, 'diff', '--cached'), staged)
@@ -77,12 +79,39 @@ test('journaled preview, rollback, re-preview and task-only commit preserve Loca
   assert.equal(delivered.phase, 'delivered')
   assert.equal(delivered.cleanup?.status, 'done')
   assert.equal(await exists(isolated), false)
-  assert.equal(await git(local, 'show', '-s', '--format=%s'), 'Task only\n')
+  assert.equal((await git(local, 'show', '-s', '--format=%B')).trimEnd(), `Task only\n\n${body}`)
   assert.equal(await git(local, 'show', '--format=', '--name-only'), 'bin.dat\ntask.txt\n')
   assert.equal(await git(local, 'diff', '--cached'), staged)
   assert.equal(await git(local, 'diff'), unstaged)
   assert.equal(await content(local, 'user.txt'), 'untracked content\n')
   assert.equal(await exists(store.lockPath), false)
+})
+
+test('commit body validation and review updates preserve the confirmed message', async t => {
+  const f = await fixture(t)
+  const session = f.task.isolatedSession!
+  const both = ['task.txt', 'extra.txt']
+  await writeFile(join(f.isolated, 'task.txt'), 'task edit\n')
+  await writeFile(join(f.isolated, 'extra.txt'), 'extra edit\n')
+  for (const body of ['bad\0body', '\x1b[32m', 'x'.repeat(4001)]) {
+    await assert.rejects(f.ready(both, body), /提交正文/)
+    assert.equal((await f.latest()).phase, 'working')
+  }
+  const blank = await f.ready(both, ' \r\n\t ')
+  assert.equal(blank.body, undefined)
+  const stale = await f.latest()
+  const current = await f.ready(both, '- Necessary detail.')
+  assert.notEqual(current.id, blank.id)
+  await assert.rejects(f.act('commit_ready', stale), /状态已变化/)
+  await assert.rejects(f.store.markReady(f.task.id, session, blank.message, both, {
+    body: blank.body, expectedReview: { id: blank.id },
+  }), /待验收记录已变化/)
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
+  const narrowed = await f.store.restrictReview(f.task.id, session, current.id, ['task.txt'])
+  assert.equal(narrowed.body, current.body)
+  await f.act('commit_ready', await f.latest())
+  assert.equal((await git(f.local, 'show', '-s', '--format=%B')).trimEnd(), 'Task only\n\n- Necessary detail.')
+  assert.equal(await exists(join(f.local, 'extra.txt')), false)
 })
 
 test('explicit review paths exclude unrelated working, staged and committed files and preserve them on delivery', async t => {
@@ -734,7 +763,10 @@ test('direct commit delivers exactly the frozen files on current Local HEAD and 
   await writeFile(join(f.isolated, 'task.txt'), 'only task edit\n')
   const binary = Buffer.from([0, 1, 0xff, 0x80])
   await writeFile(join(f.isolated, 'binary.dat'), binary)
-  await f.ready()
+  await git(f.local, 'config', 'i18n.commitEncoding', 'ISO-8859-1')
+  await f.store.markReady(f.task.id, f.task.isolatedSession!, '更新交付文件', ['task.txt', 'binary.dat'], {
+    body: '\r\n保留已有的本地改动。\r\n\r\n- 包含二进制产物。\r\n',
+  })
   const [status, staged, unstaged] = await Promise.all([
     git(f.local, 'status', '--porcelain'), git(f.local, 'diff', '--cached'), git(f.local, 'diff'),
   ])
@@ -745,7 +777,8 @@ test('direct commit delivers exactly the frozen files on current Local HEAD and 
   assert.equal(done.journal, undefined)
   assert.equal(await exists(f.isolated), false)
   assert.equal(await git(f.local, 'rev-parse', 'HEAD^'), head)
-  assert.equal(await git(f.local, 'show', '-s', '--format=%s'), 'Task only\n')
+  assert.equal((await git(f.local, 'show', '--encoding=UTF-8', '-s', '--format=%B')).trimEnd(),
+    '更新交付文件\n\n保留已有的本地改动。\n\n- 包含二进制产物。')
   assert.equal(await git(f.local, 'show', '--format=', '--name-only'), 'binary.dat\ntask.txt\n')
   assert.deepEqual(await readFile(join(f.local, 'binary.dat')), binary)
   assert.equal(await git(f.local, 'status', '--porcelain'), status)
@@ -849,7 +882,7 @@ test('direct commit preserves recovery evidence and does not auto-undo a changed
     await writeFile(join(f.local, 'task.txt'), 'external concurrent edit\n')
   } }))
   await writeFile(join(f.isolated, 'task.txt'), 'task content\n')
-  await f.ready()
+  await f.ready(undefined, 'Persist the exact approved commit.')
   const index = await readFile(join(f.local, '.git/index'))
   await assert.rejects(f.act('commit_ready', await f.latest()), /未能确认直接提交完成.*恢复记录/)
   assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
@@ -862,6 +895,8 @@ test('direct commit preserves recovery evidence and does not auto-undo a changed
   assert.ok(pending.journal?.indexBefore && pending.journal?.indexAfter)
   assert.deepEqual(await readFile(pending.journal.indexBefore), index)
   assert.equal(await git(f.local, 'show', `${pending.journal.commitOid}:task.txt`), 'task content\n')
+  assert.equal((await git(f.local, 'show', '-s', '--format=%B', pending.journal.commitOid)).trimEnd(),
+    'Task only\n\nPersist the exact approved commit.')
   assert.ok(await exists(pending.journal.indexAfter))
   assert.ok(await exists(f.isolated))
   assert.equal(await exists(join(f.local, '.git/index.lock')), false)

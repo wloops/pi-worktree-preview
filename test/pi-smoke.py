@@ -63,13 +63,19 @@ export default function(pi) {
       const declared = getCurrentTools(context.messages.filter(message => message.role === 'system'));
       const routesHistory = declared.some(tool => tool.name === 'worktree_start_follow_up');
       const runtime = text === "Edit with runtime state." || text === "Edit with overbroad review.";
-      const extra = text === "Edit many files." ? Array.from({length: 32}, (_, i) => `extra-${String(i + 1).padStart(2, '0')}.txt`) : [];
+      const chineseTask = text === "修改 task.txt，并新增 32 个文件。";
+      const titleGuidance = declared.find(tool => tool.name === "worktree_ready_for_review")?.parameters.properties.commitMessage.description ?? "";
+      const localizedTitle = titleGuidance.includes("language of the current task conversation") && titleGuidance.includes("explicit title or language requested by the user");
+      const extra = chineseTask ? Array.from({length: 32}, (_, i) => `extra-${String(i + 1).padStart(2, '0')}.txt`) : [];
       const edit = () => tool("bash", {command:`printf '${revision ? (text === "Revise before preview." ? "ready revision" : "previewed revision") : "task edit"}\\\\n' > task.txt${runtime ? " && mkdir -p .pi && printf isolated > .pi/loops.json" : ""}${extra.map(path => ` && touch ${path}`).join('')}`});
       let content;
       if (last?.role === "toolResult") {
         switch (last.toolName) {
           case "bash": content = last.isError ? say("Worktree command failed.") : [tool("worktree_ready_for_review", {
-            commitMessage:"Isolated smoke change", files: text === "Edit with overbroad review." ? ["task.txt", ".pi/loops.json"] : ["task.txt", ...extra],
+            commitMessage:chineseTask && localizedTitle ? "更新任务文件" : "Isolated smoke change",
+            ...(chineseTask ? { commitBody: "保留项目原有改动。\\n\\n- 补齐验收用例。" } :
+              revision ? { commitBody: "Apply the requested revision.\\n\\n- Keep unrelated files out." } : {}),
+            files: text === "Edit with overbroad review." ? ["task.txt", ".pi/loops.json"] : ["task.txt", ...extra],
           })]; break;
           case "read": content = say("Explained without edits."); break;
           case "write": content = say(last.isError ? "Write was blocked." : "Unexpected write."); break;
@@ -316,7 +322,7 @@ def main():
         print('real Pi: fresh Local shows the create checkbox without exposing another session’s active task', flush=True)
         for theme, cols, rows in [('light', 110, 35), ('dark', 42, 11)]:
             with Pi(local, agent, provider, theme, cols, rows, session=origin) as pi:
-                pi.until('项目目录 · Worktree 待验收')
+                pi.until('原对话 · Worktree 待验收')
                 action_x, action_y = pi.until('[ 预览改动 ]')
                 assert '预览只写入项目目录' not in pi.dump()
                 primary = pi.screen.buffer[action_y - 1][action_x - 1]
@@ -363,7 +369,7 @@ def main():
                 assert git('rev-parse', 'HEAD') == head and task()['phase'] == 'ready'
         print('real Pi: phase and primary-action contrast, hit targets and keyboard cancellation in light and narrow dark terminals', flush=True)
         with Pi(local, agent, provider, session=origin) as pi:
-            pi.until('项目目录 · Worktree 待验收')
+            pi.until('原对话 · Worktree 待验收')
             pi.click('⋯ 更多')
             pi.click('[ 进入 / 恢复 Worktree ]')
             pi.until('Worktree · 待验收')
@@ -442,7 +448,7 @@ def main():
             pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
             pi.click('[ 打开项目目录检查 ]')
-            pi.until('项目目录 · Worktree 已预览')
+            pi.until('原对话 · Worktree 已预览')
             pi.until('[ 撤回预览 ]')
             pi.until('[ 确认提交 ]')
             pi.click('⋯ 更多')
@@ -453,6 +459,9 @@ def main():
             pi.click('[ 确认提交 ]')
             pi.until('只提交任务改动。')
             pi.until('提交标题：Isolated smoke change')
+            pi.until('提交正文：')
+            pi.until('Apply the requested revision.')
+            pi.until('- Keep unrelated files out.')
             pi.until('• "task.txt"')
             assert '• ".pi/loops.json"' not in pi.dump()
             pi.click('[ 提交并安全清理 ]')
@@ -481,7 +490,7 @@ def main():
             (local / '.pi/loops.json').write_text('Local loop edited before finalizing')
             pi.click('[ 确认提交 ]')
             pi.click('[ 提交并安全清理 ]')
-            pi.until('未能安全清理 Worktree')
+            pi.until('未能安全清理 Worktree', 60)
             state_on_exit.unlink()
             assert isolated_session.read_text().count('"customType":"smoke-shutdown-state"') == 2
             pi.click('[ 保留 Worktree ]')
@@ -489,7 +498,8 @@ def main():
             pi.until('Revision ready.')
             assert '[ ] 新建 Worktree' not in pi.dump()
             pi.click('[ 返回原对话 ]')
-            pi.until('项目目录 · Worktree 已交付')
+            pi.until('原对话 · Worktree 已交付')
+            assert git('log', '-1', '--format=%B') == 'Isolated smoke change\n\nApply the requested revision.\n\n- Keep unrelated files out.'
             assert git('show', '--format=', '--name-only') == 'task.txt'
             assert git('status', '--porcelain') == baseline
             assert task()['cleanup']['status'] == 'retained' and not task()['cleanup'].get('requested')
@@ -519,7 +529,7 @@ def main():
                 assert first_path.is_dir()
                 other.click('⋯ 更多')
                 other.click('[ 返回原对话 ]')
-                other.until('项目目录 · Worktree 已交付')
+                other.until('原对话 · Worktree 已交付')
                 inspect_removal()
                 pi.until('强删将永久移除此目录')
                 pi.until('目标目录：')
@@ -591,7 +601,7 @@ def main():
             assert (follow_path / 'user.txt').read_text() == 'original\n' and not (follow_path / '.pi/loops.json').exists()
             pi.click('⋯ 更多')
             pi.click('[ 返回原对话 ]')
-            pi.until('项目目录 · Worktree 进行中')
+            pi.until('原对话 · Worktree 进行中')
             pi.click('⋯ 更多')
             pi.until('Worktree · 更多')
             assert '[ 放弃任务 ]' not in pi.dump()
@@ -614,7 +624,7 @@ def main():
             pi.click('⋯ 更多')
             pi.click('[ 放弃任务 ]')
             pi.click('[ 放弃 ]')
-            pi.until('项目目录 · Worktree 已放弃')
+            pi.until('原对话 · Worktree 已放弃')
             assert not follow_path.exists()
             print('real Pi: history questions stayed read-only; edits continued at latest HEAD; Worktree-only discard canceled safely', flush=True)
 
@@ -636,7 +646,7 @@ def main():
             pi.click('⋯ 更多')
             pi.click('[ 放弃任务 ]')
             pi.click('[ 放弃 ]')
-            pi.until('项目目录 · Worktree 已放弃')
+            pi.until('原对话 · Worktree 已放弃')
             assert not second_path.exists()
             assert not (local / 'discard.txt').exists()
             print('real Pi: extension command stayed Local; path-prefixed read-only request went to Worktree, then safely discarded', flush=True)
@@ -750,7 +760,7 @@ def main():
             pi.until('Worktree ready.')
             pi.click('⋯ 更多')
             pi.click('[ 返回原对话 ]')
-            pi.until('项目目录 · Worktree 已交付')
+            pi.until('原对话 · Worktree 已交付')
             print('real Pi: explicit retention with absent Local index; environment and session reopen after restart', flush=True)
 
         local = base / 'conflict-local'
@@ -779,7 +789,7 @@ def main():
             assert git('status', '--porcelain') == '?? untracked.txt'
             pi.click('⋯ 更多')
             pi.click('[ 返回原对话 ]')
-            pi.until('项目目录 · Worktree 待验收')
+            pi.until('原对话 · Worktree 待验收')
             pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
             pi.click('[ 让 Agent 解决冲突 ]')
@@ -922,24 +932,29 @@ exec {real_git} "$@"
             with Pi(local, agent, provider, git_bin=git_bin) as pi:
                 pi.click('[ ] 新建 Worktree')
                 pi.until('[x] 新建 Worktree')
-                pi.send((kickoff if from_worktree else 'Edit many files.').encode() + b'\r')
+                pi.send((kickoff if from_worktree else '修改 task.txt，并新增 32 个文件。').encode() + b'\r')
+                expected_title = 'Isolated smoke change' if from_worktree else '更新任务文件'
                 pi.until('Worktree ready.', 40)
                 before = task()
                 isolated = Path(before['isolatedPath'])
                 if not from_worktree:
                     pi.click('⋯ 更多')
                     pi.click('[ 返回原对话 ]')
-                    pi.until('项目目录 · Worktree 待验收')
+                    pi.until('原对话 · Worktree 待验收')
                 assert '跳过预览，直接提交' not in pi.dump(), 'direct commit is menu-only'
                 pi.click('⋯ 更多')
                 pi.click('[ 跳过预览，直接提交 ]')
                 pi.until('跳过预览，直接提交？')
                 pi.until('写入项目目录并提交。')
-                pi.until('提交标题：Isolated smoke change')
+                pi.until(f'提交标题：{expected_title}')
                 if from_worktree:
                     pi.until('项目目录 · 1 个文件')
+                    assert '提交正文：' not in pi.dump()
                 else:
                     pi.until('项目目录 · 33 个文件')
+                    pi.until('提交正文：')
+                    pi.until('保留项目原有改动。')
+                    pi.until('- 补齐验收用例。')
                     pi.until('• "extra-01.txt"')
                     assert '• "task.txt"' not in pi.dump()
                     pi.click('详情 1–')
@@ -1000,14 +1015,15 @@ exec {real_git} "$@"
                         assert 'Do not send during delivery.' not in Path(before['localSession']['file']).read_text()
                 finally:
                     gate.unlink()
-                pi.until('已交付 · 只读对话' if from_worktree else '项目目录 · Worktree 已交付')
+                pi.until('已交付 · 只读对话' if from_worktree else '原对话 · Worktree 已交付', 60)
                 pi.until_gone('正在直接提交')
                 done = task()
                 assert done['phase'] == 'delivered' and not done.get('receipt') and not done.get('journal')
                 assert done['cleanup']['status'] == ('done' if from_worktree else 'retained')
                 assert isolated.is_dir() != from_worktree
                 assert git('rev-parse', 'HEAD^') == head
-                assert git('log', '-1', '--format=%s') == 'Isolated smoke change'
+                assert git('log', '-1', '--format=%B') == (expected_title if from_worktree else
+                    expected_title + '\n\n保留项目原有改动。\n\n- 补齐验收用例。')
                 assert git('show', '--format=', '--name-only').splitlines() == (
                     ['task.txt'] if from_worktree else [*(f'extra-{i:02}.txt' for i in range(1, 33)), 'task.txt'])
                 assert (local / 'task.txt').read_text() == 'task edit\n'

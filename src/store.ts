@@ -2,12 +2,13 @@ import { createHash, randomUUID } from 'node:crypto'
 import { constants, type BigIntStats } from 'node:fs'
 import { lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
+import { formatCommitMessage, normalizeCommitBody } from './commit-message.ts'
 import { createSessionCheckoutApplyEngine, runGit, type ApplyConflictPlanResult, type FrozenReview, type PreviewReceipt } from './engine.ts'
 
 export interface Checkout { root: string; gitDir: string; commonDir: string; rootIdentity: string; gitIdentity: string; commonIdentity: string }
 export interface SessionLink { id: string; file: string; cwd: string }
 type Phase = 'creating' | 'working' | 'ready' | 'previewed' | 'delivered' | 'discarded'
-interface Review { id: string; fingerprint: string; files: string[]; message: string; snapshot?: FrozenReview; partial?: true }
+interface Review { id: string; fingerprint: string; files: string[]; message: string; body?: string; snapshot?: FrozenReview; partial?: true }
 interface ConflictRecovery {
   localHeadOid: string
   isolatedHeadOid: string
@@ -290,15 +291,18 @@ export class TaskStore {
     })
   }
 
-  async markReady(id: string, session: SessionLink, message: string, files: readonly string[]): Promise<Review> {
+  async markReady(id: string, session: SessionLink, message: string, files: readonly string[],
+    options?: { body?: string; expectedReview?: { id: string | undefined } }): Promise<Review> {
     const title = message.trim()
-    if (!title || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) throw new Error('请提供 1–200 字符的单行提交说明。')
+    if (!title || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) throw new Error('请提供 1–200 字符的单行提交标题。')
+    const body = normalizeCommitBody(options?.body)
     if (!Array.isArray(files) || !files.length) throw new Error('请明确列出本次任务要交付的改动文件。')
     return this.locked(async (state, save) => {
       const task = state.tasks.find(t => t.id === id)
       if (!task || task.journal || !['working', 'ready'].includes(task.phase) || !boundIsolatedSession(task, session)) {
         throw new Error('当前不是可标记待验收的隔离会话。')
       }
+      if (options?.expectedReview && task.review?.id !== options.expectedReview.id) throw new Error('待验收记录已变化，请重新选择。')
       await this.validateIsolated(task)
       const recovery = task.recovery
       const baseOid = recovery?.localHeadOid ?? task.baseOid
@@ -330,7 +334,7 @@ export class TaskStore {
       }
       if (!inspected.changedFiles.length) throw new Error(recovery ? '合并后无需交付：任务改动已在 Local HEAD 中。可返回 Local 放弃此任务。' : '没有可验收的 Git 改动。')
       const review: Review = { id: randomUUID(), fingerprint: inspected.isolatedFingerprint, files: inspected.changedFiles,
-        message: title, snapshot: inspected.snapshot, ...(inspected.partial ? { partial: true } : {}) }
+        message: title, ...(body ? { body } : {}), snapshot: inspected.snapshot, ...(inspected.partial ? { partial: true } : {}) }
       task.review = review
       task.phase = 'ready'
       await save()
@@ -391,7 +395,7 @@ export class TaskStore {
           if (action === 'commit_ready') {
             const review = task.review
             const done = await engine.commitReady(res.plan, {
-              previewId: randomUUID(), reviewId: review.id, iteration: 1, commitMessage: review.message,
+              previewId: randomUUID(), reviewId: review.id, iteration: 1, commitMessage: formatCommitMessage(review.message, review.body),
               beforeWrite: async (receipt, commitOid, before, after, finalIndexTreeOid) => {
                 await this.validateLocal(task)
                 await this.validateIsolated(task)
@@ -462,7 +466,9 @@ export class TaskStore {
           await save()
           await this.unpin(task).catch(() => {})
         } else if (action === 'finalize' && task.phase === 'previewed' && task.receipt && task.review) {
-          const done = await engine.finalize({ localPath: task.local.root, receipt: task.receipt, commitMessage: task.review.message, beforeCommit: async (commitOid, before, after) => {
+          if (task.receipt.reviewId !== task.review.id) throw new Error('预览与待验收记录不匹配；未提交。')
+          const commitMessage = formatCommitMessage(task.review.message, task.review.body)
+          const done = await engine.finalize({ localPath: task.local.root, receipt: task.receipt, commitMessage, beforeCommit: async (commitOid, before, after) => {
             await this.validateLocal(task)
             if (expected.keepWorktree) await this.validateIsolatedIdentity(task)
             await this.recordCommit(task, 'finalize', task.receipt!, commitOid, before, after, save)
