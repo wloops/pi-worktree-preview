@@ -6,15 +6,17 @@
 
 ## 快速开始
 
-需要 Pi 1.5.2 或兼容版本、支持鼠标的终端，以及已有初始提交的 Git 分支。请先配置 Pi 模型和 Git 提交身份。
+需要 Pi 1.5.2 或兼容版本，以及已有初始提交的 Git 分支。请先配置 Pi 模型和 Git 提交身份。
 
 ```sh
 pi install npm:pi-worktree-preview
 cd /path/to/your/repo
-pi --tui-mode fullscreen
+pi
 ```
 
-也可从 [GitHub](https://github.com/wloops/pi-worktree-preview/releases) 安装：`pi install git:github.com/wloops/pi-worktree-preview@v0.1.4`。切换安装来源前，先用 `pi list` 找到旧入口，再用 `pi remove <旧入口>` 移除，避免重复加载。
+Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就能点击 Worktree 按钮。如果你把 Pi 设置成了 regular，可用 `/worktree-preview` 打开菜单并用键盘操作；想用鼠标时，再用 `pi --tui-mode fullscreen` 启动。
+
+也可从 [GitHub](https://github.com/wloops/pi-worktree-preview/releases) 安装：`pi install git:github.com/wloops/pi-worktree-preview@v0.1.5`。切换安装来源前，先用 `pi list` 找到旧入口，再用 `pi remove <旧入口>` 移除，避免重复加载。
 
 1. **新建 Worktree**：勾选编辑器上方的复选框，再发送任务。可以先在原对话讨论；新会话自动带上当前分支的聊天上下文，但目录仍从发送时的 `HEAD` 创建，不复制未提交的文件（聊天里已经出现的内容仍会带上）。这条消息只发到新会话。
 2. **待验收**：Agent 用任务对话的语言拟定提交标题，必要时补充正文，并标记要交付的文件，不改项目目录。清单里有无关文件，可在 **⋯ 更多 → 调整交付清单** 移除。提交前可滚动查看标题、正文和文件清单。
