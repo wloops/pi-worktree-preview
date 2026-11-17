@@ -525,7 +525,7 @@ export default function extension(pi: ExtensionAPI) {
     const id = ctx.sessionManager.getSessionId()
     const selected = () => armed?.sessionId === id
     installToolbar<MenuAction | 'menu'>(ctx, () => ({
-      status: { label: phaseLabel(!!state.isolated, active), tone: phaseTone(active) },
+      status: state.isolated || active ? { label: phaseLabel(!!state.isolated, active), tone: phaseTone(active) } : undefined,
       buttons: [
         ...(showCreate ? [{ label: `[${selected() ? 'x' : ' '}] 新建 Worktree`, value: 'arm' as const, tone: 'primary' as const, checked: selected() }] : []),
         ...direct.map(({ label, ...choice }) => ({ ...choice, label: `[ ${label} ]` })),

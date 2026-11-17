@@ -60,14 +60,14 @@ function statusStyle(theme: Theme, tone: StatusTone): ThemeStyle {
 
 /** Rows and hit regions are built together from visual columns, not string offsets. */
 export function toolbar<T>(
-  theme: Theme, width: number, status: { label: string; tone?: StatusTone }, buttons: ToolbarChoice<T>[],
+  theme: Theme, width: number, status: { label: string; tone?: StatusTone } | undefined, buttons: ToolbarChoice<T>[],
 ) {
   const p = palette(theme)
   const lines: string[] = []
   const hits: { row: number; from: number; to: number; value: T }[] = []
   if (width < 1) return { lines, hits }
-  const statusText = truncateToWidth(` ${clean(status.label)} `, width, '…')
-  let row = theme.style(statusText, statusStyle(theme, status.tone ?? 'normal'))
+  const statusText = status ? truncateToWidth(` ${clean(status.label)} `, width, '…') : ''
+  let row = status ? theme.style(statusText, statusStyle(theme, status.tone ?? 'normal')) : ''
   let used = visibleWidth(statusText)
   for (const { label, value, tone, trailing, checked } of buttons) {
     const text = truncateToWidth(clean(label), width, '…')
@@ -82,7 +82,7 @@ export function toolbar<T>(
       trailing ? { fg: p.text, bg: p.header, bold: true } : { fg: p.text, bg: p.surface })
     used += size
   }
-  lines.push(row)
+  if (row) lines.push(row)
   return { lines, hits }
 }
 

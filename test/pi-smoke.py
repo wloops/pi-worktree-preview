@@ -309,9 +309,11 @@ def main():
         git('switch', '--quiet', 'main')
         with Pi(local, agent, provider) as pi:
             create_x, create_y = pi.until('[ ] 新建 Worktree')
+            assert pi.screen.display[create_y - 1].strip() == '[ ] 新建 Worktree'
             assert pi.screen.buffer[create_y - 1][create_x - 1].bg == '4669a3'
             pi.click('[ ] 新建 Worktree')
             create_x, create_y = pi.until('[x] 新建 Worktree')
+            assert pi.screen.display[create_y - 1].strip() == '[x] 新建 Worktree'
             assert pi.screen.buffer[create_y - 1][create_x - 1].bg == '294f94'
             assert not state_path.exists(), 'checking must not create anything'
             pi.click('[x] 新建 Worktree')
