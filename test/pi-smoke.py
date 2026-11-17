@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import termios
 import time
+import uuid
 
 import pyte
 
@@ -44,6 +45,21 @@ export default function(pi) {
   });
   pi.registerCommand('smoke-session-id', {
     handler: async (_args, ctx) => ctx.ui.notify(`Smoke session ${ctx.sessionManager.getSessionId()}`, 'info'),
+  });
+  pi.registerCommand('smoke-return-to-plan', {
+    handler: async (_args, ctx) => {
+      const entry = ctx.sessionManager.getBranch().find(entry => entry.type === 'message' &&
+        entry.message.role === 'assistant' && entry.message.content.some(part => part.text === 'Plan: use the cedar strategy.'));
+      if (!entry) throw new Error('Plan entry missing');
+      await ctx.navigateTree(entry.id, { summarize: false });
+      ctx.ui.notify('Returned to the plan branch.', 'info');
+    },
+  });
+  pi.registerCommand('smoke-save-local-state', {
+    handler: async (_args, ctx) => {
+      pi.appendEntry('smoke-local-state', { value: 'do not transfer' });
+      ctx.ui.notify('Saved Local state.', 'info');
+    },
   });
   pi.registerProvider("wtp-smoke", {
     baseUrl: "http://127.0.0.1:1", apiKey: "offline-test", api: "wtp-stub",
@@ -95,13 +111,28 @@ export default function(pi) {
       else if (text === 'Could we change this?') content = say('Discussed without starting a task.');
       else if (text?.startsWith("Follow up from ") && routesHistory) content = [tool('worktree_start_follow_up')];
       else if (text?.startsWith("Follow up from ")) {
-        const previous = text.endsWith("delivery.") ? "Edit task.txt and mark ready." : "/var/folders/pi-clipboard-regression.png Open a task to discard.";
+        const previous = text.endsWith("delivery.") ? ["Edit task.txt and mark ready.", "Implement the plan and mark ready."] : ["/var/folders/pi-clipboard-regression.png Open a task to discard."];
         const inherited = context.messages.some(message => message.role === 'user' &&
-          (typeof message.content === 'string' ? message.content === previous : message.content.some(part => part.type === 'text' && part.text === previous)));
+          (typeof message.content === 'string' ? previous.includes(message.content) : message.content.some(part => part.type === 'text' && previous.includes(part.text))));
         const boundary = context.messages.some(message => message.role === 'user' &&
           Array.isArray(message.content) && message.content.some(part => part.type === 'text' && part.text.includes('Only conversation history was inherited')));
         const fullTools = declared.some(tool => tool.name === 'bash') && !routesHistory;
         content = say(inherited && boundary && fullTools ? "Received follow-up with original context." : "Missing inherited context or Worktree tools.");
+      }
+      else if (text === 'Discuss a plan first.') content = say('Plan: use the cedar strategy.');
+      else if (text === 'Explore an alternative.') content = say('Alternative: use the pine strategy.');
+      else if (text === 'Implement the plan and mark ready.') {
+        const history = JSON.stringify(context.messages.filter(message => message.role !== 'system'));
+        const inherited = history.includes('Discuss a plan first.') && history.includes('Plan: use the cedar strategy.') &&
+          !history.includes('Explore an alternative.') && !history.includes('Alternative: use the pine strategy.') && !history.includes('private-shell-output');
+        const isolated = declared.some(tool => tool.name === 'bash') && history.includes('Only conversation history was inherited');
+        content = inherited && isolated ? [edit()] : say('Missing active Local plan or Worktree context.');
+      }
+      else if (text === 'Use compacted plan.') {
+        const history = JSON.stringify(context.messages.filter(message => message.role !== 'system'));
+        content = say(history.split('Summary of the earlier plan.').length === 2 && history.includes('Corrected plan question.') &&
+          history.includes('Plan: use the cedar strategy.') && !history.includes('Discuss a plan first.') && !history.includes('Local only.') &&
+          declared.some(tool => tool.name === 'bash') ? 'Received compacted plan and context edit.' : 'Compacted plan was not carried.');
       }
       else if (text === "Local only." || text === "/var/folders/pi-clipboard-regression.png Open a task to discard.") content = say("Acknowledged without edits.");
       else if (text?.trim() === "Registered Worktree prompt.") content = say("Expanded Worktree template.");
@@ -265,6 +296,7 @@ def main():
             return sum(e['type'] == 'message' and e['message']['role'] == 'user' and text in json.dumps(e['message']) for e in entries)
 
         kickoff = 'Edit task.txt and mark ready.'
+        plan_kickoff = 'Implement the plan and mark ready.'
         git('switch', '--detach', '--quiet')
         with Pi(local, agent, provider) as pi:
             pi.click('[ ] 新建 Worktree')
@@ -288,7 +320,20 @@ def main():
             pi.send(b'Local only.\r')
             pi.until('Acknowledged without edits.')
             assert not state_path.exists(), 'unchecked send must stay in Local'
-            pi.send(kickoff.encode())
+            pi.send(b'/smoke-save-local-state\r')
+            pi.until('Saved Local state.')
+            pi.send(b'!!printf private-shell-output\r')
+            pi.until('private-shell-output')
+            pi.send(b'Discuss a plan first.\r')
+            pi.until('Plan: use the cedar strategy.')
+            pi.send(b'Explore an alternative.\r')
+            pi.until('Alternative: use the pine strategy.')
+            pi.send(b'/smoke-return-to-plan\r')
+            pi.until('Returned to the plan branch.')
+            [saved_source] = [file for file in (agent / 'sessions').glob('*/*.jsonl')
+                              if 'Alternative: use the pine strategy.' in file.read_text()]
+            assert 'Alternative: use the pine strategy.' in saved_source.read_text().splitlines()[-1]
+            pi.send(plan_kickoff.encode())
             pi.click('[ ] 新建 Worktree')
             pi.until('[x] 新建 Worktree')
             assert not state_path.exists()
@@ -297,30 +342,39 @@ def main():
             pi.until('Worktree ready.')
             first_path = Path(task()['isolatedPath'])
             assert first_path.is_dir()
-            assert user_prompt_count(task()['isolatedSession']['file'], kickoff) == 1
-            assert user_prompt_count(task()['localSession']['file'], kickoff) == 0
+            child = task()['isolatedSession']['file']
+            source = task()['localSession']['file']
+            assert user_prompt_count(child, plan_kickoff) == 1
+            assert user_prompt_count(source, plan_kickoff) == 0
+            assert user_prompt_count(child, 'Discuss a plan first.') == 1
+            assert user_prompt_count(child, 'Explore an alternative.') == 0
+            assert user_prompt_count(source, 'Explore an alternative.') == 1
+            child_text = Path(child).read_text()
+            assert 'smoke-local-state' not in child_text and 'private-shell-output' not in child_text
+            assert 'smoke-local-state' in Path(source).read_text() and 'private-shell-output' in Path(source).read_text()
             deadline = time.monotonic() + 25
             while task()['phase'] != 'ready' and time.monotonic() < deadline:
                 pi.read()
             assert task()['phase'] == 'ready', pi.dump()
             assert (first_path / 'task.txt').read_text() == 'task edit\n'
+            assert (first_path / 'user.txt').read_text() == 'original\n'
             assert (local / 'task.txt').read_text() == 'base\n'
-        print('real Pi: checkbox delayed creation; unchecked send stayed Local; checked draft sent only once in Worktree', flush=True)
+        print('real Pi: checkbox delayed creation; inherited only active Local plan, not dirty files; new message sent once', flush=True)
         origin = task()['localSession']['file']
         first_session = Path(task()['isolatedSession']['file'])
         header = json.loads(first_session.read_text().splitlines()[0])
         assert header['parentSession'] == origin and header['cwd'] == str(first_path)
         with Pi(local, agent, provider, cols=230, resume=True) as pi:
             pi.until('Resume Session (Current Folder)')
-            pi.until(f'原对话 · {kickoff}')
-            assert f'Worktree · {kickoff}' not in pi.dump()
+            pi.until(f'原对话 · {plan_kickoff}')
+            assert f'Worktree · {plan_kickoff}' not in pi.dump()
             pi.send(b'\t')
             pi.until('Resume Session (All)')
-            _, parent_y = pi.until(f'原对话 · {kickoff}')
-            _, child_y = pi.until(f'└─ Worktree · {kickoff}')
+            _, parent_y = pi.until(f'原对话 · {plan_kickoff}')
+            _, child_y = pi.until(f'└─ Worktree · {plan_kickoff}')
             assert child_y == parent_y + 1, pi.dump()
-            pi.send(f'"Worktree · {kickoff}"'.encode())
-            pi.until('› Worktree · ' + kickoff)
+            pi.send(f'"Worktree · {plan_kickoff}"'.encode())
+            pi.until('› Worktree · ' + plan_kickoff)
             pi.send(b'\r')
             pi.until('Worktree · 待验收')
             pi.until(str(first_path))
@@ -1111,6 +1165,42 @@ exec {real_git} "$@"
                 assert expanded in Path(task()['isolatedSession']['file']).read_text()
                 assert expanded not in Path(task()['localSession']['file']).read_text()
         print('real Pi: template and skill prompts were expanded only after switching to Worktree', flush=True)
+
+        # Seed a native Pi compaction whose kept range starts at metadata
+        # that will be dropped, followed by a context edit on a kept message.
+        entries = list(map(json.loads, Path(origin).read_text().splitlines()))
+        plan = next(entry for entry in entries if entry['type'] == 'message' and entry['message']['role'] == 'assistant'
+                    and 'Plan: use the cedar strategy.' in json.dumps(entry['message']))
+        by_id = {entry['id']: entry for entry in entries[1:]}
+        branch = [plan]
+        while branch[-1]['parentId'] is not None:
+            branch.append(by_id[branch[-1]['parentId']])
+        branch.reverse()
+        anchor = next(entry for entry in branch if entry.get('customType') == 'smoke-local-state')
+        plan_prompt = next(entry for entry in branch if entry['type'] == 'message' and entry['message']['role'] == 'user'
+                           and 'Discuss a plan first.' in json.dumps(entry['message']))
+        system = next(entry['message'] for entry in branch if entry['type'] == 'message' and entry['message']['role'] == 'system')
+        stamp = plan['timestamp']
+        compact = dict(type='compaction', id=uuid.uuid4().hex[:8], parentId=plan['id'], timestamp=stamp,
+                       summary='Summary of the earlier plan.', firstKeptEntryId=anchor['id'], tokensBefore=1000,
+                       systemMessage=system, details={'old': True})
+        corrected = dict(type='context_edit', id=uuid.uuid4().hex[:8], parentId=compact['id'], timestamp=stamp,
+                         targetId=plan_prompt['id'], replacement={'content': [{'type': 'text', 'text': 'Corrected plan question.'}]})
+        session_id = str(uuid.uuid4())
+        compact_source = Path(origin).with_name(f'{stamp.replace(":", "-").replace(".", "-")}_{session_id}.jsonl')
+        compact_source.write_text(''.join(json.dumps(entry) + '\n' for entry in
+                                          [{**entries[0], 'id': session_id}, *branch, compact, corrected]))
+        with Pi(local, agent, provider, session=compact_source) as pi:
+            pi.click('[ ] 新建 Worktree')
+            pi.until('[x] 新建 Worktree')
+            pi.send(b'Use compacted plan.\r')
+            pi.until('Received compacted plan and context edit.', 40)
+            assert task()['localSession']['file'] == str(compact_source)
+            child_entries = list(map(json.loads, Path(task()['isolatedSession']['file']).read_text().splitlines()))
+            new_compact = next(entry for entry in child_entries if entry['type'] == 'compaction')
+            assert new_compact['firstKeptEntryId'] == plan_prompt['id']
+            assert 'systemMessage' not in new_compact and 'details' not in new_compact
+        print('real Pi: inherited native compaction and context edit, with a fresh tool loadout', flush=True)
 
 
 if __name__ == '__main__':

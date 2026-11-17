@@ -1,4 +1,4 @@
-import { CURRENT_SESSION_VERSION, getAgentDir, SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type InputEvent } from '@earendil-works/pi-coding-agent'
+import { CURRENT_SESSION_VERSION, getAgentDir, SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type InputEvent, type SessionEntry } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 import { createHash, randomUUID } from 'node:crypto'
 import { link, lstat, mkdir, mkdtemp, open, realpath, rm } from 'node:fs/promises'
@@ -288,6 +288,53 @@ async function makeHistoryView(data: TaskStore, task: Task, returnTo: SessionLin
 }
 
 type FollowUpHistory = { body: string[]; leaf: string | null }
+
+function captureLocalBranch(ctx: ExtensionContext): string[] {
+  // Use the live Pi leaf, not the last line on disk (which can be on an
+  // abandoned branch after /tree). Copy conversation, not the old loadout
+  // or extension state. Keep Pi's native compaction and context-edit links.
+  const branch = ctx.sessionManager.getBranch()
+  const entries = branch.flatMap<SessionEntry>(entry => {
+    switch (entry.type) {
+      case 'message': {
+        const msg = entry.message
+        if (msg.role === 'system' || msg.role === 'bashExecution' && msg.excludeFromContext) return []
+        if (msg.role === 'toolResult' || msg.role === 'custom') return [{ ...entry, message: { ...msg, details: undefined } }]
+        if (msg.role === 'bashExecution') return [{ ...entry, message: { ...msg, fullOutputPath: undefined } }]
+        return [entry]
+      }
+      case 'custom_message': return [{ ...entry, details: undefined }]
+      case 'compaction': return [{ ...entry, systemMessage: undefined, details: undefined }]
+      case 'branch_summary': return [{ ...entry, details: undefined }]
+      case 'context_edit': return [entry]
+      default: return []
+    }
+  })
+  const ids = new Set(entries.map(entry => entry.id))
+  const retained = entries.filter(entry => entry.type !== 'context_edit' || ids.has(entry.targetId))
+  const keptIds = new Set(retained.map(entry => entry.id))
+  const nextKept = new Map<string, string>()
+  let next: string | undefined
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const { id } = branch[i]
+    if (keptIds.has(id)) next = id
+    if (next) nextKept.set(id, next)
+  }
+  let parentId: string | null = null
+  const previous = new Set<string>()
+  return retained.map(entry => {
+    if (entry.type === 'compaction') {
+      // If Pi anchored its kept range at removed metadata, start at the
+      // next retained entry instead. Its own ID represents an empty range.
+      const anchor = nextKept.get(entry.firstKeptEntryId)
+      entry = { ...entry, firstKeptEntryId: anchor && previous.has(anchor) ? anchor : entry.id }
+    }
+    const line = JSON.stringify({ ...entry, parentId })
+    parentId = entry.id
+    previous.add(entry.id)
+    return line
+  })
+}
 
 function captureFollowUp(ctx: ExtensionContext, leaf: string | null): FollowUpHistory {
   if (!leaf) throw new Error('缺少原对话记录，未开启下一轮。')
@@ -771,7 +818,7 @@ export default function extension(pi: ExtensionAPI) {
     let replaced = false
     const view = historyView
     const summary = taskSummary(text)
-    const create = async (current: ExtensionCommandContext, send: (text: string) => unknown) => {
+    const create = async (current: ExtensionCommandContext, send: (text: string) => unknown, localBranch: string[] = []) => {
       let entered = false
       try {
         const { local, isolated, tasks, data } = await context(current)
@@ -789,7 +836,14 @@ export default function extension(pi: ExtensionAPI) {
             const name = summary ? `Worktree · ${summary}` : shortSessionName(task.id)
             return prior && view && inherited
               ? forkWorktreeSession(path, task, prior, view, inherited, name)
-              : createChildSession(path, task.localSession, [], sm => sm.appendSessionInfo(name))
+              : createChildSession(path, task.localSession, localBranch, sm => {
+                sm.appendSessionInfo(name)
+                if (localBranch.length) sm.appendCustomMessageEntry(`${NAME}-local-context`, [
+                  `New isolated task from the source checkout's HEAD at creation (${task.baseOid}).`,
+                  'Only conversation history was inherited, not uncommitted changes or workspace state.',
+                  'Use prior discussion to understand the new request. Treat earlier tool output and paths as historical; check the new cwd and work only there.',
+                ].join(' '), false)
+              })
           }, view?.priorId)
         })
         const target = created.isolatedSession!
@@ -822,10 +876,13 @@ export default function extension(pi: ExtensionAPI) {
     try {
       if (!ctx.isIdle() || sessionId !== ctx.sessionManager.getSessionId()) throw new Error('当前对话已变化或忙碌。')
       if (view) await create(ctx, () => {})
-      else await withSavedLocal(ctx, async (current, send) => {
-        if (current !== ctx) replaced = true
-        await create(current, send)
-      }, summary ? `原对话 · ${summary}` : undefined)
+      else {
+        const localBranch = captureLocalBranch(ctx)
+        await withSavedLocal(ctx, async (current, send) => {
+          if (current !== ctx) replaced = true
+          await create(current, send, localBranch)
+        }, summary ? `原对话 · ${summary}` : undefined)
+      }
     } catch (error) {
       if (!replaced) {
         restoreDraft(ctx, text)
