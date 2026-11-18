@@ -4,6 +4,9 @@
 
 用 Pi 在隔离的 Git Worktree 里并行开发。改完直接在原项目目录预览和测试：满意就提交，不满意就撤回。不用切分支，也不用手动暂存。
 
+- **Pi 终端**：用鼠标新建 Worktree、预览、返修和提交。
+- **Pi RPC 客户端**：用斜杠命令操作，也可[接入已有的 Worktree](#接入已有的-worktree)，不必重开任务。
+
 ## 快速开始
 
 需要 Pi 1.5.2 或兼容版本，以及已有初始提交的 Git 分支。请先配置 Pi 模型和 Git 提交身份。
@@ -33,14 +36,40 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 | 直接提交或放弃 | 待验收时可从 **⋯ 更多** 跳过预览直接提交。**放弃任务** 只在对应 Worktree 的菜单里；若已预览，先撤回。 |
 | 续接已结束的对话 | 提交后可留在原任务对话，也可从 **任务历史** 打开。提问不新建；明确要求修改时，Agent 才从项目目录最新 `HEAD` 开新 Worktree，不带旧目录的未提交文件。 |
 
-## 不用 TUI：命令和外部 Worktree
+## 接入已有的 Worktree
 
-输入 `/worktree-preview-` 查找独立命令，也可发送 `/worktree-preview help` 查看列表：
+> 外部接入和下文的独立斜杠命令将随 v0.2.0 发布，当前稳定版 v0.1.5 尚不包含这些功能。
+
+已经在外部 Worktree（例如 T3 Code 创建的 Worktree）里工作？在**该 Worktree 的 Pi 对话**里操作：
+
+1. **接入**：运行 `/worktree-preview-adopt`。插件识别目标 checkout 和共同分叉基点，登记当前改动，不写入两边的工作目录。
+2. **核对并预览**：运行 `/worktree-preview-status` 查看文件，再运行 `/worktree-preview-preview` 并确认。预览写入目标目录，不暂存、不提交。默认清单包含所有检测到的改动，包括未忽略的新文件；如只交付部分，可先运行 `/worktree-preview-adopt 1,3` 保留第 1、3 项，或在 fullscreen TUI 里用 **⋯ 更多 → 调整交付清单**。
+3. **返修或提交**：需要改就直接在同一对话里说。已预览时，确认 **撤回预览，继续返修** 后，Agent 接着处理同一条消息；未预览时可直接返修。改完重新标记待验收，不用重新接入。验收通过就运行 `/worktree-preview-commit`；想撤回用 `/worktree-preview-rollback`。
+
+**工具权限由原客户端管理。** 插件不额外拦截外部会话的读写、shell 或其他工具。插件只管理验收：不切换源分支或删除目录，放弃只解除登记，不能跳过预览直接提交。交付清单不会自动扩大；需要改清单时，可在 fullscreen TUI 用 **⋯ 更多 → 标记待验收（手动）**，或先撤回（如有）、解除登记，再按新清单接入。源分支或 `HEAD` 变化后，先处理已有预览，再重新接入。
+
+<details>
+<summary>手动指定目标、基点和交付文件</summary>
+
+共同分叉基点不一定等于任务实际开工点。接入前请核对目标、基点和清单；自动识别不适用时，可以显式指定：
+
+```text
+/worktree-preview-adopt {"source":"/path/to/external-worktree","target":"/path/to/project","base":"<完整基点提交 OID>","title":"提交标题","files":["src/example.ts"]}
+```
+
+源和目标必须是同一仓库的两个独立 checkout；`base` 必须是两边 `HEAD` 的唯一共同分叉基点（用 `git merge-base --all <目标 HEAD> <源 HEAD>` 核对）。文件用仓库相对路径，重命名列出新旧路径。从目标对话接入时，插件只在该对话提供验收操作，不把它当作源 Worktree 的返修对话。
+
+</details>
+
+## 斜杠命令
+
+输入 `/worktree-preview-` 查找独立命令，或运行 `/worktree-preview help`。原来的 `/worktree-preview <操作>` 仍可用。
 
 | 命令 | 用途 |
 | --- | --- |
 | `/worktree-preview-new` | 下一条任务消息发到新 Worktree |
-| `/worktree-preview-status` | 查看任务状态 |
+| `/worktree-preview-status` | 查看任务状态、目标和交付清单 |
+| `/worktree-preview-adopt` | 接入已有 Worktree；加 `1,3` 可缩小现有清单 |
 | `/worktree-preview-resume` | 进入关联的 Worktree 对话 |
 | `/worktree-preview-back` | 返回原对话 |
 | `/worktree-preview-preview` | 发起预览 |
@@ -50,30 +79,16 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 | `/worktree-preview-confirm <确认码>` | 仅用于文本确认（同一对话、单次有效、5 分钟过期） |
 | `/worktree-preview-cancel` | 取消文本确认或下次新建 |
 
-RPC 客户端默认用原生 Ask 让你核对再确认，取消或超时不会执行。不支持弹出提问的客户端可用 `/worktree-preview-preview --text` 等命令索取确认码。原来的 `/worktree-preview <操作>` 仍可用。命令模式从插件新建的 Worktree 提交或放弃后返回原对话。
+RPC 客户端默认用原生 Ask 确认；取消或超时不执行。Ask 只显示摘要，完整文件清单用 `status` 查看。不支持 Ask 的客户端可用 `/worktree-preview-preview --text` 等命令索取确认码，再运行 `/worktree-preview-confirm <确认码>`。命令模式中，自建任务提交或放弃后会回到原对话。
 
-### 接入 T3 Code 等客户端已有的 Worktree
+**验证范围：** 已用真实 Pi fullscreen 和 RPC 跑通。已核对 T3 Code Nightly 的命令与 Ask 接口，尚未在 T3 Code 或 Paseo 界面做端到端验证。
 
-1. 在**外部 Worktree 的 Pi 对话**里运行 `/worktree-preview-adopt`，无需参数。插件从 Git 识别主 checkout 和唯一共同分叉基点，登记当前相对起点的改动；不改源目录或目标目录的文件。
-2. 运行 `/worktree-preview-preview` 或点击「预览改动」。Ask 只显示目标、起点和文件数；想看完整清单可先运行 `/worktree-preview-status`。**确认后**才写入目标目录，不暂存、不提交。
+<details>
+<summary>RPC 客户端接入说明</summary>
 
-默认纳入所有检测到的改动（包括未跟踪且未忽略的文件）。如果只交付一部分，预览前用「更多 → 调整交付清单」，或发送 `/worktree-preview-adopt 1,3` 只保留当前清单中对应的编号。
+用 `get_commands` 列出命令，通过 `prompt` 原样发送。收到 `extension_ui_request` 的 `select` 后，应显示提问并回传 `extension_ui_response`，不要等 `prompt` 回执才处理。`setStatus` 显示简短结果和下一步，`notify` 发送完整结果；以 `worktree-preview ok:` 或 `error:` 为准。
 
-共同分叉基点不一定等于任务实际开工点。如果无法自动识别、要指定另一个目标或要自定义提交标题，可在源或目标的 Pi 对话里用 JSON 显式接入并确认：
-
-```text
-/worktree-preview-adopt {"source":"/path/to/external-worktree","target":"/path/to/project","base":"<完整起点提交 OID>","title":"提交标题","files":["src/example.ts"]}
-```
-
-确认后只登记，不写入 checkout。两个目录须是同一 Git 仓库下的独立 checkout；`base` 必须是两个 `HEAD` 的唯一共同分叉基点（`git merge-base --all <目标 HEAD> <源 HEAD>`）。`files` 只填本任务的仓库相对路径，重命名须列出新旧路径。
-
-**在接入时的源 Worktree 对话里直接说要改什么。** 只讨论不影响验收。收到改动要求时，确认「继续返修」；如果已经预览，则确认「撤回预览，继续返修」。Agent 在同一轮处理并重新标记待验收，不用重发或重新接入。从目标目录接入的对话只负责验收。
-
-外部返修只开放源 Worktree 内的文件编辑，不运行 shell；需要测试时可在单独终端运行。Agent 不会自动扩大交付清单。需要换清单时，在 fullscreen TUI 用「更多 → 标记待验收（手动）」选择；仅用命令时，可解除登记后按新清单重新接入。
-
-外部 Worktree 不能跳过预览直接提交。插件不会切换源分支或删除源目录；放弃只解除登记。源分支或 `HEAD` 变化后，插件会停止返修或交付，请先处理已有预览再重新接入。
-
-RPC 客户端用 `get_commands` 列出命令、通过 `prompt` 原样发送。收到 `extension_ui_request` 的 `select` 后应先显示提问并回传 `extension_ui_response`，无需等待 `prompt` 回执。简短结果和下一步通过 `setStatus` 显示，完整结果通过 `notify` 发送；以 `worktree-preview ok:` 或 `error:` 为准。已验证真实 Pi RPC；T3 Code Nightly 的适配支持已核对，尚未在 T3 Code / Paseo 界面完成端到端操作。
+</details>
 
 ## 安全与限制
 
