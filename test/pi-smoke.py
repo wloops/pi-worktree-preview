@@ -73,6 +73,9 @@ export default function(pi) {
       const tool = (name, args = {}) => ({type:"toolCall",id:`test_${name}`,name,arguments:args});
       const say = (text) => [{type:"text",text}];
       const revision = text?.startsWith("Revise ");
+      const externalRevision = text?.endsWith(' external.');
+      const revisionFiles = text === 'Revise with scope expansion external.' ? ['task.txt','source only.txt'] :
+        text === 'Revise with missing file external.' ? ['source only.txt'] : ['task.txt'];
       const recover = text?.startsWith("只在当前 detached Worktree 解决冲突") && text.match(/--no-overwrite-ignore ([0-9a-f]{40,64})/);
       const revise = () => tool("worktree_begin_revision");
       const badWrite = () => tool("write", {path:"forbidden.txt",content:"must not be written"});
@@ -97,8 +100,13 @@ export default function(pi) {
             ? last.content.some(part => part.type === 'text' && part.text.trim() === 'task edit')
               ? 'Read isolated task content.' : 'Read the wrong checkout.'
             : 'Explained without edits.'); break;
-          case "write": content = say(last.isError ? "Write was blocked." : "Unexpected write."); break;
-          case "worktree_begin_revision": content = last.isError ? say(text === "Revise after Local drift." ? "Revision blocked by Local drift." : "Revision stopped.") : [edit()]; break;
+          case "write": content = last.isError ? say('Write was blocked.') : externalRevision ?
+            [tool('worktree_ready_for_review', {commitMessage:'Isolated smoke change', files:revisionFiles})] : say('Unexpected write.'); break;
+          case "worktree_begin_revision": content = last.isError ? say(text?.includes('after Local drift.') || text?.includes('after Local drift external.') ?
+            'Revision blocked by Local drift.' : 'Revision stopped.') : externalRevision ? [tool('write', {
+              path: text === 'Revise with escaping path external.' ? '../../repo-escape.txt' : '../task.txt',
+              content: text === 'Revise before preview external.' ? 'ready revision\\n' : 'previewed revision\\n',
+            })] : [edit()]; break;
           default: content = say(last.isError ? "Review failed." : recover ? "Conflict resolved in Worktree." : revision ? "Revision ready." : "Worktree ready.");
         }
       } else if (recover) content = [tool('bash', {command: `git add -- task.txt && git commit -m checkpoint &&
@@ -1232,12 +1240,13 @@ def external_adoption():
         git(repo, 'worktree', 'add', '--detach', '--', str(source))
         (source / 'task.txt').write_text('external task\n')
         (source / 'unrelated.txt').write_text('leave this in the source\n')
+        subdir = source / 'subdir'
+        subdir.mkdir()
         state = agent / 'worktree-preview/tasks.json'
-        with Pi(source, agent, provider) as pi:
+        with Pi(subdir, agent, provider) as pi:
             pi.until('[ ] 新建 Worktree')
             pi.send(b'/worktree-preview-adopt\r')
-            pi.until('已接入外部 Worktree')
-            pi.until('预览改动')
+            pi.until('[ 预览改动 ]')
             adopted, = json.loads(state.read_text())['tasks']
             assert adopted['phase'] == 'ready' and adopted['review']['files'] == ['task.txt', 'unrelated.txt']
             assert git(repo, 'status', '--porcelain') == ''
@@ -1257,11 +1266,16 @@ def external_adoption():
             pi.until('预览改动？')
             pi.click('[ 预览 ]')
             pi.until('已写入项目目录')
+            assert (repo / 'task.txt').read_text() == 'external task\n' and not (repo / 'unrelated.txt').exists()
+            pi.send(b'Revise while previewed external.\r')
+            pi.until('返修前需撤回项目目录的预览')
+            pi.click('[ 撤回预览，继续返修 ]')
+            pi.until('Revision ready.')
         adopted, = json.loads(state.read_text())['tasks']
-        assert adopted['phase'] == 'previewed' and adopted['review']['files'] == ['task.txt']
-        assert (repo / 'task.txt').read_text() == 'external task\n' and not (repo / 'unrelated.txt').exists()
-        assert (source / 'task.txt').is_file() and (source / 'unrelated.txt').is_file()
-        print('real Pi: adopt goes straight to preview; optional TUI narrowing preserves the source', flush=True)
+        assert adopted['phase'] == 'ready' and adopted['review']['files'] == ['task.txt']
+        assert not (repo / 'task.txt').exists() and not (repo / 'unrelated.txt').exists()
+        assert (source / 'task.txt').read_text() == 'previewed revision\n' and (source / 'unrelated.txt').is_file()
+        print('real Pi: external adoption, TUI narrowing and same-turn rollback/revision', flush=True)
 
 
 if __name__ == '__main__':

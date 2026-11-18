@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real Pi RPC client; deliberately does not implement extension UI dialogs."""
+"""Real Pi RPC client with a deterministic model and native select replies."""
 import ast
 import os
 import json
@@ -111,6 +111,20 @@ class PiRPC:
 
     def act(self, args):
         return self.answer(self.ask(args))
+
+    def start_turn(self, message):
+        identifier = self.send('prompt', message=message)
+        assert self.reply(identifier)['disposition'] == 'started'
+
+    def finish_turn(self, text):
+        self.wait(lambda e: e.get('type') == 'agent_settled')
+        self.wait(lambda e: e.get('type') == 'message_end' and e.get('message', {}).get('role') == 'assistant'
+                  and any(c.get('text') == text for c in e['message'].get('content', [])))
+
+    def revision_ask(self, previewed=True):
+        request = self.wait(lambda e: e.get('method') == 'select')
+        assert request['options'] == ['取消', '撤回预览，继续返修' if previewed else '继续返修'] and request['timeout'] == 300_000, request
+        return request
 
     def __enter__(self):
         return self
@@ -224,6 +238,8 @@ def main():
         git(repo, 'worktree', 'add', '-b', 'external', '--', str(source))
         base = git(repo, 'rev-parse', 'HEAD')
         source_file = source / 'task.txt'
+        subdir = source / 'subdir'
+        subdir.mkdir()
         source_file.write_text('external change\n')
         (source / 'source only.txt').write_text('do not deliver\n')
         git(source, 'add', 'source only.txt')
@@ -234,7 +250,16 @@ def main():
         # session becomes the owner, without changing its cwd or parent.
         with PiRPC(repo, agent, provider) as pi:
             assert 'linked Worktree' in pi.command('adopt', 'error')
-        with PiRPC(source, agent, provider) as pi:
+            pi.act(f'adopt {req}')
+            pi.start_turn('Try to write during review.')
+            pi.finish_turn('Write was blocked.')
+            pi.start_turn('Revise before preview external.')
+            pi.finish_turn('Revision stopped.')
+            shell = pi.reply(pi.send('bash', command='touch forbidden.txt', excludeFromContext=True))
+            assert shell['exitCode'] == 1 and '不执行 shell' in shell['output']
+            assert not (repo / 'forbidden.txt').exists() and target_file.read_text() == 'task edit\n'
+            pi.act('discard')
+        with PiRPC(subdir, agent, provider) as pi:
             origin = pi.state()
             listing = pi.command('adopt')
             pi.status_line(f'下一步：{NAME}-preview')
@@ -298,15 +323,83 @@ def main():
             assert not (repo / 'source only.txt').exists()
             pi.act('rollback')
             assert target_file.read_text() == 'task edit\n'
+            pi.start_turn('Revise before preview external.')
+            ask = pi.revision_ask(previewed=False)
+            pi.write({'type': 'extension_ui_response', 'id': ask['id'], 'cancelled': True})
+            pi.finish_turn('Revision stopped.')
+            assert source_file.read_text() == 'external change\n' and pi.status()['phase'] == 'ready'
+            pi.start_turn('Revise before preview external.')
+            ask = pi.revision_ask(previewed=False)
+            pi.write({'type': 'extension_ui_response', 'id': ask['id'], 'value': ask['options'][1]})
+            pi.finish_turn('Revision ready.')
+            assert pi.status()['phase'] == 'ready'
+            assert source_file.read_text() == 'ready revision\n' and target_file.read_text() == 'task edit\n'
+            pi.act('preview')
+            previewed = pi.status()
+            pi.start_turn('Explain the change.')
+            pi.finish_turn('Explained without edits.')
+            pi.start_turn('Try to write during review.')
+            pi.finish_turn('Write was blocked.')
+            assert pi.status() == previewed and not (source / 'forbidden.txt').exists()
+            assert target_file.read_text() == 'ready revision\n'
+            pi.start_turn('Revise while previewed external.')
+            ask = pi.revision_ask()
+            assert str(repo) in ask['title'] and '涉及 1 个文件' in ask['title'] and 'task.txt' not in ask['title']
+            pi.write({'type': 'extension_ui_response', 'id': ask['id'], 'cancelled': True})
+            pi.finish_turn('Revision stopped.')
+            assert pi.status() == previewed and source_file.read_text() == 'ready revision\n'
+            pi.start_turn('Revise after Local drift external.')
+            ask = pi.revision_ask()
+            target_file.write_text('user edited preview\n')
+            pi.write({'type': 'extension_ui_response', 'id': ask['id'], 'value': ask['options'][1]})
+            pi.finish_turn('Revision blocked by Local drift.')
+            assert pi.status() == previewed and source_file.read_text() == 'ready revision\n'
+            assert target_file.read_text() == 'user edited preview\n'
+            target_file.write_text('ready revision\n')
+            prompt = 'Revise with scope expansion external.'
+            pi.inbox.clear()
+            pi.start_turn(prompt)
+            ask = pi.revision_ask()
+            assert target_file.read_text() == 'ready revision\n'
+            for kind in ('steer', 'follow_up'):
+                assert pi.reply(pi.send(kind, message='Do not enqueue this.'))['disposition'] == 'handled'
+            assert target_file.read_text() == 'ready revision\n' and source_file.read_text() == 'ready revision\n'
+            pi.write({'type': 'extension_ui_response', 'id': ask['id'], 'value': ask['options'][1]})
+            pi.finish_turn('Review failed.')
+            def event_index(match):
+                return next(i for i, e in enumerate(pi.inbox) if match(e))
+            assert event_index(lambda e: e.get('statusText') == 'Worktree 返修中') < event_index(
+                lambda e: e.get('type') == 'tool_execution_end' and e.get('toolName') == 'worktree_begin_revision') < event_index(
+                lambda e: e.get('type') == 'tool_execution_start' and e.get('toolName') == 'write') < event_index(
+                lambda e: e.get('type') == 'tool_execution_end' and e.get('toolName') == 'worktree_ready_for_review')
+            assert pi.status()['phase'] == 'working' and target_file.read_text() == 'task edit\n'
+            assert source_file.read_text() == 'previewed revision\n' and not (repo / 'source only.txt').exists()
+            pi.start_turn('Try to write during review.')
+            pi.finish_turn('Write was blocked.')
+            pi.start_turn('Revise with escaping path external.')
+            ask = pi.revision_ask(previewed=False)
+            pi.write({'type': 'extension_ui_response', 'id': ask['id'], 'value': ask['options'][1]})
+            pi.finish_turn('Write was blocked.')
+            assert not (root / 'repo-escape.txt').exists()
+            pi.start_turn('Revise while previewed external.')
+            ask = pi.revision_ask(previewed=False)
+            pi.write({'type': 'extension_ui_response', 'id': ask['id'], 'value': ask['options'][1]})
+            pi.finish_turn('Revision ready.')
+            transcript = Path(pi.state()['sessionFile']).read_text()
+            assert transcript.count(prompt) == 1 and 'Do not enqueue this.' not in transcript
+            ready = pi.status()
+            assert ready['phase'] == 'ready' and ready['id'] == previewed['id'] and ready['ready'] == ['task.txt']
+            assert source_file.read_text() == 'previewed revision\n' and target_file.read_text() == 'task edit\n'
+            assert not (repo / 'source only.txt').exists()
             pi.act('preview')
             pi.act('commit')
             assert pi.state()['sessionId'] == origin['sessionId']
             assert pi.status()['phase'] == 'delivered'
         assert git(source, 'symbolic-ref', 'HEAD') == 'refs/heads/external'
-        assert git(source, 'rev-parse', 'HEAD') == base and source_file.read_text() == 'external change\n'
+        assert git(source, 'rev-parse', 'HEAD') == base and source_file.read_text() == 'previewed revision\n'
         assert git(source, 'status', '--porcelain=v1') == source_status
-        assert git(repo, 'show', '-1', '--format=%s', '--name-only') == 'Adopt selected external change\n\ntask.txt'
-        print('PASS real Pi RPC: adopt → native Ask, readable scope and status, stale checks, text fallback, source preserved', flush=True)
+        assert git(repo, 'show', '-1', '--format=%s', '--name-only') == 'Isolated smoke change\n\ntask.txt'
+        print('PASS real Pi RPC: adopt → native Ask, discussion/cancel/drift/same-turn revision, original source branch preserved', flush=True)
 
 
 if __name__ == '__main__':

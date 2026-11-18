@@ -54,6 +54,7 @@ export interface ReviewSnapshotResult {
   isolatedTreeOid: string
   isolatedIndexTreeOid: string
   changedFiles: string[]
+  allChangedFiles: string[]
   snapshot: FrozenReview
   /** At least one changed working, index or HEAD path is outside the delivery. */
   partial: boolean
@@ -1359,6 +1360,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
         isolatedHeadOid: isolated.headOid, isolatedHeadRef: isolated.headRef,
         isolatedTreeOid: isolated.treeOid, isolatedIndexTreeOid: isolated.indexTreeOid,
         changedFiles: changedFiles.map((path) => toProjectPath(path, localPrefix)).sort(),
+        allChangedFiles: allChanged.map((path) => toProjectPath(path, localPrefix)).sort(),
         snapshot, partial,
       }
     } catch (error) {

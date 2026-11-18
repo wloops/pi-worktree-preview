@@ -29,6 +29,7 @@ export interface Task {
   followUpOf?: string
   external?: { headOid: string; headRef: string | null } // Never own, switch, or remove the source checkout.
   review?: Review
+  externalRevisionFiles?: string[] // Last reviewed scope while the external task is working.
   recovery?: ConflictRecovery
   receipt?: PreviewReceipt
   // A null indexBefore explicitly records that no index file existed.
@@ -415,15 +416,22 @@ export class TaskStore {
     })
   }
 
+  async isEditingSession(task: Task, session: SessionLink): Promise<boolean> {
+    // Before external adoption recorded only one session link. Use that exact
+    // link, and only if it belongs to the source, not an adopting target.
+    if (!task.external) return boundIsolatedSession(task, session)
+    return sameSession(task.localSession, session) && !!task.isolated && same(await checkout(session.cwd), task.isolated)
+  }
+
   async markReady(id: string, session: SessionLink, message: string, files: readonly string[],
-    options?: { body?: string; expectedReview?: { id: string | undefined } }): Promise<Review> {
+    options?: { body?: string; expectedReview?: { id: string | undefined }; userSelectedFiles?: true }): Promise<Review> {
     const title = message.trim()
     if (!title || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) throw new Error('请提供 1–200 字符的单行提交标题。')
     const body = normalizeCommitBody(options?.body)
     if (!Array.isArray(files) || !files.length) throw new Error('请明确列出本次任务要交付的改动文件。')
     return this.locked(async (state, save) => {
       const task = state.tasks.find(t => t.id === id)
-      if (!task || task.journal || !['working', 'ready'].includes(task.phase) || !boundIsolatedSession(task, session)) {
+      if (!task || task.journal || !(task.phase === 'working' || !task.external && task.phase === 'ready') || !await this.isEditingSession(task, session)) {
         throw new Error('当前不是可标记待验收的隔离会话。')
       }
       if (options?.expectedReview && task.review?.id !== options.expectedReview.id) throw new Error('待验收记录已变化，请重新选择。')
@@ -432,6 +440,17 @@ export class TaskStore {
       const baseOid = recovery?.localHeadOid ?? task.baseOid
       const inspected = await this.engineFactory().inspectReview({ ...this.input(task), baseOid }, files)
       if (inspected.status === 'error') engineError(inspected)
+      if (task.external) {
+        const previous = task.externalRevisionFiles
+        if (!options?.userSelectedFiles && (!previous || inspected.changedFiles.some(path => !previous.includes(path)) ||
+            previous.some(path => inspected.allChangedFiles.includes(path) && !inspected.changedFiles.includes(path)))) {
+          throw new Error('返修必须保留仍有改动的原交付文件，不能自动扩大清单；请由用户选择新清单。')
+        }
+        if (inspected.isolatedHeadOid !== task.external.headOid || inspected.isolatedHeadRef !== task.external.headRef) {
+          throw new Error('外部 Worktree 的分支或 HEAD 已变化，不能标记待验收。')
+        }
+        await this.validateIsolated(task)
+      }
       if (recovery) {
         if (inspected.partial) throw new Error('合并完成后的交付清单必须包含相对合并目标的全部改动。')
         const [firstParent, mergedParent, ...others] = (await out(task.isolatedPath,
@@ -460,6 +479,7 @@ export class TaskStore {
       const review: Review = { id: randomUUID(), fingerprint: inspected.isolatedFingerprint, files: inspected.changedFiles,
         message: title, ...(body ? { body } : {}), snapshot: inspected.snapshot, ...(inspected.partial ? { partial: true } : {}) }
       task.review = review
+      delete task.externalRevisionFiles
       task.phase = 'ready'
       await save()
       return review
@@ -469,14 +489,27 @@ export class TaskStore {
   async continueEditing(id: string, session: SessionLink, reviewId: string, signal?: AbortSignal): Promise<void> {
     await this.locked(async (state, save) => {
       const task = state.tasks.find(t => t.id === id)
-      if (!task || task.phase !== 'ready' || task.review?.id !== reviewId || task.receipt || task.journal || !boundIsolatedSession(task, session)) {
+      if (!task || task.phase !== 'ready' || task.review?.id !== reviewId || task.receipt || task.journal || !await this.isEditingSession(task, session)) {
         throw new Error('待验收状态或隔离会话已变化，不能继续修改。')
       }
       await this.validateIsolated(task)
       signal?.throwIfAborted()
+      if (task.external) task.externalRevisionFiles = [...task.review.files]
       delete task.review
       task.phase = 'working'
       await save()
+    })
+  }
+
+  async resumeExternalEditing(id: string, session: SessionLink, signal?: AbortSignal): Promise<void> {
+    await this.locked(async state => {
+      const task = state.tasks.find(t => t.id === id)
+      if (!task?.external || task.phase !== 'working' || task.review || task.receipt || task.journal ||
+          !task.externalRevisionFiles || !await this.isEditingSession(task, session)) {
+        throw new Error('返修状态或绑定会话已变化。')
+      }
+      await this.validateIsolated(task)
+      signal?.throwIfAborted()
     })
   }
 
@@ -502,13 +535,14 @@ export class TaskStore {
           !(sameSession(task.localSession, expected.session) || boundIsolatedSession(task, expected.session)))) {
         throw new Error('当前不是绑定的 Pi 对话；操作已停止。')
       }
-      if (task.external && action === 'discard' && task.phase === 'ready') {
+      if (task.external && action === 'discard' && ['working', 'ready'].includes(task.phase)) {
         task.phase = 'discarded'
         await save()
         return task
       }
       if (task.external && action === 'commit_ready') throw new Error('外部 Worktree 必须先预览再提交。')
-      if (task.external && action === 'rollback' && expected.revision) throw new Error('外部 Worktree 不支持在插件内返修。')
+      if (task.external && expected.revision && (action !== 'rollback' || !expected.session ||
+          !sameSession(expected.session, expected.revision.session))) throw new Error('返修确认不属于当前外部 Worktree 对话。')
       // The register lock covers this check through the Local write and receipt.
       // Working/ready siblings and isolated-only cleanup never own this slot.
       if (action !== 'discard') assertLocalAcceptanceAvailable(state, task, this.statePath)
@@ -579,7 +613,7 @@ export class TaskStore {
         } else if (action === 'rollback' && task.phase === 'previewed' && task.receipt) {
           const revision = expected.revision
           if (revision) {
-            if (!task.review || !boundIsolatedSession(task, revision.session)) throw new Error('待验收状态或隔离会话已变化，不能继续修改。')
+            if (!task.review || !await this.isEditingSession(task, revision.session)) throw new Error('待验收状态或隔离会话已变化，不能继续修改。')
             await this.validateIsolated(task)
             revision.signal?.throwIfAborted()
           }
@@ -596,6 +630,7 @@ export class TaskStore {
           delete task.receipt
           delete task.journal
           if (revision) {
+            if (task.external) task.externalRevisionFiles = [...task.review!.files]
             delete task.review
             task.phase = 'working'
           } else task.phase = 'ready'

@@ -146,6 +146,31 @@ test('external adoption freezes named paths, shares preview slot and never owns 
   assert.match(await git(f.local, 'worktree', 'list', '--porcelain'), /branch refs\/heads\/external\nlocked/)
 })
 
+test('external revision preserves the last reviewed scope unless the user selects a new one', async t => {
+  const f = await fixture(t)
+  const source = join(f.dir, 'external')
+  await git(f.local, 'worktree', 'add', '-b', 'external', '--', source, f.base.trim())
+  for (const file of ['task.txt', 'unstaged.txt', 'staged.txt']) await writeFile(join(source, file), `${file} external\n`)
+  await git(source, 'add', 'staged.txt')
+  const session = { cwd: source, file: join(f.dir, 'adopt.jsonl'), id: 'adopt' }
+  const request = { source, target: f.local, base: f.base.trim(), title: 'External', files: ['task.txt', 'unstaged.txt'] }
+  const adopted = await f.store.adopt(session, request, await f.store.inspectAdoption(session, request))
+  await assert.rejects(f.store.continueEditing(adopted.id, { ...session, id: 'other' }, adopted.review!.id), /隔离会话已变化/)
+  await f.store.continueEditing(adopted.id, session, adopted.review!.id)
+  await assert.rejects(f.store.markReady(adopted.id, session, 'Revision', ['task.txt']), /仍有改动的原交付文件/)
+  await writeFile(join(source, 'unstaged.txt'), 'unstaged.txt base\n')
+  await assert.rejects(f.store.markReady(adopted.id, session, 'Revision', ['task.txt', 'staged.txt']), /不能自动扩大清单/)
+  const review = await f.store.markReady(adopted.id, session, 'Revision', ['task.txt'])
+  assert.deepEqual(review.files, ['task.txt'])
+  assert.notEqual(review.id, adopted.review!.id)
+  await f.store.continueEditing(adopted.id, session, review.id)
+  const manual = await f.store.markReady(adopted.id, session, 'User changed the selection', ['staged.txt'], { userSelectedFiles: true })
+  assert.deepEqual(manual.files, ['staged.txt'])
+  assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
+  assert.equal(await content(f.local, 'staged.txt'), 'staged.txt base\n')
+  assert.equal(await git(source, 'rev-parse', 'HEAD'), f.base)
+})
+
 test('external source branch drift after preview blocks delivery while preserving rollback', async t => {
   const f = await fixture(t)
   const source = join(f.dir, 'external')

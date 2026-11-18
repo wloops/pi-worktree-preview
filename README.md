@@ -65,7 +65,13 @@ RPC 客户端默认用原生 Ask 让你核对再确认，取消或超时不会�
 /worktree-preview-adopt {"source":"/path/to/external-worktree","target":"/path/to/project","base":"<完整起点提交 OID>","title":"提交标题","files":["src/example.ts"]}
 ```
 
-确认后只登记，不写入 checkout。两个目录须是同一 Git 仓库下的独立 checkout；`base` 必须等于两个 `HEAD` 的唯一共同分叉基点（用 `git merge-base --all <目标 HEAD> <源 HEAD>` 核对）。`files` 只填写本任务的确切仓库相对路径，重命名须列出新旧路径。然后仍可预览、撤回或提交；放弃只解除登记，已预览时须先撤回。外部 Worktree **不支持跳过预览或自动返修**，插件不切换或删除源目录；需要更新清单时，先撤回（如有）并解除登记，再接入。
+确认后只登记，不写入 checkout。两个目录须是同一 Git 仓库下的独立 checkout；`base` 必须是两个 `HEAD` 的唯一共同分叉基点（`git merge-base --all <目标 HEAD> <源 HEAD>`）。`files` 只填本任务的仓库相对路径，重命名须列出新旧路径。
+
+**在接入时的源 Worktree 对话里直接说要改什么。** 只讨论不影响验收。收到改动要求时，确认「继续返修」；如果已经预览，则确认「撤回预览，继续返修」。Agent 在同一轮处理并重新标记待验收，不用重发或重新接入。从目标目录接入的对话只负责验收。
+
+外部返修只开放源 Worktree 内的文件编辑，不运行 shell；需要测试时可在单独终端运行。Agent 不会自动扩大交付清单。需要换清单时，在 fullscreen TUI 用「更多 → 标记待验收（手动）」选择；仅用命令时，可解除登记后按新清单重新接入。
+
+外部 Worktree 不能跳过预览直接提交。插件不会切换源分支或删除源目录；放弃只解除登记。源分支或 `HEAD` 变化后，插件会停止返修或交付，请先处理已有预览再重新接入。
 
 RPC 客户端用 `get_commands` 列出命令、通过 `prompt` 原样发送。收到 `extension_ui_request` 的 `select` 后应先显示提问并回传 `extension_ui_response`，无需等待 `prompt` 回执。简短结果和下一步通过 `setStatus` 显示，完整结果通过 `notify` 发送；以 `worktree-preview ok:` 或 `error:` 为准。已验证真实 Pi RPC；T3 Code Nightly 的适配支持已核对，尚未在 T3 Code / Paseo 界面完成端到端操作。
 

@@ -81,9 +81,9 @@ const recoverChoice = { label: '让 Agent 继续解决冲突', value: 'recover',
 const resumeChoice = { label: '进入 / 恢复 Worktree', value: 'resume' } as const
 const scopeChoice = { label: '调整交付清单', value: 'scope' } as const
 
-async function chooseReviewFiles(ctx: ExtensionContext, files: readonly string[], narrow: boolean) {
+async function chooseReviewFiles(ctx: ExtensionContext, files: readonly string[], narrow: boolean, initial = narrow ? files : []) {
   if (!files.length) throw new Error('没有可验收的 Git 改动。')
-  const selected = new Set(narrow ? files : [])
+  const selected = new Set(initial.filter(path => files.includes(path)))
   const choices: Choice<boolean>[] = files.map(path => ({
     get label() { return `[${selected.has(path) ? 'x' : ' '}] ${JSON.stringify(path)}` },
     value: false,
@@ -122,7 +122,7 @@ const taskVersion = (task?: Task) => task && JSON.stringify([task.id, task.phase
 async function existing(file: string) {
   try { return (await lstat(file)).isFile() } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false; throw e }
 }
-async function isWorktreePath(root: string, path: string) {
+async function isWorktreePath(root: string, path: string, cwd: string, external: boolean) {
   const within = (target: string) => {
     const name = relative(root, target)
     return !!name && name !== '..' && !name.startsWith(`..${sep}`) && !isAbsolute(name) && !name.toLowerCase().split(sep).includes('.git')
@@ -131,13 +131,18 @@ async function isWorktreePath(root: string, path: string) {
   // than Pi's optional home-relative or file-URL forms for mutators.
   const normalized = path.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, ' ').replace(/^@/, '')
   if (normalized === '~' || normalized.startsWith('~/') || normalized.startsWith('file://')) return false
-  let target = resolve(root, normalized)
+  let target = resolve(cwd, normalized)
   if (!within(target)) return false
   let checkingParent = false
   for (;;) {
     try {
       const actual = await realpath(target)
-      return (checkingParent && actual === root) || within(actual)
+      if (!((checkingParent && actual === root) || within(actual))) return false
+      if (external && !checkingParent) {
+        const info = await lstat(target)
+        return info.isFile() && info.nlink === 1
+      }
+      return true
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
       // A dangling symlink is not a new file. Never authorize writes through it.
@@ -495,17 +500,37 @@ export default function extension(pi: ExtensionAPI) {
   let pendingHold: { data: TaskStore; id: string } | undefined
   let incomingHoldFailed = false
   let revisionStopped = false
+  let revising = false
+  let approvedExternalRevision: string | undefined
 
-  async function context(ctx: ExtensionContext) {
+  async function workspace(ctx: ExtensionContext) {
     const data = store ??= new TaskStore(join(await realpath(getAgentDir()), NAME))
-    const cwd = await realpath(ctx.cwd)
+    const cwd = await realpath(ctx.cwd).catch(() => ctx.cwd)
     const tasks = (await data.read()).tasks
     const isolated = tasks.find(task => !task.external && (task.isolatedPath === cwd || cwd.startsWith(task.isolatedPath + '/')))
+    return { data, cwd, isolated, tasks }
+  }
+
+  async function context(ctx: ExtensionContext) {
+    const { data, cwd, isolated, tasks } = await workspace(ctx)
     if (isolated) return { data, cwd, isolated, tasks: [] }
     let local: Awaited<ReturnType<typeof checkout>> | undefined
     try { local = await checkout(cwd) } catch { /* No Git checkout: no workflow entry. */ }
-    const own = local ? tasks.filter(task => task.local.root === local.root || task.external && isBoundSession(ctx, task.localSession)).reverse() : []
+    const own = tasks.filter(task => task.local.root === local?.root || task.external && isBoundSession(ctx, task.localSession)).reverse()
     return { data, cwd, local, isolated, tasks: own }
+  }
+
+  // Identify the bound session independently of the filesystem. A target-side
+  // adopter or a moved source cwd must still pass through the write guard.
+  const externalTask = (ctx: ExtensionContext, tasks: readonly Task[]) => tasks.find(task => task.external && isOpenTask(task) &&
+    task.localSession.id === ctx.sessionManager.getSessionId() && task.localSession.file === ctx.sessionManager.getSessionFile())
+  const editingTask = (ctx: ExtensionContext, state: Pick<Awaited<ReturnType<typeof workspace>>, 'isolated' | 'tasks'>) =>
+    state.isolated ?? externalTask(ctx, state.tasks)
+  const editingSession = (ctx: ExtensionContext, task: Task) => isBoundSession(ctx, task.external ? task.localSession : task.isolatedSession)
+  const isBuiltin = (name: string) => pi.getAllTools().some(tool => tool.name === name && tool.sourceInfo.path === `builtin:${name}`)
+  async function verifyExternalEditor(data: TaskStore, task: Task, link?: SessionLink) {
+    if (!link || !await data.isEditingSession(task, link)) throw new Error('只能在绑定的 Worktree 源对话中返修。')
+    await data.validateIsolated(task)
   }
 
   const openMenu = () => pi.sendUserMessage(`/${NAME}`, { expandPromptTemplates: true })
@@ -600,7 +625,7 @@ export default function extension(pi: ExtensionAPI) {
   // Pi changes its logical cwd without chdir. Coordinate managed sessions with
   // removal, including the interval between native switch and session_start.
   pi.on('session_before_switch', async (event, ctx) => {
-    if (commandAsk || delivering(ctx)) {
+    if (revising || commandAsk || delivering(ctx)) {
       if (ctx.hasUI) ctx.ui.notify('请等待当前操作结束。', 'warning')
       return { cancel: true }
     }
@@ -673,7 +698,7 @@ export default function extension(pi: ExtensionAPI) {
       return { action: 'handled' }
     }
     const history = historyView !== undefined
-    if (runningCommand || delivering(ctx) && !history) {
+    if (revising || runningCommand || delivering(ctx) && !history) {
       if (ctx.hasUI) { restoreDraft(ctx, event.text); commandNotice(ctx, 'error', '操作尚未结束；消息未发送。') }
       return { action: 'handled' }
     }
@@ -711,13 +736,19 @@ export default function extension(pi: ExtensionAPI) {
   pi.on('session_before_compact', () => historyView !== undefined ? { cancel: true } : undefined)
   // Tree navigation can run a summary and change the context silently.
   pi.on('session_before_tree', () => historyView !== undefined ? { cancel: true } : undefined)
-  pi.on('user_bash', (_event, ctx) => {
-    if (historyView === undefined) return
-    if (ctx.hasUI) ctx.ui.notify('历史对话不执行 shell；请返回原对话。', 'warning')
-    return { result: { output: '历史对话未执行 shell。', exitCode: 1, cancelled: false, truncated: false } }
+  pi.on('user_bash', async (_event, ctx) => {
+    let output: string | undefined
+    if (historyView !== undefined) output = '历史对话不执行 shell；请返回原对话。'
+    else {
+      try {
+        if (externalTask(ctx, (await workspace(ctx)).tasks)) output = '外部 Worktree 接入对话不执行 shell；请在单独终端运行检查。'
+      } catch (error) { output = `无法核对 Worktree 状态：${message(error)}` }
+    }
+    if (!output) return
+    if (ctx.hasUI) ctx.ui.notify(output, 'warning')
+    return { result: { output, exitCode: 1, cancelled: false, truncated: false } }
   })
-  const canReadInHistory = (name: string) => historyReadTools.has(name) &&
-    pi.getAllTools().some(tool => tool.name === name && tool.sourceInfo.path === `builtin:${name}`)
+  const canReadInHistory = (name: string) => historyReadTools.has(name) && isBuiltin(name)
 
   pi.on('before_agent_start', async (event, ctx) => {
     if (historyView !== undefined) {
@@ -733,14 +764,20 @@ export default function extension(pi: ExtensionAPI) {
       return
     }
     revisionStopped = false
-    const state = await context(ctx).catch(() => undefined)
-    const task = state?.isolated
+    approvedExternalRevision = undefined
+    const state = await workspace(ctx).catch(() => undefined)
+    const task = state && editingTask(ctx, state)
     if (!task) return
-    const canWork = isBoundSession(ctx, task.isolatedSession) && !task.journal && ['working', 'ready', 'previewed'].includes(task.phase)
-    const guidance = canWork
+    const canWork = editingSession(ctx, task) && !task.journal && ['working', 'ready', 'previewed'].includes(task.phase) &&
+      (!task.external || await state!.data.isEditingSession(task, sessionLink(ctx)!).catch(() => false))
+    const guidance = canWork && task.external
+      ? `For discussion only read. For explicit edits, call ${REVISE} alone and wait for approval; then use built-in edit/write only in this Worktree. After edits call ${TOOL} alone with the still-changed original delivery paths. If the scope must change beyond those paths, ask the user to choose it. Do not retry cancelled revision.`
+      : canWork
       ? `Status at the start of this request: ${task.phase}. For questions, explanations, and discussion, use read-only tools; do not invalidate a review or ask to roll back. If the user actually requests changes after a review was marked ready (including when a Local preview is active), call ${REVISE} alone before editing or running shell commands. The tool handles any required user confirmation. Wait for its success, then implement the existing request yourself in this Worktree, in the same turn, without asking the user to repeat it. If cancelled or unsuccessful, do not edit or retry unless asked again. After verifying, call ${TOOL} with a short commit title and only the exact repo-relative paths for the entire task, including earlier rounds and both sides of renames. Never blindly submit git status or include unrelated runtime/generated files. Then stop editing.`
       : 'This session or task is not editable. Use it for inspection only; do not modify files or mark it ready.'
-    return { systemPrompt: `${event.systemPrompt}\n\nThis is a managed isolated Git worktree. Work only in the active Worktree cwd. ${guidance} Do not write to Local yourself; the user alone controls preview, rollback, delivery and discard.` }
+    const ownership = task.external ? 'This is an adopted external Git worktree. Edit files here only; do not commit, switch branches, or change its HEAD during the task.' :
+      'This is a managed isolated Git worktree. Work only in the active Worktree cwd.'
+    return { systemPrompt: `${event.systemPrompt}\n\n${ownership} ${guidance} Do not write to Local yourself; the user alone controls preview, rollback, delivery and discard.` }
   })
   // Shell cannot be reliably classified as read-only. Keep built-in mutators
   // behind the revision step, including sibling calls while confirmation is open.
@@ -758,7 +795,13 @@ export default function extension(pi: ExtensionAPI) {
       return { block: true, reason: '历史对话只读，不执行修改或 shell。' }
     }
     if (event.toolName === FOLLOW_UP) return { block: true, reason: 'Only available in ended task conversations.' }
-    if ((!guardedTools.has(event.toolName) && event.toolName !== REVISE) || (!activeHold && !incomingHoldFailed)) return
+    if (canReadInHistory(event.toolName)) return
+    let state: Awaited<ReturnType<typeof workspace>>
+    try { state = await workspace(ctx) }
+    catch (error) { return { block: true, reason: `无法核对 Worktree 状态：${message(error)}` } }
+    const task = editingTask(ctx, state)
+    if (!activeHold && !incomingHoldFailed && !task?.external) return
+    if (!task?.external && !guardedTools.has(event.toolName) && event.toolName !== REVISE) return
     const assistant = ctx.sessionManager.getBranch().reverse().find(entry => entry.type === 'message' && entry.message.role === 'assistant')
     const calls = assistant?.type === 'message' && assistant.message.role === 'assistant'
       ? assistant.message.content.filter(part => part.type === 'toolCall') : []
@@ -767,16 +810,23 @@ export default function extension(pi: ExtensionAPI) {
       return { block: true, reason: `${REVISE} 和 ${TOOL} 都必须单独调用，不可与其他工具批量执行。` }
     }
     if (event.toolName === REVISE) return
-    const state = await context(ctx)
-    const task = state.isolated
-    if (task?.phase === 'working' && !task.journal && !revisionStopped && !incomingHoldFailed && isBoundSession(ctx, task.isolatedSession)) {
+    if (task?.phase === 'working' && !task.journal && !revising && !revisionStopped && !incomingHoldFailed && editingSession(ctx, task) &&
+        (!task.external || approvedExternalRevision === task.id)) {
+      if (task.external) {
+        if (event.toolName !== TOOL && (!['edit', 'write'].includes(event.toolName) || !isBuiltin(event.toolName) || event.parentToolCallId)) {
+          return { block: true, reason: '外部 Worktree 只允许内置 edit/write，不执行 shell 或其他写入工具。' }
+        }
+        try { await verifyExternalEditor(state.data, task, sessionLink(ctx)) }
+        catch (error) { return { block: true, reason: `${message(error)} 不要编辑或绕过校验。` } }
+      }
       if ((event.toolName === 'edit' || event.toolName === 'write') &&
-          (typeof event.input.path !== 'string' || !await isWorktreePath(task.isolatedPath, event.input.path))) {
+          (typeof event.input.path !== 'string' || !await isWorktreePath(task.isolatedPath, event.input.path, ctx.cwd, !!task.external))) {
         return { block: true, reason: '只允许编辑当前 Worktree 内的文件。' }
       }
       return
     }
-    const reason = !revisionStopped && task && !task.journal && isBoundSession(ctx, task.isolatedSession) && ['ready', 'previewed'].includes(task.phase)
+    const reason = !revisionStopped && task && !task.journal && editingSession(ctx, task) &&
+        (['ready', 'previewed'].includes(task.phase) || task.external && task.phase === 'working')
       ? `当前处于验收阶段。如果用户要求改动，先单独调用 ${REVISE}；如果只是讨论，请用只读工具。`
       : '当前会话不允许编辑或执行 shell；请勿绕过。'
     return { block: true, reason }
@@ -795,6 +845,7 @@ export default function extension(pi: ExtensionAPI) {
     },
   })
   pi.on('agent_settled', async (event, ctx) => {
+    approvedExternalRevision = undefined
     const turn = historyTurn
     historyTurn = undefined
     if (!turn?.requested || !isBoundSession(ctx, turn.source)) return
@@ -816,44 +867,77 @@ export default function extension(pi: ExtensionAPI) {
   })
   pi.registerTool({
     name: REVISE, label: '开始返修', executionMode: 'sequential',
-    description: 'Only when the user requests edits to a reviewed Worktree, call this alone before changing files or using shell. If there is a Local preview, wait for a user click to roll it back. On success continue the existing request in the same turn; on failure do not edit or ask again. Not for discussion.',
+    description: 'Call alone only for requested edits, not discussion. Wait for any required approval and rollback; on success continue the same request, on failure stop.',
     parameters: Type.Object({}),
     async execute(_id, _params, signal, _update, ctx) {
       const result = (ok: boolean, text: string) => ({ content: [{ type: 'text' as const, text }], details: { ok }, isError: !ok })
       if (busy || revisionStopped) return result(false, '不能开始返修。请勿编辑，也不要在本轮重试。')
       busy = true
+      revising = true
       try {
         signal?.throwIfAborted()
-        const { isolated: task, data } = await context(ctx)
+        const state = await workspace(ctx)
+        const task = editingTask(ctx, state)
+        const { data } = state
         const link = sessionLink(ctx)
-        if (incomingHoldFailed || !task || !link || !isBoundSession(ctx, task.isolatedSession) || task.journal ||
-            !task.review || (task.phase !== 'ready' && (task.phase !== 'previewed' || !task.receipt))) {
+        const resuming = task?.external && task.phase === 'working' && !!task.externalRevisionFiles
+        const rollingBack = task?.phase === 'previewed' && !!task.receipt
+        if (incomingHoldFailed || !task || !link || !editingSession(ctx, task) || task.journal ||
+            (!resuming && (!task.review || (task.phase !== 'ready' && !rollingBack)))) {
           throw new Error('当前不在可返修的 Worktree 验收状态。')
         }
-        if (task.phase === 'ready') {
-          const reviewId = task.review.id
-          await withLoading(ctx, '正在准备返修…', () => data.continueEditing(task.id, link, reviewId, signal))
-        } else {
-          if (ctx.mode !== 'tui' || !ctx.hasUI) throw new Error(`请让用户先运行 /${NAME} rollback 并确认，再重试修改。`)
-          const confirmed = await pick(ctx, '返修前需撤回项目目录的预览', [
-            '撤回后，Agent 会接着处理刚才的要求。',
-            '预览文件若已被修改，将停止并保留现场。',
-            `项目目录：${task.local.root}`,
-          ], [{ label: '撤回预览，继续返修', value: true, tone: 'primary' }, { label: '取消', value: false, tone: 'quiet' }], { signal, tone: 'warning' })
+        if (task.external) await verifyExternalEditor(data, task, link)
+        signal?.throwIfAborted()
+        if (resuming && approvedExternalRevision === task.id) return result(true, '本轮已获准继续返修。')
+        if (rollingBack || task.external) {
+          const title = rollingBack ? '返修前需撤回项目目录的预览' : '继续修改外部 Worktree？'
+          const accept = rollingBack ? '撤回预览，继续返修' : '继续返修'
+          const detail = rollingBack ? ['撤回后，Agent 会接着处理刚才的要求。',
+            '预览文件若已被修改，将停止并保留现场。', `项目目录：${JSON.stringify(task.local.root)}`]
+            : ['Agent 将修改源 Worktree，不写入项目目录。', `来源：${JSON.stringify(task.isolatedPath)}`]
+          let confirmed: boolean | undefined
+          if (ctx.hasUI && ctx.mode === 'tui') {
+            confirmed = await pick(ctx, title, detail, [
+              { label: accept, value: true, tone: 'primary' }, { label: '取消', value: false, tone: 'quiet' },
+            ], { signal, tone: 'warning' })
+          } else if (ctx.hasUI && ctx.mode === 'rpc') {
+            const ask = new AbortController()
+            const approvalSignal = signal ? AbortSignal.any([signal, ask.signal]) : ask.signal
+            commandAsk = ask
+            const expires = Date.now() + confirmationTTL
+            try {
+              const choice = await ctx.ui.select([title, ...detail,
+                `涉及 ${task.receipt?.changedFiles.length ?? task.review?.files.length ?? task.externalRevisionFiles?.length} 个文件。`].join('\n'),
+                ['取消', accept], { signal: approvalSignal, timeout: confirmationTTL })
+              confirmed = choice === accept && !approvalSignal.aborted && Date.now() < expires
+            } finally { if (commandAsk === ask) commandAsk = undefined }
+          } else throw new Error(rollingBack && !task.external ? `请先运行 /${NAME}-rollback 并确认，再重试修改。` : '此客户端不支持返修确认。')
           signal?.throwIfAborted()
-          if (!confirmed) throw new Error('用户取消了撤回，预览保留。')
-          const reviewId = task.review.id
+          if (!confirmed) throw new Error(rollingBack ? '未确认撤回，预览保留。' : '未确认返修，现有状态未改变。')
+        }
+        if (rollingBack) {
           await withLoading(ctx, progress.rollback, () => data.act(task.id, 'rollback', {
-            phase: task.phase, reviewId, previewId: task.receipt?.previewId, revision: { session: link, signal },
+            phase: task.phase, reviewId: task.review!.id, previewId: task.receipt!.previewId, revision: { session: link, signal }, session: link,
           }))
+        } else if (resuming) {
+          await withLoading(ctx, '正在检查返修状态…', () => data.resumeExternalEditing(task.id, link, signal))
+        } else {
+          await withLoading(ctx, '正在准备返修…', () => data.continueEditing(task.id, link, task.review!.id, signal))
+        }
+        if (task.external) {
+          if (ctx.mode === 'rpc') ctx.ui.setStatus(NAME, 'Worktree 返修中')
+          signal?.throwIfAborted()
+          approvedExternalRevision = task.id
         }
         return result(true, '已进入返修。请现在继续处理用户刚才的修改要求，只改本 Worktree，验证后重新标记待验收。')
       } catch (error) {
+        approvedExternalRevision = undefined
         revisionStopped = true
         return result(false, `${message(error)} 不要编辑，也不要在本轮重试。`)
       } finally {
-        busy = false
         await refresh(ctx).catch(() => {})
+        revising = false
+        busy = false
       }
     },
   })
@@ -866,14 +950,19 @@ export default function extension(pi: ExtensionAPI) {
     }),
     async execute(_id, params, signal, _update, ctx) {
       if (signal?.aborted) throw new Error('已取消。')
-      const state = await context(ctx)
+      const state = await workspace(ctx)
       const link = sessionLink(ctx)
-      if (!state.isolated || !link) throw new Error('只能在受管 Worktree 的原始 Pi 会话中标记待验收。')
-      const id = state.isolated.id
+      const task = editingTask(ctx, state)
+      if (!task || !link || !editingSession(ctx, task) || task.external && approvedExternalRevision !== task.id) {
+        throw new Error('只能在绑定的 Worktree 源对话中标记待验收。')
+      }
       const review = await withLoading(ctx, '正在标记待验收…', () =>
-        state.data.markReady(id, link, params.commitMessage, params.files, { body: params.commitBody }))
+        state.data.markReady(task.id, link, params.commitMessage, params.files, { body: params.commitBody,
+          ...(task.external ? { expectedReview: { id: task.review?.id } } : {}) }))
       await refresh(ctx)
-      return { content: [{ type: 'text', text: `已标记待验收（${review.files.length} 个文件）；未修改项目目录。可点击「预览改动」。` }], details: { reviewId: review.id } }
+      const next = ctx.mode === 'rpc' ? `可运行 /${NAME}-preview。` : '可点击「预览改动」。'
+      if (ctx.mode === 'rpc' && task.external) ctx.ui.setStatus(NAME, `Worktree 待验收 · ${review.files.length} 个文件 · /${NAME}-preview`)
+      return { content: [{ type: 'text', text: `已标记待验收（${review.files.length} 个文件）；未修改项目目录。${next}` }], details: { reviewId: review.id } }
     },
   })
 
@@ -1106,7 +1195,7 @@ export default function extension(pi: ExtensionAPI) {
       }
       if (command.kind === 'action') {
         if (!task || task.journal || (command.verb === 'preview' ? task.phase !== 'ready' :
-            command.verb === 'discard' ? !(task.external ? task.phase === 'ready' : isolated && ['ready', 'working'].includes(task.phase)) :
+            command.verb === 'discard' ? !((task.external || isolated) && ['ready', 'working'].includes(task.phase)) :
               task.phase !== 'previewed')) throw new Error('当前任务阶段或对话不允许此操作；先查看 status。')
         const act = commandActions[command.verb]
         const discardFingerprint = act === 'discard' && !task.external ? await data.discardFingerprint(task) : undefined
@@ -1238,7 +1327,10 @@ export default function extension(pi: ExtensionAPI) {
           if (historyTasks(tasks).length) choices.push(historyChoice)
           if (task && isOpenTask(task) && !task.journal && task.phase !== 'creating') {
             if (task.isolatedSession) choices.push({ ...resumeChoice, tone: choices.length ? undefined : 'primary' })
-            if (task.external && task.phase === 'ready') choices.push({ label: '解除外部任务登记', value: 'discard' })
+            if (task.external && ['working', 'ready'].includes(task.phase)) choices.push({ label: '解除外部任务登记', value: 'discard' })
+            if (task.external && task.phase === 'working' && await data.isEditingSession(task, task.localSession).catch(() => false)) {
+              choices.push({ label: '标记待验收（手动）', value: 'mark' })
+            }
           }
         }
         const retained = retainedTasks(tasks)
@@ -1324,15 +1416,16 @@ export default function extension(pi: ExtensionAPI) {
             })
             if (moved.cancelled) throw new Error('Pi 取消了切换。')
           }
-        } else if (choice === 'mark' && isolated) {
+        } else if (choice === 'mark' && task) {
           const link = sessionLink(ctx)
-          if (!link) throw new Error('没有可保存的 Pi 会话。')
-          const candidates = await withLoading(ctx, '正在扫描 Worktree 改动…', () => data.reviewCandidates(isolated))
-          const files = await chooseReviewFiles(ctx, candidates, false)
+          if (!link || !editingSession(ctx, task)) throw new Error('只能在绑定的 Worktree 源对话中标记待验收。')
+          if (task.external) await verifyExternalEditor(data, task, link)
+          const candidates = await withLoading(ctx, '正在扫描 Worktree 改动…', () => data.reviewCandidates(task))
+          const files = await chooseReviewFiles(ctx, candidates, false, task.externalRevisionFiles)
           if (!files || !ctx.isIdle()) return
           await withLoading(ctx, '正在标记待验收…', () =>
-            data.markReady(isolated.id, link, isolated.review?.message ?? 'Worktree task changes', files, {
-              body: isolated.review?.body, expectedReview: { id: isolated.review?.id },
+            data.markReady(task.id, link, task.review?.message ?? 'Worktree task changes', files, {
+              body: task.review?.body, expectedReview: { id: task.review?.id }, userSelectedFiles: true,
             }))
           ctx.ui.notify('已标记待验收；未修改项目目录。', 'info')
         } else if (choice === 'scope' && task?.review && (task.isolatedSession || task.external)) {
