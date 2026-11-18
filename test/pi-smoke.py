@@ -1205,5 +1205,65 @@ exec {real_git} "$@"
         print('real Pi: inherited native compaction and context edit, with a fresh tool loadout', flush=True)
 
 
+def external_adoption():
+    def git(cwd, *args):
+        return subprocess.check_output(['git', '-C', str(cwd), *args], text=True,
+                                       env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'}).strip()
+
+    with tempfile.TemporaryDirectory(prefix='pi-wtp-external-tui-') as folder:
+        root = Path(folder).resolve()
+        repo, source, agent = root / 'project', root / 'external', root / 'agent'
+        repo.mkdir()
+        agent.mkdir()
+        if PACKAGE:
+            subprocess.run(['pi', 'install', PACKAGE], cwd=root, check=True,
+                           env={**os.environ, 'PI_CODING_AGENT_DIR': str(agent)})
+        provider = root / 'offline.ts'
+        provider.write_text(PROVIDER)
+        provider.with_name('smoke-task.md').write_text('Worktree test prompt.\n')
+        skill_dir = root / 'smoke-worktree'
+        skill_dir.mkdir()
+        (skill_dir / 'SKILL.md').write_text('---\nname: smoke-worktree\ndescription: Worktree test skill.\n---\n')
+        (root / 'node_modules').symlink_to(ROOT / 'node_modules', target_is_directory=True)
+        git(repo, 'init', '-q', '-b', 'main')
+        git(repo, 'config', 'user.name', 'Smoke Test')
+        git(repo, 'config', 'user.email', 'smoke@example.invalid')
+        git(repo, 'commit', '--allow-empty', '-m', 'base')
+        git(repo, 'worktree', 'add', '--detach', '--', str(source))
+        (source / 'task.txt').write_text('external task\n')
+        (source / 'unrelated.txt').write_text('leave this in the source\n')
+        state = agent / 'worktree-preview/tasks.json'
+        with Pi(source, agent, provider) as pi:
+            pi.until('[ ] 新建 Worktree')
+            pi.send(b'/worktree-preview-adopt\r')
+            pi.until('已接入外部 Worktree')
+            pi.until('预览改动')
+            adopted, = json.loads(state.read_text())['tasks']
+            assert adopted['phase'] == 'ready' and adopted['review']['files'] == ['task.txt', 'unrelated.txt']
+            assert git(repo, 'status', '--porcelain') == ''
+            pi.click('[ 预览改动 ]')
+            pi.until('预览改动？')
+            pi.until('• "task.txt"')
+            pi.until('• "unrelated.txt"')
+            assert git(repo, 'status', '--porcelain') == ''
+            pi.click('[ 取消 ]')
+            pi.until_gone('预览改动？')
+            pi.click('⋯ 更多')
+            pi.click('调整交付清单')
+            pi.click('[x] "unrelated.txt"')
+            pi.click('保存交付清单')
+            pi.until('已更新交付清单')
+            pi.click('[ 预览改动 ]')
+            pi.until('预览改动？')
+            pi.click('[ 预览 ]')
+            pi.until('已写入项目目录')
+        adopted, = json.loads(state.read_text())['tasks']
+        assert adopted['phase'] == 'previewed' and adopted['review']['files'] == ['task.txt']
+        assert (repo / 'task.txt').read_text() == 'external task\n' and not (repo / 'unrelated.txt').exists()
+        assert (source / 'task.txt').is_file() and (source / 'unrelated.txt').is_file()
+        print('real Pi: adopt goes straight to preview; optional TUI narrowing preserves the source', flush=True)
+
+
 if __name__ == '__main__':
+    external_adoption()
     main()

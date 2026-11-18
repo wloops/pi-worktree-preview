@@ -27,6 +27,7 @@ export interface Task {
   localSession: SessionLink
   isolatedSession?: SessionLink
   followUpOf?: string
+  external?: { headOid: string; headRef: string | null } // Never own, switch, or remove the source checkout.
   review?: Review
   recovery?: ConflictRecovery
   receipt?: PreviewReceipt
@@ -36,6 +37,14 @@ export interface Task {
   commitOid?: string | null
 }
 interface State { version: 1; tasks: Task[] }
+export interface AdoptionRequest {
+  source: string; target: string; base: string; title: string; files: readonly string[]
+}
+export interface AdoptionInspection {
+  local: Checkout; isolated: Checkout; baseOid: string; localHeadRef: string
+  localHeadOid: string; isolatedHeadOid: string; isolatedHeadRef: string | null
+  review: Omit<Review, 'id'>
+}
 export type Action = 'preview' | 'rollback' | 'finalize' | 'commit_ready' | 'discard'
 const oid = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/
 const missing = (error: unknown) => (error as NodeJS.ErrnoException)?.code === 'ENOENT'
@@ -157,9 +166,113 @@ export class TaskStore {
     } finally { await rm(this.lockPath, { recursive: true }); await syncDir(this.directory) }
   }
 
+  async discoverAdoption(session: SessionLink): Promise<AdoptionInspection> {
+    const source = await checkout(session.cwd)
+    const listed = (await runGit(source.root, ['worktree', 'list', '--porcelain', '-z'])).stdout.toString('utf8')
+    // Git lists the main worktree first. Do not guess an alternate checkout or
+    // infer the target from the source branch's upstream (which may be remote).
+    const first = listed.split('\0\0')[0].split('\0')
+    if (!first[0]?.startsWith('worktree ') || first.includes('bare') || first.includes('detached') || source.gitDir === source.commonDir) {
+      throw new Error('请在外部 linked Worktree 的 Pi 对话中运行；没有可自动选择的主 checkout 时，请显式指定接入参数。')
+    }
+    const target = await checkout(first[0].slice('worktree '.length))
+    if (target.gitDir !== target.commonDir || target.commonDir !== source.commonDir || target.root === source.root) {
+      throw new Error('无法确定唯一的主 checkout；请显式指定接入参数。')
+    }
+    const [targetHead, sourceHead] = await Promise.all([target, source].map(dir => out(dir.root, ['rev-parse', 'HEAD^{commit}'])))
+    const base = await out(target.root, ['merge-base', '--all', targetHead, sourceHead])
+    if (!oid.test(base)) throw new Error('未找到唯一共同分叉基点，不能自动接入。')
+    const subject = sourceHead === base ? '' : (await out(source.root, ['show', '-s', '--format=%s', sourceHead])).trim()
+    const title = subject && subject.length <= 200 && !/[\x00-\x1f\x7f]/.test(subject) ? subject : '交付外部 Worktree 改动'
+    const found = await this.inspectAdoptionSnapshot(session, { source: source.root, target: target.root, base, title })
+    if (!same(source, found.isolated) || !same(target, found.local) || found.localHeadOid !== targetHead || found.isolatedHeadOid !== sourceHead) {
+      throw new Error('识别期间 checkout 已变化，请重新识别。')
+    }
+    return found
+  }
+
+  private sameAdoptionHeads(a: AdoptionInspection, b: AdoptionInspection) {
+    return same(a.isolated, b.isolated) && same(a.local, b.local) && a.baseOid === b.baseOid && a.localHeadRef === b.localHeadRef &&
+      a.localHeadOid === b.localHeadOid && a.isolatedHeadOid === b.isolatedHeadOid && a.isolatedHeadRef === b.isolatedHeadRef
+  }
+
+  async inspectAdoption(session: SessionLink, request: AdoptionRequest): Promise<AdoptionInspection> {
+    if (!request.files.length) throw new Error('请明确列出交付文件。')
+    return this.inspectAdoptionSnapshot(session, request)
+  }
+
+  private async inspectAdoptionSnapshot(session: SessionLink, request: Omit<AdoptionRequest, 'files'> & { files?: readonly string[] }): Promise<AdoptionInspection> {
+    if (![request.source, request.target].every(path => path.startsWith('/') && !path.includes('\0')) || !oid.test(request.base)) {
+      throw new Error('请提供绝对目录和完整起点提交 OID。')
+    }
+    const title = request.title.trim()
+    if (!title || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) throw new Error('请提供 1–200 字符的单行提交标题。')
+    const [local, isolated, source, target, current] = await Promise.all([
+      checkout(request.target), checkout(request.source), realpath(request.source), realpath(request.target), checkout(session.cwd),
+    ])
+    const contains = (root: string, path: string) => path === root || path.startsWith(root + '/')
+    const managed = await realpath(this.worktrees).catch(error => { if (missing(error)) return this.worktrees; throw error })
+    if (isolated.root !== source || local.root !== target || local.gitDir === isolated.gitDir || local.commonDir !== isolated.commonDir ||
+        local.commonIdentity !== isolated.commonIdentity || contains(local.root, isolated.root) || contains(isolated.root, local.root) ||
+        contains(managed, isolated.root) || contains(managed, local.root) || !(same(current, local) || same(current, isolated))) {
+      throw new Error('请选择同一 Git 仓库中两个独立的 checkout 根目录，并从其中之一运行接入；不能接入插件自建目录。')
+    }
+    await this.validateLinkedRegistration(local, isolated, true)
+    await Promise.all([assertOrdinary(local), assertOrdinary(isolated)])
+    const [localHeadRef, localHeadOid, sourceHead, baseOid] = await Promise.all([
+      normalRef(local.root), out(local.root, ['rev-parse', 'HEAD^{commit}']),
+      out(isolated.root, ['rev-parse', 'HEAD^{commit}']), out(local.root, ['rev-parse', '--verify', `${request.base}^{commit}`]),
+    ])
+    if (baseOid !== request.base || await out(local.root, ['merge-base', '--all', localHeadOid, sourceHead]) !== baseOid) {
+      throw new Error('起点必须是源 Worktree 与目标当前 HEAD 的唯一共同分叉基点（git merge-base --all）。')
+    }
+    const inspected = await this.engineFactory().inspectReview({ localPath: local.root, isolatedPath: isolated.root, baseOid }, request.files)
+    if (inspected.status === 'error') engineError(inspected)
+    if (!inspected.changedFiles.length) throw new Error('没有相对候选起点可交付的改动。')
+    const sourceRef = await runGit(isolated.root, ['symbolic-ref', '--quiet', 'HEAD'], { allowedExitCodes: [0, 1] })
+    if (inspected.isolatedHeadRef === localHeadRef) throw new Error('源 Worktree 和目标不能检出同一个分支。')
+    if (await out(local.root, ['rev-parse', 'HEAD']) !== localHeadOid || await normalRef(local.root) !== localHeadRef ||
+        inspected.isolatedHeadOid !== sourceHead || await out(isolated.root, ['rev-parse', 'HEAD']) !== sourceHead ||
+        inspected.isolatedHeadRef !== (sourceRef.stdout.toString('utf8').trim() || null) ||
+        !same(await checkout(local.root), local) || !same(await checkout(isolated.root), isolated)) {
+      throw new Error('检查期间 checkout 已变化，请重试。')
+    }
+    return { local, isolated, baseOid, localHeadRef, localHeadOid, isolatedHeadOid: sourceHead,
+      isolatedHeadRef: inspected.isolatedHeadRef, review: { message: title, files: inspected.changedFiles,
+        snapshot: inspected.snapshot, fingerprint: inspected.isolatedFingerprint, ...(inspected.partial ? { partial: true } : {}) } }
+  }
+
+  async adopt(session: SessionLink, request: AdoptionRequest, shown: AdoptionInspection): Promise<Task> {
+    return this.locked(async (state, save) => {
+      const current = await this.inspectAdoption(session, request)
+      const { isolated, local, baseOid, localHeadRef, review, isolatedHeadOid, isolatedHeadRef } = current
+      // Bind the exact selected contents and checkout identities to confirmation.
+      // Unrelated working copy drift doesn't affect the selected delivery.
+      if (!this.sameAdoptionHeads(current, shown) || review.message !== shown.review.message ||
+          JSON.stringify(review.snapshot) !== JSON.stringify(shown.review.snapshot)) {
+        throw new Error('接入来源、目标或交付内容已变化；请重新检查。')
+      }
+      const overlaps = (a: Checkout, b: Checkout | undefined) => !!b && (a.gitDir === b.gitDir ||
+        a.root === b.root || a.root.startsWith(b.root + '/') || b.root.startsWith(a.root + '/'))
+      if (state.tasks.some(t => (!terminal(t) || t.journal) && (sameSession(t.localSession, session) ||
+          overlaps(isolated, t.isolated) || overlaps(isolated, t.local) || overlaps(local, t.isolated)))) {
+        throw new Error('当前会话或相关 checkout 已有冲突的任务；请先结束该任务。')
+      }
+      const task: Task = { id: randomUUID(), external: { headOid: isolatedHeadOid, headRef: isolatedHeadRef },
+        phase: 'ready', baseOid, localHeadRef, local,
+        isolatedPath: isolated.root, isolated, localSession: session, review: { id: randomUUID(), ...review } }
+      state.tasks.push(task)
+      await save()
+      return task
+    })
+  }
+
   async create(local: Checkout, localSession: SessionLink, createSession: (cwd: string, task: Task, prior?: Task) => Promise<SessionLink>, followUpOf?: string): Promise<Task> {
     return this.locked(async (state, save) => {
       if (!same(await checkout(local.root), local)) throw new Error('Local 身份已经变化。')
+      if (state.tasks.some(t => t.external && t.isolated && (!terminal(t) || t.journal) && (t.isolated.root === local.root || t.isolated.gitDir === local.gitDir))) {
+        throw new Error('此 checkout 是进行中外部任务的来源，不能另作预览目标。')
+      }
       if (state.tasks.some(t => sameSession(t.localSession, localSession) && (!terminal(t) || t.journal))) {
         throw new Error('此 Local 会话已有未完成的任务或恢复记录；可新开 Local 会话并行开发。')
       }
@@ -196,13 +309,24 @@ export class TaskStore {
 
   async validateIsolatedIdentity(task: Task) {
     const expected = task.isolated
-    if (!expected || task.isolatedPath !== join(this.worktrees, task.id) || expected.root !== task.isolatedPath ||
+    if (!expected || (!task.external && task.isolatedPath !== join(this.worktrees, task.id)) || expected.root !== task.isolatedPath ||
         expected.root === task.local.root || expected.gitDir === task.local.gitDir || expected.commonDir !== task.local.commonDir ||
         !same(await checkout(task.isolatedPath), expected)) throw new Error('隔离 Worktree 的身份已变化；保留现场。')
+    if (task.external) await this.validateLinkedRegistration(task.local, expected, true)
     return expected
   }
 
-  async validateIsolated(task: Task) { await assertOrdinary(await this.validateIsolatedIdentity(task)) }
+  async validateIsolated(task: Task) {
+    const checkout = await this.validateIsolatedIdentity(task)
+    await assertOrdinary(checkout)
+    if (task.external) {
+      const ref = await runGit(checkout.root, ['symbolic-ref', '--quiet', 'HEAD'], { allowedExitCodes: [0, 1] })
+      if (task.external.headRef !== (ref.stdout.toString('utf8').trim() || null) ||
+          task.external.headOid !== await out(checkout.root, ['rev-parse', 'HEAD'])) {
+        throw new Error('外部 Worktree 的分支或 HEAD 已变化；请重新接入。')
+      }
+    }
+  }
 
   async validateLocalIdentity(task: Task) {
     if (!same(await checkout(task.local.root), task.local)) throw new Error('Local checkout 的身份已变化。')
@@ -221,7 +345,7 @@ export class TaskStore {
       const task = state.tasks.find(t => t.id === id)
       if (!task || task.phase !== 'ready' || task.review?.id !== reviewId || task.receipt || task.journal || task.recovery ||
           !boundIsolatedSession(task, session)) throw new Error('待验收状态或隔离会话已变化，请重新预览。')
-      if (task.review.partial) throw new Error('交付清单未覆盖整个 Worktree，不能自动合并冲突。')
+      if (task.external || task.review.partial) throw new Error('外部 Worktree 或部分交付不能自动合并冲突。')
       assertLocalAcceptanceAvailable(state, task, this.statePath)
       await this.validateLocal(task)
       await this.validateIsolated(task)
@@ -367,12 +491,24 @@ export class TaskStore {
   async act(id: string, action: Action, expected: {
     phase: Phase; reviewId?: string; previewId?: string; discardFingerprint?: string; keepWorktree?: boolean
     revision?: { session: SessionLink; signal?: AbortSignal }
+    session?: SessionLink
   }): Promise<Task> {
     return this.locked(async (state, save) => {
       const task = state.tasks.find(t => t.id === id)
       if (!task || task.journal || task.phase !== expected.phase || task.review?.id !== expected.reviewId || task.receipt?.previewId !== expected.previewId) {
         throw new Error(`任务状态已变化或存在恢复记录；操作已停止。${this.statePath}`)
       }
+      if ((task.external || expected.session) && (!expected.session ||
+          !(sameSession(task.localSession, expected.session) || boundIsolatedSession(task, expected.session)))) {
+        throw new Error('当前不是绑定的 Pi 对话；操作已停止。')
+      }
+      if (task.external && action === 'discard' && task.phase === 'ready') {
+        task.phase = 'discarded'
+        await save()
+        return task
+      }
+      if (task.external && action === 'commit_ready') throw new Error('外部 Worktree 必须先预览再提交。')
+      if (task.external && action === 'rollback' && expected.revision) throw new Error('外部 Worktree 不支持在插件内返修。')
       // The register lock covers this check through the Local write and receipt.
       // Working/ready siblings and isolated-only cleanup never own this slot.
       if (action !== 'discard') assertLocalAcceptanceAvailable(state, task, this.statePath)
@@ -470,7 +606,10 @@ export class TaskStore {
           const commitMessage = formatCommitMessage(task.review.message, task.review.body)
           const done = await engine.finalize({ localPath: task.local.root, receipt: task.receipt, commitMessage, beforeCommit: async (commitOid, before, after) => {
             await this.validateLocal(task)
-            if (expected.keepWorktree) await this.validateIsolatedIdentity(task)
+            // Both checkouts share refs. An external source that changed to
+            // the target branch must not have its HEAD moved by delivery.
+            if (task.external) await this.validateIsolated(task)
+            else if (expected.keepWorktree) await this.validateIsolatedIdentity(task)
             await this.recordCommit(task, 'finalize', task.receipt!, commitOid, before, after, save)
           } })
           if (done.status === 'error') engineError(done)
@@ -523,8 +662,8 @@ export class TaskStore {
   private async completeCommit(task: Task, commitOid: string | null, fingerprint: string, keep: boolean, save: () => Promise<void>) {
     task.phase = 'delivered'
     task.commitOid = commitOid
-    if (keep) task.cleanup = { status: 'retained', reason: '按用户选择保留环境。', requested: true }
-    else if (task.review?.partial) task.cleanup = { status: 'retained', reason: '含未纳入交付清单的改动。', canForce: true }
+    if (!task.external && keep) task.cleanup = { status: 'retained', reason: '按用户选择保留环境。', requested: true }
+    else if (!task.external && task.review?.partial) task.cleanup = { status: 'retained', reason: '含未纳入交付清单的改动。', canForce: true }
     const { journal, receipt } = task
     if (journal?.operation === 'commit_ready') delete task.receipt
     delete task.journal
@@ -536,7 +675,7 @@ export class TaskStore {
       throw error
     }
     await this.deleteIndexArtifacts(journal)
-    if (!keep && !task.review?.partial) {
+    if (!task.external && !keep && !task.review?.partial) {
       try { await this.cleanup(task, fingerprint, save) }
       catch (error) { throw new Error(`已提交 ${commitOid}，但未能确认 Worktree 清理完成：${errText(error)}`, { cause: error }) }
     }
@@ -588,6 +727,7 @@ export class TaskStore {
   }
 
   private async checkCleanupIdentity(task: Task, cwd: string) {
+    if (task.external) throw new Error('外部 Worktree 由原工具管理，插件不会删除。')
     for (const active of [cwd, process.cwd()]) {
       const path = await realpath(active)
       if (path === task.isolatedPath || path.startsWith(task.isolatedPath + '/')) {
@@ -600,12 +740,7 @@ export class TaskStore {
     await assertOrdinary(task.local)
     const isolated = await this.validateIsolatedIdentity(task)
     await assertOrdinary(isolated)
-    const marker = join(isolated.root, '.git')
-    if (!(await lstat(marker)).isFile()) throw new Error('不是受管的 linked Worktree。')
-    const pointer = (await readFile(marker, 'utf8')).replace(/\r?\n$/, '')
-    const backlink = (await readFile(join(isolated.gitDir, 'gitdir'), 'utf8')).replace(/\r?\n$/, '')
-    if (!pointer.startsWith('gitdir: ') || await realpath(resolve(isolated.root, pointer.slice(8))) !== isolated.gitDir ||
-        await realpath(resolve(isolated.gitDir, backlink)) !== marker) throw new Error('Git Worktree 登记与目录不匹配。')
+    await this.validateLinkedRegistration(local, isolated)
     try {
       await lstat(join(isolated.gitDir, 'index.lock'))
       throw new Error('Worktree 的 Git 索引仍被锁定。')
@@ -624,9 +759,20 @@ export class TaskStore {
         if (!mount || mount === isolated.root || mount.startsWith(isolated.root + '/')) throw new Error('无法排除 Worktree 中的挂载点。')
       }
     }
-    const listed = (await runGit(task.local.root, ['worktree', 'list', '--porcelain', '-z'])).stdout.toString('utf8')
-    const entry = listed.split('\0\0').find(record => record.split('\0')[0] === `worktree ${task.isolatedPath}`)
-    if (!entry || entry.split('\0').some(field => /^(locked|prunable)( |$)/.test(field))) throw new Error('Worktree 未注册、已锁定或可被修剪。')
+  }
+
+  private async validateLinkedRegistration(local: Checkout, isolated: Checkout, allowLocked = false) {
+    const marker = join(isolated.root, '.git')
+    if (!(await lstat(marker)).isFile()) throw new Error('不是受管的 linked Worktree。')
+    const pointer = (await readFile(marker, 'utf8')).replace(/\r?\n$/, '')
+    const backlink = (await readFile(join(isolated.gitDir, 'gitdir'), 'utf8')).replace(/\r?\n$/, '')
+    if (!pointer.startsWith('gitdir: ') || await realpath(resolve(isolated.root, pointer.slice(8))) !== isolated.gitDir ||
+        await realpath(resolve(isolated.gitDir, backlink)) !== marker) throw new Error('Git Worktree 登记与目录不匹配。')
+    const listed = (await runGit(local.root, ['worktree', 'list', '--porcelain', '-z'])).stdout.toString('utf8')
+    const entry = listed.split('\0\0').find(record => record.split('\0')[0] === `worktree ${isolated.root}`)
+    if (!entry || entry.split('\0').some(field => /^(prunable)( |$)/.test(field) || (!allowLocked && /^locked( |$)/.test(field)))) {
+      throw new Error('Worktree 未注册、已锁定或可被修剪。')
+    }
   }
 
   private async scanCleanupTree(root: string, hash?: ReturnType<typeof createHash>) {
@@ -675,6 +821,7 @@ export class TaskStore {
   }
 
   private async removeWorktree(task: Task, save: () => Promise<void>) {
+    if (task.external) throw new Error('外部 Worktree 由原工具管理，插件不会删除。')
     // A failed or interrupted removal deliberately leaves the cleanup journal.
     await runGit(task.local.root, ['worktree', 'remove', '--force', '--', task.isolatedPath])
     task.cleanup = { status: 'done' }
@@ -719,14 +866,14 @@ export class TaskStore {
   }
 
   async inspectRetainedRemoval(task: Task, cwd: string): Promise<string> {
-    if (!terminal(task) || task.journal || task.cleanup?.status !== 'retained') throw new Error('仅可清理已结束且没有恢复记录的保留 Worktree。')
+    if (task.external || !terminal(task) || task.journal || task.cleanup?.status !== 'retained') throw new Error('仅可清理已结束且没有恢复记录的保留 Worktree。')
     return this.removalProof(task, cwd)
   }
 
   async removeRetained(id: string, cwd: string, proof: string): Promise<void> {
     await this.locked(async (state, save) => {
       const task = state.tasks.find(item => item.id === id)
-      if (!task || !terminal(task) || task.journal || task.cleanup?.status !== 'retained') throw new Error('保留状态已变化或存在恢复记录，未删除。')
+      if (!task || task.external || !terminal(task) || task.journal || task.cleanup?.status !== 'retained') throw new Error('保留状态已变化或存在恢复记录，未删除。')
       task.journal = { operation: 'cleanup', at: Date.now() }
       await save()
       try {

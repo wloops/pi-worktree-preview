@@ -33,9 +33,45 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 | 直接提交或放弃 | 待验收时可从 **⋯ 更多** 跳过预览直接提交。**放弃任务** 只在对应 Worktree 的菜单里；若已预览，先撤回。 |
 | 续接已结束的对话 | 提交后可留在原任务对话，也可从 **任务历史** 打开。提问不新建；明确要求修改时，Agent 才从项目目录最新 `HEAD` 开新 Worktree，不带旧目录的未提交文件。 |
 
+## 不用 TUI：命令和外部 Worktree
+
+输入 `/worktree-preview-` 查找独立命令，也可发送 `/worktree-preview help` 查看列表：
+
+| 命令 | 用途 |
+| --- | --- |
+| `/worktree-preview-new` | 下一条任务消息发到新 Worktree |
+| `/worktree-preview-status` | 查看任务状态 |
+| `/worktree-preview-resume` | 进入关联的 Worktree 对话 |
+| `/worktree-preview-back` | 返回原对话 |
+| `/worktree-preview-preview` | 发起预览 |
+| `/worktree-preview-rollback` | 发起撤回 |
+| `/worktree-preview-commit` | 发起提交已预览的改动 |
+| `/worktree-preview-discard` | 发起放弃任务或解除外部登记 |
+| `/worktree-preview-confirm <确认码>` | 在同一对话确认（单次有效，5 分钟过期） |
+| `/worktree-preview-cancel` | 取消待确认操作或下次新建 |
+
+原来的 `/worktree-preview <操作>` 仍可用。命令模式从 Worktree 提交或放弃后返回原对话。
+
+### 接入 T3 Code 等客户端已有的 Worktree
+
+1. 在**外部 Worktree 的 Pi 对话**里运行 `/worktree-preview-adopt`，无需参数。插件从 Git 识别主 checkout 和唯一共同分叉基点，登记当前相对起点的改动；不改源目录或目标目录的文件。
+2. 直接运行 `/worktree-preview-preview` 或点击「预览改动」，核对目标、起点和完整文件清单，**确认后**才写入目标目录，不暂存、不提交。
+
+默认纳入所有检测到的改动（包括未跟踪且未忽略的文件）。如果只交付一部分，预览前用「更多 → 调整交付清单」，或发送 `/worktree-preview-adopt 1,3` 只保留当前清单中对应的编号。
+
+共同分叉基点不一定等于任务实际开工点。如果无法自动识别、要指定另一个目标或要自定义提交标题，可在源或目标的 Pi 对话里用 JSON 显式接入并确认：
+
+```text
+/worktree-preview-adopt {"source":"/path/to/external-worktree","target":"/path/to/project","base":"<完整起点提交 OID>","title":"提交标题","files":["src/example.ts"]}
+```
+
+确认后只登记，不写入 checkout。两个目录须是同一 Git 仓库下的独立 checkout；`base` 必须等于两个 `HEAD` 的唯一共同分叉基点（用 `git merge-base --all <目标 HEAD> <源 HEAD>` 核对）。`files` 只填写本任务的确切仓库相对路径，重命名须列出新旧路径。然后仍可预览、撤回或提交；放弃只解除登记，已预览时须先撤回。外部 Worktree **不支持跳过预览或自动返修**，插件不切换或删除源目录；需要更新清单时，先撤回（如有）并解除登记，再接入。
+
+RPC 客户端可通过 `get_commands` 逐条列出命令，须将命令原样交给 Pi 的 `prompt`，并显示 `extension_ui_request` 的 `notify`。`prompt` 的 `handled` 不是操作完成；应看 `worktree-preview ok:`、`confirm:` 或 `error:` 通知，并在切换后刷新会话信息。已验证真实 Pi RPC；尚未验证 T3 Code / Paseo 的具体界面。
+
 ## 安全与限制
 
-- **只交付验收清单。** 预览、撤回、提交和放弃都需点击确认。撤回或提交前会检查分支、索引和预览路径；保留无关的未暂存改动，发现影响验收的变化就停止。验收时不要让别的进程同时写项目目录。
+- **只交付验收清单。** 预览、撤回、提交和放弃都需用户确认。撤回或提交前会检查分支、索引和预览路径；保留无关的未暂存改动，发现影响验收的变化就停止。验收时不要让别的进程同时写项目目录。
 - **中断不自动重试。** 写入前会保留恢复记录，默认在 `~/.pi/agent/worktree-preview/tasks.json`。状态不明时先备份项目目录和 Worktree，不要删记录或锁来强行继续。
 - **清理不等于强删。** 安全检查不通过时保留 Worktree。强删会永久删除整个隔离目录，包括未交付文件，且需要另行确认。
 - Worktree 隔离的是目录，不是安全沙箱；历史对话只读，检查的是当前项目目录，不是历史快照。支持 macOS/Linux（在 macOS 验证），不支持 `--no-session`、稀疏检出、子模块或嵌套仓库。暂不预览 `.gitignore` / `.gitattributes`；提交不运行 Git 钩子、不签名、不推送。
@@ -46,7 +82,8 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 npm ci
 npm run check
 npm test
-# 需要 pi 和 Python pyte；使用临时 Git 仓库与离线测试模型
+# 使用真实 Pi、临时 Git 仓库和离线测试模型；fullscreen 测试另需 Python pyte
+python3 test/pi-rpc-smoke.py
 python3 test/pi-smoke.py
 ```
 
