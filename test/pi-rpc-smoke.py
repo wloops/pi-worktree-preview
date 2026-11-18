@@ -40,9 +40,12 @@ class PiRPC:
 
     def send(self, kind, **values):
         identifier = str(uuid.uuid4())
-        self.process.stdin.write(json.dumps({'type': kind, 'id': identifier, **values}) + '\n')
-        self.process.stdin.flush()
+        self.write({'type': kind, 'id': identifier, **values})
         return identifier
+
+    def write(self, event):
+        self.process.stdin.write(json.dumps(event) + '\n')
+        self.process.stdin.flush()
 
     def wait(self, match, timeout=45):
         deadline = time.monotonic() + timeout
@@ -57,7 +60,7 @@ class PiRPC:
             if event is None:
                 raise AssertionError(f'Pi RPC exited: {self.process.stderr.read()} {self.inbox[-20:]}')
             assert not (event.get('type') == 'extension_ui_request' and event.get('method') in {
-                'select', 'confirm', 'input', 'editor',
+                'confirm', 'input', 'editor',
             }), event
             self.inbox.append(event)
 
@@ -83,13 +86,31 @@ class PiRPC:
     def status(self):
         return json.loads(self.command('status'))
 
-    def challenge(self, args):
-        detail = self.command(args, 'confirm')
+    def status_line(self, contains):
+        return self.wait(lambda e: e.get('method') == 'setStatus' and e.get('statusKey') == 'worktree-preview'
+                         and contains in e.get('statusText', ''))
+
+    def challenge(self, verb):
+        name, _, rest = verb.partition(' ')
+        detail = self.command(f'{name} --text {rest}'.strip(), 'confirm')
         return re.search(r'/worktree-preview-confirm ([a-f0-9-]+)', detail)[1], detail
 
+    def ask(self, args):
+        identifier = self.send('prompt', message=f'{NAME}-{args}')
+        dialog = self.wait(lambda e: e.get('type') == 'extension_ui_request' and e.get('method') == 'select')
+        assert dialog['options'][0] == '取消' and len(dialog['options']) == 2 and dialog['timeout'] == 300_000, dialog
+        assert not any(e.get('id') == identifier and e.get('type') == 'response' for e in self.inbox)
+        return identifier, dialog
+
+    def answer(self, request, *, choice=None, cancel=False, kind='ok'):
+        identifier, dialog = request
+        result = {'cancelled': True} if cancel else {'value': dialog['options'][1] if choice is None else choice}
+        self.write({'type': 'extension_ui_response', 'id': dialog['id'], **result})
+        assert self.reply(identifier)['disposition'] == 'handled'
+        return self.notice(kind)
+
     def act(self, args):
-        token, _ = self.challenge(args)
-        return self.command(f'confirm {token}')
+        return self.answer(self.ask(args))
 
     def __enter__(self):
         return self
@@ -177,6 +198,15 @@ def main():
             pi.command(f'confirm {token}', 'error')
             pi.act('rollback')
             assert target_file.read_text() == 'base\n'
+            cancelled = pi.ask('preview')
+            assert target_file.read_text() == 'base\n'
+            assert '未执行' in pi.answer(cancelled, cancel=True)
+            assert target_file.read_text() == 'base\n'
+            request = pi.ask('preview')
+            assert request[1]['id'] != cancelled[1]['id']
+            pi.write({'type': 'extension_ui_response', 'id': cancelled[1]['id'], 'value': '预览'})
+            assert '未执行' in pi.answer(request, choice='不是批准选项')
+            assert target_file.read_text() == 'base\n'
             pi.act('preview')
             pi.act('commit')
             assert pi.state()['sessionId'] == origin['sessionId']
@@ -207,16 +237,21 @@ def main():
         with PiRPC(source, agent, provider) as pi:
             origin = pi.state()
             listing = pi.command('adopt')
+            pi.status_line(f'下一步：{NAME}-preview')
             assert str(source) in listing and str(repo) in listing and base in listing
             assert '可直接运行' in listing and '-confirm' not in listing
             assert pi.state()['sessionId'] == origin['sessionId']
             assert pi.status()['phase'] == 'ready' and pi.status()['ready'] == ['source only.txt', 'task.txt']
             assert target_file.read_text() == 'task edit\n' and git(source, 'status', '--porcelain=v1') == source_status
             number = re.search(r'(?m)^([0-9]+)\. "task.txt"$', listing)[1]
-            token, detail = pi.challenge('preview')
-            assert all(s in detail for s in (str(source), str(repo), base, 'task.txt', 'source only.txt'))
+            request = pi.ask('preview')
+            detail = request[1]['title']
+            assert all(s in detail for s in (str(source), str(repo), base, '涉及 2 个文件。'))
+            assert 'task.txt' not in detail and 'source only.txt' not in detail
+            assert request[1]['options'] == ['取消', '预览']
             assert not (repo / 'source only.txt').exists()
-            pi.command(f'confirm {token}')
+            pi.answer(request)
+            pi.status_line('改动已写入项目目录')
             assert target_file.read_text() == 'external change\n' and (repo / 'source only.txt').is_file()
             pi.act('rollback')
             assert target_file.read_text() == 'task edit\n' and not (repo / 'source only.txt').exists()
@@ -244,6 +279,13 @@ def main():
             assert pi.status()['phase'] == 'discarded'
             assert target_file.read_text() == 'task edit\n'
             source_file.write_text('external change\n')
+            request = pi.ask(f'adopt {req}')
+            assert 'Adopt selected external change' in request[1]['title']
+            assert '涉及 1 个文件。' in request[1]['title'] and 'task.txt' not in request[1]['title']
+            source_file.write_text('drift during native Ask\n')
+            pi.answer(request, kind='error')
+            assert pi.status()['phase'] == 'discarded' and target_file.read_text() == 'task edit\n'
+            source_file.write_text('external change\n')
             pi.act(f'adopt {req}')
             assert pi.state()['sessionId'] == origin['sessionId']
             assert pi.status()['phase'] == 'ready' and pi.status()['external']
@@ -264,7 +306,7 @@ def main():
         assert git(source, 'rev-parse', 'HEAD') == base and source_file.read_text() == 'external change\n'
         assert git(source, 'status', '--porcelain=v1') == source_status
         assert git(repo, 'show', '-1', '--format=%s', '--name-only') == 'Adopt selected external change\n\ntask.txt'
-        print('PASS real Pi RPC: adopt → preview, optional narrowing, stale checks, JSON fallback, source preserved', flush=True)
+        print('PASS real Pi RPC: adopt → native Ask, readable scope and status, stale checks, text fallback, source preserved', flush=True)
 
 
 if __name__ == '__main__':

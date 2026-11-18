@@ -436,8 +436,32 @@ function adoptionDetails(shown: AdoptionInspection) {
 function numberedAdoptionFiles(files: readonly string[]) {
   return files.map((file, index) => `${index + 1}. ${JSON.stringify(file)}`)
 }
-function commandNotice(ctx: ExtensionContext, kind: 'ok' | 'confirm' | 'error', text: string) {
+function commandNotice(ctx: ExtensionContext, kind: 'ok' | 'confirm' | 'error', text: string, summary?: string) {
+  if (ctx.mode === 'rpc' && (summary || kind === 'error')) {
+    const status = clean(summary ?? `Worktree：${text.split('\n')[0]}`)
+    ctx.ui.setStatus(NAME, Array.from(status).slice(0, 110).join(''))
+  }
   ctx.ui.notify(`${NAME} ${kind}: ${text}`, kind === 'error' ? 'error' : 'info')
+}
+
+function commandFiles(files: readonly string[], compact: boolean): string[] {
+  return compact ? [`涉及 ${files.length} 个文件。`] : ['', `文件（${files.length}）：`, ...numberedAdoptionFiles(files)]
+}
+
+function commandActionDetails(task: Task, act: Action, compact: boolean): string {
+  const { title, lead } = confirmationCopy[act]
+  const externalDiscard = task.external && act === 'discard'
+  const files = task.receipt?.changedFiles ?? task.review?.files ?? []
+  return [externalDiscard ? '解除外部 Worktree 登记？' : title,
+    externalDiscard ? '只解除登记，两个目录都不改动。' : lead,
+    ...(task.external && !externalDiscard ? ['不修改或删除源目录。'] : act === 'finalize' ? ['提交后尝试安全清理；不会强制删除。'] : []),
+    `目标：${JSON.stringify(task.local.root)} · ${JSON.stringify(task.localHeadRef)}`,
+    `来源：${JSON.stringify(task.isolatedPath)}`,
+    ...(task.external && act === 'preview' ? [`起点：${task.baseOid}`] : []),
+    ...(act === 'finalize' && task.review ? [`提交标题：${JSON.stringify(task.review.message)}`,
+      ...(task.review.body ? ['提交正文：', ...task.review.body.split('\n').map(clean)] : [])] : []),
+    ...commandFiles(files, compact),
+  ].join('\n')
 }
 
 async function confirmRemoval(ctx: ExtensionContext, data: TaskStore, task: Task, title: string) {
@@ -465,6 +489,7 @@ export default function extension(pi: ExtensionAPI) {
   let draft: Draft | undefined
   let clickIntent: ClickIntent | undefined
   let confirmation: Confirmation | undefined
+  let commandAsk: AbortController | undefined
   let runningCommand = false
   let activeHold: { data: TaskStore; id: string } | undefined
   let pendingHold: { data: TaskStore; id: string } | undefined
@@ -575,7 +600,7 @@ export default function extension(pi: ExtensionAPI) {
   // Pi changes its logical cwd without chdir. Coordinate managed sessions with
   // removal, including the interval between native switch and session_start.
   pi.on('session_before_switch', async (event, ctx) => {
-    if (delivering(ctx)) {
+    if (commandAsk || delivering(ctx)) {
       if (ctx.hasUI) ctx.ui.notify('请等待当前操作结束。', 'warning')
       return { cancel: true }
     }
@@ -600,6 +625,7 @@ export default function extension(pi: ExtensionAPI) {
   })
   pi.on('session_shutdown', async (event, ctx) => {
     confirmation = undefined
+    commandAsk?.abort()
     try {
       if (event.reason === 'quit' && pendingHold && pendingHold.id !== activeHold?.id) await pendingHold.data.releaseWorktree(pendingHold.id)
       if (!activeHold || (event.reason !== 'quit' && event.reason !== 'resume')) return
@@ -947,20 +973,24 @@ export default function extension(pi: ExtensionAPI) {
   async function runCommand(ctx: ExtensionCommandContext, args: string) {
     let replaced = false
     if (busy || draft || !ctx.isIdle() || delivering(ctx)) {
-      commandNotice(ctx, 'error', '当前对话忙碌，请等待操作结束。')
+      commandNotice(ctx, 'error', commandAsk ? '请先回答或关闭当前确认。' : '当前对话忙碌，请等待操作结束。')
       return
     }
     busy = runningCommand = true
     try {
       const command = parseWorktreeCommand(args)
-      const approval = confirmation
+      let approval = confirmation
       if (command.kind !== 'status' && command.kind !== 'help') confirmation = undefined
       if (command.kind === 'help') {
         commandNotice(ctx, 'ok', `Worktree 命令：\n${standaloneCommands.map(([verb, usage, description]) =>
           `/${NAME}-${verb}${usage} — ${description}`).join('\n')}`)
         return
       }
-      if (command.kind === 'cancel') { armed = undefined; commandNotice(ctx, 'ok', '已取消待确认操作／下次新建。'); return }
+      if (command.kind === 'cancel') {
+        armed = undefined
+        commandNotice(ctx, 'ok', '已取消待确认操作／下次新建。', 'Worktree · 已取消')
+        return
+      }
       const link = sessionLink(ctx)
       if (!link || historyView !== undefined || incomingHoldFailed) throw new Error('当前不是可操作的持久化 Pi 会话。')
       const { local, isolated, tasks, data } = await context(ctx)
@@ -977,7 +1007,7 @@ export default function extension(pi: ExtensionAPI) {
         if (!local || isolated || process.platform === 'win32') throw new Error('只能从受支持的原 Git 项目目录新建 Worktree。')
         if (task && isOpenTask(task)) throw new Error(sessionBusy)
         armed = { sessionId: link.id }
-        commandNotice(ctx, 'ok', '下次发送的任务消息将在新 Worktree 中执行。')
+        commandNotice(ctx, 'ok', '下次发送的任务消息将在新 Worktree 中执行。', '下次发送时新建 Worktree')
         return
       }
       const move = async (target: SessionLink, execute: (next: ExtensionContext) => Promise<void>) => {
@@ -1002,7 +1032,26 @@ export default function extension(pi: ExtensionAPI) {
         await move(target, async next => commandNotice(next, 'ok', JSON.stringify({ cwd: target.cwd, session: target.id })))
         return
       }
-      const offer = (details: string) => commandNotice(ctx, 'confirm', `${details}\n5 分钟内运行 /${NAME}-confirm ${confirmation!.token}，或 /${NAME}-cancel。`)
+      const offer = async (candidate: NonNullable<Confirmation>, details: string, accept: string, text?: true) => {
+        if (ctx.mode !== 'rpc' || text) {
+          confirmation = candidate
+          commandNotice(ctx, 'confirm', `${details}\n5 分钟内运行 /${NAME}-confirm ${candidate.token}，或 /${NAME}-cancel。`, 'Worktree · 等待确认')
+          return
+        }
+        // A native select requires an explicit choice every time. Some hosts
+        // cache yes/no approvals for the entire session; do not use confirm.
+        const ask = new AbortController()
+        commandAsk = ask
+        let choice: string | undefined
+        try { choice = await ctx.ui.select(details, ['取消', accept], { signal: ask.signal, timeout: confirmationTTL }) }
+        finally { if (commandAsk === ask) commandAsk = undefined }
+        if (choice !== accept || ask.signal.aborted || Date.now() >= candidate.expires) {
+          commandNotice(ctx, 'ok', '未执行操作。', 'Worktree · 未执行操作')
+          return
+        }
+        if (!isBoundSession(ctx, candidate.session) || !ctx.isIdle() || delivering(ctx)) throw new Error('验收对话已变化，未执行操作。')
+        return candidate
+      }
       const registerAdoption = async (owner: SessionLink, request: AdoptionRequest, shown: AdoptionInspection) => {
         await withSavedLocal(ctx, async (next, send) => {
           if (next !== ctx) replaced = true
@@ -1011,10 +1060,9 @@ export default function extension(pi: ExtensionAPI) {
             const registered = await withLoading(next, '正在接入外部 Worktree…', () => data.adopt(owner, request, shown))
             armed = undefined
             const files = registered.review?.files ?? []
-            commandNotice(next, 'ok', [`已接入外部 Worktree · ${registered.id}；源和目标文件均未改动。`,
-              `可直接运行 /${NAME}-preview；核对清单后再确认写入。`,
-              ...adoptionDetails(shown), ...numberedAdoptionFiles(files),
-            ].join('\n'))
+            commandNotice(next, 'ok', [`已接入 · ${files.length} 个文件。可直接运行 /${NAME}-preview。`,
+              `未改动源或目标目录。任务：${registered.id}`, ...adoptionDetails(shown), ...numberedAdoptionFiles(files),
+            ].join('\n'), `Worktree 已接入 · ${files.length} 个文件 · 下一步：/${NAME}-preview`)
           } catch (error) { commandNotice(next, 'error', message(error)) }
           finally {
             // A native reopen loads a new extension runtime. Let that runtime
@@ -1034,7 +1082,8 @@ export default function extension(pi: ExtensionAPI) {
         const selected = new Set(command.numbers)
         const files = review.files.filter((_file, index) => selected.has(index + 1))
         const updated = await withLoading(ctx, '正在更新交付清单…', () => data.restrictReview(task.id, link, review.id, files))
-        commandNotice(ctx, 'ok', ['已缩小交付清单；可继续预览。', ...numberedAdoptionFiles(updated.files)].join('\n'))
+        commandNotice(ctx, 'ok', ['已缩小交付清单；可继续预览。', ...numberedAdoptionFiles(updated.files)].join('\n'),
+          `交付清单已更新 · ${updated.files.length} 个文件 · 下一步：/${NAME}-preview`)
         return
       }
       if (command.kind === 'adopt' || command.kind === 'discoverAdoption') {
@@ -1048,9 +1097,10 @@ export default function extension(pi: ExtensionAPI) {
           }, shown)
         } else {
           const shown = await inspect(() => data.inspectAdoption(link, command.request))
-          confirmation = { kind: 'adopt', request: command.request, shown, token: randomUUID(), expires: Date.now() + confirmationTTL, session: link }
-          offer(['接入外部 Worktree（只登记，不改 checkout）：', ...adoptionDetails(shown),
-            ...numberedAdoptionFiles(shown.review.files)].join('\n'))
+          const accepted = await offer({ kind: 'adopt', request: command.request, shown, token: randomUUID(), expires: Date.now() + confirmationTTL, session: link },
+            ['接入外部 Worktree？只登记，不改动两个目录。', ...adoptionDetails(shown),
+              ...commandFiles(shown.review.files, ctx.mode === 'rpc' && !command.text)].join('\n'), '接入 Worktree', command.text)
+          if (accepted?.kind === 'adopt') await registerAdoption(accepted.session, accepted.request, accepted.shown)
         }
         return
       }
@@ -1060,16 +1110,11 @@ export default function extension(pi: ExtensionAPI) {
               task.phase !== 'previewed')) throw new Error('当前任务阶段或对话不允许此操作；先查看 status。')
         const act = commandActions[command.verb]
         const discardFingerprint = act === 'discard' && !task.external ? await data.discardFingerprint(task) : undefined
-        confirmation = { kind: 'action', task, verb: command.verb, discardFingerprint, token: randomUUID(), expires: Date.now() + confirmationTTL, session: link }
-        const details = { source: task.isolatedPath, target: task.local.root, branch: task.localHeadRef,
-          base: task.external && act === 'preview' ? task.baseOid : undefined,
-          title: task.review?.message, body: act === 'finalize' ? task.review?.body : undefined,
-          files: task.receipt?.changedFiles ?? task.review?.files }
-        offer(`${confirmationCopy[act].title}${task.external && act === 'discard' ? '只解除登记，不修改目标。' : confirmationCopy[act].lead}` +
-          `${task.external ? ' 不修改或删除源目录。' : act === 'finalize' ? ' 提交后尝试安全清理；不会强制删除。' : ''} ${JSON.stringify(details)}`)
-        return
-      }
-      if (command.kind !== 'confirm' || !approval || approval.token !== command.token || approval.expires <= Date.now() ||
+        const accept = task.external && act === 'discard' ? '解除登记' : act === 'finalize' && task.external ? '提交' : confirmationCopy[act].button
+        approval = await offer({ kind: 'action', task, verb: command.verb, discardFingerprint, token: randomUUID(), expires: Date.now() + confirmationTTL, session: link },
+          commandActionDetails(task, act, ctx.mode === 'rpc' && !command.text), accept, command.text)
+        if (!approval) return
+      } else if (command.kind !== 'confirm' || !approval || approval.token !== command.token || approval.expires <= Date.now() ||
           !isBoundSession(ctx, approval.session)) throw new Error('确认码无效、已使用或已过期；请重新发起操作。')
       if (approval.kind === 'adopt') {
         await registerAdoption(approval.session, approval.request, approval.shown)
@@ -1083,9 +1128,11 @@ export default function extension(pi: ExtensionAPI) {
         if (!owner) throw new Error('确认会话已变化。')
         const result = await data.act(approved.id, act, { session: owner, phase: approved.phase,
           reviewId: approved.review?.id, previewId: approved.receipt?.previewId, discardFingerprint: approval.discardFingerprint })
-        commandNotice(next, 'ok', `${completed[act]}${result.commitOid ? ` · ${result.commitOid}` : ''}` +
+        const outcome = result.external && act === 'discard' ? '已解除登记。' : completed[act]
+        commandNotice(next, 'ok', `${outcome}${result.commitOid ? ` · ${result.commitOid}` : ''}` +
           (result.external ? ' 外部 Worktree 未修改或删除。' : result.cleanup?.status === 'retained' ?
-            ` Worktree 保留：${result.cleanup.reason ?? result.isolatedPath}` : result.cleanup?.status === 'done' ? ' Worktree 已清理。' : ''))
+            ` Worktree 保留：${result.cleanup.reason ?? result.isolatedPath}` : result.cleanup?.status === 'done' ? ' Worktree 已清理。' : ''),
+          `Worktree · ${outcome}${result.commitOid ? ` · ${result.commitOid.slice(0, 12)}` : ''}`)
       }
       if (!approved.external && isolated && (act === 'finalize' || act === 'discard')) {
         await data.validateLocalIdentity(approved)

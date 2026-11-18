@@ -47,15 +47,15 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 | `/worktree-preview-rollback` | 发起撤回 |
 | `/worktree-preview-commit` | 发起提交已预览的改动 |
 | `/worktree-preview-discard` | 发起放弃任务或解除外部登记 |
-| `/worktree-preview-confirm <确认码>` | 在同一对话确认（单次有效，5 分钟过期） |
-| `/worktree-preview-cancel` | 取消待确认操作或下次新建 |
+| `/worktree-preview-confirm <确认码>` | 仅用于文本确认（同一对话、单次有效、5 分钟过期） |
+| `/worktree-preview-cancel` | 取消文本确认或下次新建 |
 
-原来的 `/worktree-preview <操作>` 仍可用。命令模式从 Worktree 提交或放弃后返回原对话。
+RPC 客户端默认用原生 Ask 让你核对再确认，取消或超时不会执行。不支持弹出提问的客户端可用 `/worktree-preview-preview --text` 等命令索取确认码。原来的 `/worktree-preview <操作>` 仍可用。命令模式从插件新建的 Worktree 提交或放弃后返回原对话。
 
 ### 接入 T3 Code 等客户端已有的 Worktree
 
 1. 在**外部 Worktree 的 Pi 对话**里运行 `/worktree-preview-adopt`，无需参数。插件从 Git 识别主 checkout 和唯一共同分叉基点，登记当前相对起点的改动；不改源目录或目标目录的文件。
-2. 直接运行 `/worktree-preview-preview` 或点击「预览改动」，核对目标、起点和完整文件清单，**确认后**才写入目标目录，不暂存、不提交。
+2. 运行 `/worktree-preview-preview` 或点击「预览改动」。Ask 只显示目标、起点和文件数；想看完整清单可先运行 `/worktree-preview-status`。**确认后**才写入目标目录，不暂存、不提交。
 
 默认纳入所有检测到的改动（包括未跟踪且未忽略的文件）。如果只交付一部分，预览前用「更多 → 调整交付清单」，或发送 `/worktree-preview-adopt 1,3` 只保留当前清单中对应的编号。
 
@@ -67,7 +67,7 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 
 确认后只登记，不写入 checkout。两个目录须是同一 Git 仓库下的独立 checkout；`base` 必须等于两个 `HEAD` 的唯一共同分叉基点（用 `git merge-base --all <目标 HEAD> <源 HEAD>` 核对）。`files` 只填写本任务的确切仓库相对路径，重命名须列出新旧路径。然后仍可预览、撤回或提交；放弃只解除登记，已预览时须先撤回。外部 Worktree **不支持跳过预览或自动返修**，插件不切换或删除源目录；需要更新清单时，先撤回（如有）并解除登记，再接入。
 
-RPC 客户端可通过 `get_commands` 逐条列出命令，须将命令原样交给 Pi 的 `prompt`，并显示 `extension_ui_request` 的 `notify`。`prompt` 的 `handled` 不是操作完成；应看 `worktree-preview ok:`、`confirm:` 或 `error:` 通知，并在切换后刷新会话信息。已验证真实 Pi RPC；尚未验证 T3 Code / Paseo 的具体界面。
+RPC 客户端用 `get_commands` 列出命令、通过 `prompt` 原样发送。收到 `extension_ui_request` 的 `select` 后应先显示提问并回传 `extension_ui_response`，无需等待 `prompt` 回执。简短结果和下一步通过 `setStatus` 显示，完整结果通过 `notify` 发送；以 `worktree-preview ok:` 或 `error:` 为准。已验证真实 Pi RPC；T3 Code Nightly 的适配支持已核对，尚未在 T3 Code / Paseo 界面完成端到端操作。
 
 ## 安全与限制
 
