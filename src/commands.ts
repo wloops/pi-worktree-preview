@@ -6,6 +6,7 @@ export const commandActions: Record<ActionVerb, Action> = { preview: 'preview', 
 export type WorktreeCommand =
   | { kind: 'help' | 'new' | 'status' | 'resume' | 'back' | 'cancel' }
   | { kind: 'action'; verb: ActionVerb; text?: true }
+  | { kind: 'recover' }
   | { kind: 'confirm'; token: string }
   | { kind: 'adopt'; request: AdoptionRequest; text?: true }
   | { kind: 'discoverAdoption' }
@@ -18,7 +19,7 @@ export function parseWorktreeCommand(args: string): WorktreeCommand {
   const payload = useText ? argument!.slice(6).trimStart() : argument
   if (!verb || verb === 'help' && !argument) return { kind: 'help' }
   if (!payload && actions.some(action => action === verb)) return { kind: 'action', verb: verb as ActionVerb, ...(useText ? { text: true } : {}) }
-  if (!argument && (verb === 'new' || verb === 'status' || verb === 'resume' || verb === 'back' || verb === 'cancel')) return { kind: verb }
+  if (!argument && (verb === 'new' || verb === 'status' || verb === 'resume' || verb === 'back' || verb === 'cancel' || verb === 'recover')) return { kind: verb }
   if (verb === 'confirm' && !useText && payload && /^[a-f0-9-]{36}$/u.test(payload)) return { kind: 'confirm', token: payload }
   if (verb === 'adopt') {
     if (!argument) return { kind: 'discoverAdoption' }

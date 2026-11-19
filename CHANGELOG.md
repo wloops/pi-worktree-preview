@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.2.2]
+
+- 接入的外部 Worktree 遇到目标分支的新提交冲突时，也可选择「让 Agent 解决冲突」。冲突只在独立目录处理，不改源 Worktree 或目标 checkout；解决后重新验收，由用户再次预览。
+- 全屏 Pi 提供鼠标操作；Pi RPC 客户端通过原生 `select` 确认，也支持 `--text`。中断后可用 `/worktree-preview-recover` 继续处理。
+
 ## [0.2.1]
 
 - 修复外部 Worktree 返修后无法为新增、删除或替换的交付文件重新标记待验收的问题。

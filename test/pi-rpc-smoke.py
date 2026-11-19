@@ -169,7 +169,7 @@ def main():
         record = agent / 'worktree-preview/tasks.json'
         with PiRPC(repo, agent, provider) as pi:
             origin = pi.state()
-            verbs = ['new', 'status', 'resume', 'back', 'preview', 'rollback', 'commit', 'discard', 'adopt', 'confirm', 'cancel']
+            verbs = ['new', 'status', 'resume', 'back', 'preview', 'recover', 'rollback', 'commit', 'discard', 'adopt', 'confirm', 'cancel']
             available = pi.reply(pi.send('get_commands'))['commands']
             extensions = {cmd['name']: cmd for cmd in available if cmd['source'] == 'extension'}
             assert 'worktree-preview' in extensions
@@ -401,6 +401,58 @@ export default function(pi) {
         assert git(source, 'status', '--porcelain=v1') == source_status + '\n?? "new revision.txt"'
         assert git(repo, 'show', '-1', '--format=%s', '--name-only') == 'Isolated smoke change\n\nnew revision.txt\ntask.txt'
         print('PASS real Pi RPC: native Ask, same-turn revision adds a file after source branch/HEAD change; only reviewed files delivered', flush=True)
+
+        conflict_source = root / "conflict source's checkout"
+        git(repo, 'worktree', 'add', '-b', 'external-conflict', '--', str(conflict_source))
+        (conflict_source / 'task.txt').write_text('external conflict\n')
+        (conflict_source / 'not for delivery.txt').write_text('private\n')
+        with PiRPC(conflict_source, agent, provider) as pi:
+            pi.command('adopt')
+            pi.command('adopt 2')
+            assert pi.status()['ready'] == ['task.txt']
+            old_review = json.loads(record.read_text())['tasks'][-1]['review']['id']
+            source_index = (Path(git(conflict_source, 'rev-parse', '--absolute-git-dir')) / 'index').read_bytes()
+            target_file.write_text('committed conflict\n')
+            git(repo, 'commit', '-am', 'upstream conflict')
+            upstream = git(repo, 'rev-parse', 'HEAD')
+
+            def conflict_ask():
+                identifier, first = pi.ask('preview')
+                pi.write({'type': 'extension_ui_response', 'id': first['id'], 'value': first['options'][1]})
+                second = pi.wait(lambda e: e.get('method') == 'select' and e.get('id') != first['id'])
+                assert second['options'] == ['取消', '让 Agent 解决冲突'], second
+                return identifier, second
+
+            assert pi.answer(conflict_ask(), cancel=True) == '未执行操作。'
+            token, _ = pi.challenge('preview')
+            challenge = pi.command(f'confirm {token}', 'confirm')
+            assert '预览冲突' in challenge
+            recovery_token = re.search(r'/worktree-preview-confirm ([a-f0-9-]+)', challenge)[1]
+            assert token != recovery_token
+            pi.command('cancel')
+            pi.command(f'confirm {recovery_token}', 'error')
+            assert json.loads(record.read_text())['tasks'][-1]['review']['id'] == old_review
+            assert target_file.read_text() == 'committed conflict\n'
+            pause = provider.with_name('pause-recovery')
+            pause.touch()
+            pi.answer(conflict_ask())
+            pi.finish_turn('Conflict recovery paused.')
+            pending = pi.status()
+            assert pending['phase'] == 'working' and pending['conflict']['files'] == ['task.txt']
+            assert Path(pending['conflict']['directory']).is_dir()
+            pause.unlink()
+            pi.command('recover')
+            pi.finish_turn('Conflict resolved in private workspace.')
+            ready = json.loads(record.read_text())['tasks'][-1]
+            assert ready['phase'] == 'ready' and ready['review']['id'] != old_review and ready['resolution']
+            assert target_file.read_text() == 'committed conflict\n' and git(repo, 'rev-parse', 'HEAD') == upstream
+            pi.act('preview')
+            assert target_file.read_text() == 'resolved independently\n' and not (repo / 'not for delivery.txt').exists()
+            pi.act('commit')
+            assert pi.status()['phase'] == 'delivered' and git(repo, 'diff', 'HEAD^', 'HEAD', '--name-only') == 'task.txt'
+            assert (conflict_source / 'task.txt').read_text() == 'external conflict\n'
+            assert (Path(git(conflict_source, 'rev-parse', '--absolute-git-dir')) / 'index').read_bytes() == source_index
+        print('PASS real Pi RPC: external committed conflict, native Ask cancel/resolve, re-review and explicit preview/commit', flush=True)
 
 
 if __name__ == '__main__':

@@ -19,7 +19,7 @@ pi
 
 Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就能点击 Worktree 按钮。如果你把 Pi 设置成了 regular，可用 `/worktree-preview` 打开菜单并用键盘操作；想用鼠标时，再用 `pi --tui-mode fullscreen` 启动。
 
-也可从 [GitHub](https://github.com/wloops/pi-worktree-preview/releases) 安装：`pi install git:github.com/wloops/pi-worktree-preview@v0.2.1`。切换安装来源前，先用 `pi list` 找到旧入口，再用 `pi remove <旧入口>` 移除，避免重复加载。
+也可从 [GitHub](https://github.com/wloops/pi-worktree-preview/releases) 安装：`pi install git:github.com/wloops/pi-worktree-preview@v0.2.2`。切换安装来源前，先用 `pi list` 找到旧入口，再用 `pi remove <旧入口>` 移除，避免重复加载。
 
 1. **新建 Worktree**：勾选编辑器上方的复选框，再发送任务。可以先在原对话讨论；新会话自动带上当前分支的聊天上下文，但目录仍从发送时的 `HEAD` 创建，不复制未提交的文件（聊天里已经出现的内容仍会带上）。这条消息只发到新会话。
 2. **待验收**：Agent 用任务对话的语言拟定提交标题，必要时补充正文，并标记要交付的文件，不改项目目录。清单里有无关文件，可在 **⋯ 更多 → 调整交付清单** 移除。提交前可滚动查看标题、正文和文件清单。
@@ -45,6 +45,8 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 1. **接入**：运行 `/worktree-preview-adopt`。插件识别目标 checkout 和共同分叉基点，登记当前改动，不写入两边的工作目录。
 2. **核对并预览**：运行 `/worktree-preview-status` 查看文件，再运行 `/worktree-preview-preview` 并确认。预览写入目标目录，不暂存、不提交。默认清单包含所有检测到的改动，包括未忽略的新文件；如只交付部分，可先运行 `/worktree-preview-adopt 1,3` 保留第 1、3 项，或在 fullscreen TUI 里用 **⋯ 更多 → 调整交付清单**。
 3. **返修或提交**：需要改就直接在同一对话里说。已预览时，确认 **撤回预览，继续返修** 后，Agent 接着处理同一条消息；未预览时可直接返修。改完重新标记待验收，不用重新接入。验收通过就运行 `/worktree-preview-commit`；想撤回用 `/worktree-preview-rollback`。
+
+**遇到提交冲突（v0.2.2 起）**：在接入任务的源 Worktree 对话选择 **让 Agent 解决冲突**。Agent 在独立目录处理，原外部 Worktree 和目标 checkout 都不变。解决后会重新标记待验收，由你再次预览；目标目录的未提交内容不会带入。处理被中断时可用 **继续解决冲突** 或 `/worktree-preview-recover`。独立冲突目录保留在插件数据目录中，便于检查，不会自动清理。
 
 **外部 Worktree 由原客户端管理。** 返修可以增删交付文件、提交或切换源分支，不用重新接入；Agent 按当前任务重新列清单，不自动带入无关文件。已有预览不会随源改动自动更新，先撤回再预览新版。插件不会拦截外部会话的工具、切换源分支或删除源目录；放弃只解除登记。外部任务需先预览再确认提交。
 
@@ -73,13 +75,14 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 | `/worktree-preview-resume` | 进入关联的 Worktree 对话 |
 | `/worktree-preview-back` | 返回原对话 |
 | `/worktree-preview-preview` | 发起预览 |
+| `/worktree-preview-recover` | 继续已获确认的外部冲突处理 |
 | `/worktree-preview-rollback` | 发起撤回 |
 | `/worktree-preview-commit` | 发起提交已预览的改动 |
 | `/worktree-preview-discard` | 发起放弃任务或解除外部登记 |
 | `/worktree-preview-confirm <确认码>` | 仅用于文本确认（同一对话、单次有效、5 分钟过期） |
 | `/worktree-preview-cancel` | 取消文本确认或下次新建 |
 
-RPC 客户端默认用原生 Ask 确认；取消或超时不执行。Ask 只显示摘要，完整文件清单用 `status` 查看。不支持 Ask 的客户端可用 `/worktree-preview-preview --text` 等命令索取确认码，再运行 `/worktree-preview-confirm <确认码>`。命令模式中，自建任务提交或放弃后会回到原对话。
+RPC 确认用的是 **Pi 原生 `select`**（支持的客户端可显示为 Ask），不依赖 T3 Code。取消或超时不执行。确认只显示摘要，完整文件清单用 `status` 查看。不支持 Ask 的客户端可用 `/worktree-preview-preview --text` 等命令索取确认码，再运行 `/worktree-preview-confirm <确认码>`。命令模式中，自建任务提交或放弃后会回到原对话。
 
 **验证范围：** 已用真实 Pi fullscreen 和 RPC 跑通。已核对 T3 Code Nightly 的命令与 Ask 接口，尚未在 T3 Code 或 Paseo 界面做端到端验证。
 

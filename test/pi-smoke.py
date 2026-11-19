@@ -32,6 +32,7 @@ export default function(pi) {
   const slowVeto = fileURLToPath(new URL('./slow-veto-switch', import.meta.url));
   const persistState = fileURLToPath(new URL('./persist-shutdown-state', import.meta.url));
   const appendContext = fileURLToPath(new URL('./append-shutdown-context', import.meta.url));
+  const pauseRecovery = fileURLToPath(new URL('./pause-recovery', import.meta.url));
   pi.on('session_shutdown', event => {
     if (event.reason !== 'resume' || !event.targetSessionFile?.includes('/history-views/')) return;
     if (existsSync(persistState)) pi.appendEntry('smoke-shutdown-state', { saved: true });
@@ -79,6 +80,8 @@ export default function(pi) {
       const revisionFiles = addsFile ? ['task.txt', 'new revision.txt'] : ['task.txt'];
       const checkRevision = () => tool('bash', {command: `grep -qx '${externalNewText}' ../task.txt${addsFile ? " && echo 'new in revision' > '../new revision.txt'" : ''}`});
       const recover = text?.startsWith("只在当前 detached Worktree 解决冲突") && text.match(/--no-overwrite-ignore ([0-9a-f]{40,64})/);
+      const privateRecovery = text?.match(/^只在独立冲突目录 ("(?:[^"\\\\]|\\\\.)*") 解决冲突/u);
+      const shellQuote = value => "'" + value.replaceAll("'", "'\\\"'\\\"'") + "'";
       const revise = () => tool("worktree_begin_revision");
       const badWrite = () => tool("write", {path:"forbidden.txt",content:"must not be written"});
       const declared = getCurrentTools(context.messages.filter(message => message.role === 'system'));
@@ -116,9 +119,12 @@ export default function(pi) {
           case "write": content = say(last.isError ? 'Write was blocked.' : 'Write succeeded.'); break;
           case "worktree_begin_revision": content = last.isError ? say(text?.includes('after Local drift.') || text?.includes('after Local drift external.') ?
             'Revision blocked by Local drift.' : 'Revision stopped.') : externalRevision ? [tool('read', {path:'../task.txt'})] : [edit()]; break;
-          default: content = say(last.isError ? "Review failed." : recover ? "Conflict resolved in Worktree." : revision || externalRevision ? "Revision ready." : "Worktree ready.");
+          default: content = say(last.isError ? "Review failed." : privateRecovery ? "Conflict resolved in private workspace." : recover ? "Conflict resolved in Worktree." : revision || externalRevision ? "Revision ready." : "Worktree ready.");
         }
-      } else if (recover) content = [tool('bash', {command: `git add -- task.txt && git commit -m checkpoint &&
+      } else if (privateRecovery && existsSync(pauseRecovery)) content = say('Conflict recovery paused.');
+      else if (privateRecovery) content = [tool('bash', {command: `cd ${shellQuote(JSON.parse(privateRecovery[1]))} &&
+        test -n "$(git ls-files -u -- task.txt)" && echo 'resolved independently' > task.txt && git add -- task.txt`})];
+      else if (recover) content = [tool('bash', {command: `git add -- task.txt && git commit -m checkpoint &&
         (git -c merge.renames=false -c merge.directoryRenames=false merge --no-edit --no-overwrite-ignore ${recover[1]}; test $? -eq 1) &&
         test "$(git rev-parse MERGE_HEAD)" = ${recover[1]} && printf 'merged task\\\\n' > task.txt && git add -- task.txt && git commit -m resolve`})];
       else if (text === 'Refresh external delivery list.') content = [tool('worktree_ready_for_review', {
@@ -1289,6 +1295,28 @@ def external_adoption():
         assert not (repo / 'task.txt').exists() and not (repo / 'unrelated.txt').exists()
         assert (source / 'task.txt').read_text() == 'previewed revision\n' and (source / 'unrelated.txt').is_file()
         print('real Pi: external adoption, TUI narrowing and same-turn rollback/revision', flush=True)
+
+        (repo / 'task.txt').write_text('committed upstream\n')
+        git(repo, 'add', 'task.txt')
+        git(repo, 'commit', '-m', 'upstream')
+        head = git(repo, 'rev-parse', 'HEAD')
+        with Pi(subdir, agent, provider, session=Path(adopted['localSession']['file'])) as pi:
+            pi.until('[ 预览改动 ]')
+            pi.click('[ 预览改动 ]')
+            pi.click('[ 预览 ]')
+            pi.until('预览冲突 · 项目目录未修改')
+            pi.click('[ 让 Agent 解决冲突 ]')
+            pi.until('Conflict resolved in private workspace.', 45)
+            pi.until('[ 预览改动 ]')
+            resolved, = json.loads(state.read_text())['tasks']
+            assert resolved['phase'] == 'ready' and resolved['resolution'] and resolved['review']['files'] == ['task.txt']
+            assert (repo / 'task.txt').read_text() == 'committed upstream\n' and git(repo, 'rev-parse', 'HEAD') == head
+            assert (source / 'task.txt').read_text() == 'previewed revision\n'
+            pi.click('[ 预览改动 ]')
+            pi.click('[ 预览 ]')
+            pi.until('已写入项目目录')
+            assert (repo / 'task.txt').read_text() == 'resolved independently\n'
+        print('real Pi: external committed conflict resolved without changing source, then explicitly previewed', flush=True)
 
 
 if __name__ == '__main__':

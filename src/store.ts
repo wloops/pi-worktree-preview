@@ -1,20 +1,23 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { constants, type BigIntStats } from 'node:fs'
-import { lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, stat } from 'node:fs/promises'
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, realpath, rename, rm, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { formatCommitMessage, normalizeCommitBody } from './commit-message.ts'
-import { createSessionCheckoutApplyEngine, runGit, type ApplyConflictPlanResult, type FrozenReview, type PreviewReceipt } from './engine.ts'
+import { createSessionCheckoutApplyEngine, prepareExternalConflictWorkspace, runGit, verifyFrozenReview, type ApplyConflictPlanResult, type FrozenReview, type PreviewReceipt } from './engine.ts'
 
 export interface Checkout { root: string; gitDir: string; commonDir: string; rootIdentity: string; gitIdentity: string; commonIdentity: string }
 export interface SessionLink { id: string; file: string; cwd: string }
 type Phase = 'creating' | 'working' | 'ready' | 'previewed' | 'delivered' | 'discarded'
 interface Review { id: string; fingerprint: string; files: string[]; message: string; body?: string; snapshot?: FrozenReview; partial?: true }
+interface PrivateResolution { checkout: Checkout; sourceReview: FrozenReview; baseOid: string }
 interface ConflictRecovery {
   localHeadOid: string
   isolatedHeadOid: string
   reviewedTreeOid: string
   conflictingFiles: string[]
   cleanEntries: { path: string; entry: string | null }[]
+  workspace?: PrivateResolution
+  files?: string[]
 }
 export interface Task {
   id: string
@@ -31,6 +34,7 @@ export interface Task {
   external?: true | { headOid: string; headRef: string | null }
   review?: Review
   recovery?: ConflictRecovery
+  resolution?: PrivateResolution
   receipt?: PreviewReceipt
   // A null indexBefore explicitly records that no index file existed.
   journal?: { operation: 'preview' | 'rollback' | 'finalize' | 'commit_ready' | 'cleanup'; at: number; commitOid?: string; indexBefore?: string | null; indexAfter?: string }
@@ -339,21 +343,43 @@ export class TaskStore {
     if (await normalRef(task.local.root) !== task.localHeadRef) throw new Error('Local 分支已变化；保留现场。')
   }
 
-  private input(task: Task) { return { localPath: task.local.root, isolatedPath: task.isolatedPath, baseOid: task.baseOid } }
+  private input(task: Task, resolution = task.resolution) {
+    return resolution ? { localPath: task.local.root, isolatedPath: resolution.checkout.root, baseOid: resolution.baseOid, privateResolution: true as const } :
+      { localPath: task.local.root, isolatedPath: task.isolatedPath, baseOid: task.baseOid }
+  }
+
+  private async validateResolution(task: Task, resolution = task.resolution, verifySource = true) {
+    if (!resolution) return
+    const root = resolution.checkout.root
+    const parent = dirname(root)
+    if (!task.external || dirname(parent) !== join(this.directory, 'conflict-workspaces') ||
+        join(parent, 'committed merge checkout') !== root || !same(await checkout(root), resolution.checkout) ||
+        resolution.checkout.gitDir !== join(root, '.git') || resolution.checkout.commonDir !== resolution.checkout.gitDir) {
+      throw new Error('冲突处理目录已变化。')
+    }
+    if (verifySource) await verifyFrozenReview(task.isolatedPath, resolution.sourceReview)
+  }
+
+  async resumeConflictRecovery(id: string, session: SessionLink, expected: ConflictRecovery): Promise<void> {
+    const task = (await this.read()).tasks.find(t => t.id === id)
+    if (!task || task.phase !== 'working' || task.journal || JSON.stringify(task.recovery) !== JSON.stringify(expected) ||
+        !await this.isEditingSession(task, session)) throw new Error('冲突恢复状态已变化。')
+    await this.validateIsolatedIdentity(task)
+    await this.validateResolution(task, expected.workspace)
+  }
 
   async beginConflictRecovery(id: string, session: SessionLink, reviewId: string, shown: ApplyConflictPlanResult): Promise<ConflictRecovery> {
     return this.locked(async (state, save) => {
       const task = state.tasks.find(t => t.id === id)
       if (!task || task.phase !== 'ready' || task.review?.id !== reviewId || task.receipt || task.journal || task.recovery ||
-          !boundIsolatedSession(task, session)) throw new Error('待验收状态或隔离会话已变化，请重新预览。')
-      if (task.external || task.review.partial) throw new Error('外部 Worktree 或部分交付不能自动合并冲突。')
+          !await this.isEditingSession(task, session)) throw new Error('待验收状态或隔离会话已变化，请重新预览。')
+      if (!task.external && task.review.partial) throw new Error('受管 Worktree 的部分交付不能自动合并冲突。')
       assertLocalAcceptanceAvailable(state, task, this.statePath)
       await this.validateLocal(task)
       await this.validateIsolated(task)
       const engine = this.engineFactory()
       const input = this.input(task)
-      const current = await engine.inspectReview(input)
-      if (current.status === 'error') engineError(current)
+      await this.validateResolution(task)
       const latest = await engine.plan(input, task.review)
       if (latest.status === 'error') engineError(latest)
       if (latest.status !== 'conflict' || latest.localFingerprint !== shown.localFingerprint || latest.dirtyConflict !== shown.dirtyConflict ||
@@ -365,6 +391,30 @@ export class TaskStore {
       }
       if (!latest.committedConflictingFiles.length || !latest.cleanEntries) throw new Error('无法安全合并这组冲突；Local 未修改。')
       const { isolatedHeadOid, localHeadOid, reviewedTreeOid, committedConflictingFiles, cleanEntries } = latest
+      if (task.external) {
+        const sourceReview = task.resolution?.sourceReview ?? task.review.snapshot
+        if (!sourceReview || !await isAncestor(task.local.root, input.baseOid, localHeadOid)) throw new Error('无法验证冲突基点。')
+        const directory = join(this.directory, 'conflict-workspaces')
+        await mkdir(directory, { mode: 0o700, recursive: true })
+        if (await realpath(directory) !== directory) throw new Error('冲突处理目录不可用。')
+        const root = await mkdtemp(join(directory, `${task.id}-`))
+        const path = await prepareExternalConflictWorkspace(root, input, task.review, latest)
+        const workspace = { checkout: await checkout(path), sourceReview, baseOid: localHeadOid }
+        await this.validateLocal(task)
+        await this.validateIsolated(task)
+        await this.validateResolution(task, workspace)
+        if (await out(task.local.root, ['rev-parse', 'HEAD']) !== localHeadOid) throw new Error('合并目标已变化，请重新预览。')
+        const recovery: ConflictRecovery = { localHeadOid, isolatedHeadOid, reviewedTreeOid, conflictingFiles: committedConflictingFiles,
+          cleanEntries, workspace, files: task.review.files }
+        task.recovery = recovery
+        delete task.resolution
+        delete task.review
+        task.phase = 'working'
+        await save()
+        return recovery
+      }
+      const current = await engine.inspectReview(input)
+      if (current.status === 'error') engineError(current)
       // Agent can checkpoint the exact reviewed tree without picking up later files or
       // flattening a staged version different from both HEAD and the reviewed content.
       const [headTree, mergeBase] = await Promise.all([
@@ -394,7 +444,9 @@ export class TaskStore {
 
   async reviewCandidates(task: Task): Promise<string[]> {
     await this.validateIsolated(task)
-    const result = await this.engineFactory().inspectReview({ ...this.input(task), baseOid: task.recovery?.localHeadOid ?? task.baseOid })
+    await this.validateResolution(task, task.recovery?.workspace)
+    const input = this.input(task, task.recovery?.workspace)
+    const result = await this.engineFactory().inspectReview({ ...input, baseOid: task.recovery?.localHeadOid ?? input.baseOid })
     if (result.status === 'error') engineError(result)
     return result.changedFiles
   }
@@ -408,6 +460,7 @@ export class TaskStore {
       }
       if (files.length >= task.review.files.length) throw new Error('这里只能缩小交付清单。')
       await this.validateIsolated(task)
+      await this.validateResolution(task)
       const snapshot = await this.engineFactory().restrictReview(this.input(task), task.review, files)
       const review: Review = { ...task.review, id: randomUUID(), files: [...files].sort(), snapshot, partial: true }
       task.review = review
@@ -437,10 +490,17 @@ export class TaskStore {
       if (options?.expectedReview && task.review?.id !== options.expectedReview.id) throw new Error('待验收记录已变化，请重新选择。')
       await this.validateIsolated(task)
       const recovery = task.recovery
+      // Normal re-review looks at the source. A recovery review only reads its private workspace.
+      const workspace = recovery?.workspace
+      if (task.resolution && !workspace) throw new Error('要改动已解决的交付，请先开始返修。')
       const baseOid = recovery?.localHeadOid ?? task.baseOid
-      const inspected = await this.engineFactory().inspectReview({ ...this.input(task), baseOid }, files)
+      if (workspace) {
+        await this.validateResolution(task, workspace)
+        if ((await runGit(workspace.checkout.root, ['ls-files', '-u', '-z'])).stdout.length) throw new Error('还有未解决的冲突；请先暂存已解决的冲突文件。')
+      }
+      const inspected = await this.engineFactory().inspectReview({ ...this.input(task, workspace), baseOid }, workspace ? undefined : files)
       if (inspected.status === 'error') engineError(inspected)
-      if (task.external) {
+      if (task.external && !workspace) {
         // A new review can select a new set of paths at any source HEAD.
         // Only a checkout change during this very scan requires a retry.
         await this.validateIsolated(task)
@@ -450,7 +510,23 @@ export class TaskStore {
           throw new Error('扫描期间源 Worktree 已变化；请重新标记待验收。')
         }
       }
-      if (recovery) {
+      if (workspace && recovery) {
+        const allowed = new Set(recovery.files)
+        const actual = new Map(inspected.snapshot.entries.map(({ path, working, index }) => [path, { working, index }]))
+        const clean = new Map(recovery.cleanEntries.map(({ path, entry }) => [path, entry]))
+        const conflicts = new Set(recovery.conflictingFiles)
+        if (files.length !== actual.size || new Set(files).size !== actual.size || files.some(path => !actual.has(path)) ||
+            [...actual].some(([path, entry]) => !allowed.has(path) || entry.working !== entry.index ||
+              (!conflicts.has(path) && (!clean.has(path) || clean.get(path) !== entry.working))) ||
+            [...clean.keys()].some(path => !actual.has(path)) || inspected.isolatedTreeOid !== inspected.isolatedIndexTreeOid) {
+          throw new Error('冲突结果必须完整、已暂存，并保留非冲突文件的自动合并结果。')
+        }
+        await this.validateResolution(task, workspace)
+        await this.validateLocal(task)
+        if (!await isAncestor(task.local.root, baseOid, 'HEAD')) throw new Error('项目目录已不包含合并目标。')
+        task.resolution = workspace
+        delete task.recovery
+      } else if (recovery) {
         if (inspected.partial) throw new Error('合并完成后的交付清单必须包含相对合并目标的全部改动。')
         const [firstParent, mergedParent, ...others] = (await out(task.isolatedPath,
           ['show', '-s', '--format=%P', inspected.isolatedHeadOid])).split(' ')
@@ -493,6 +569,7 @@ export class TaskStore {
       if (task.external) await this.validateIsolatedIdentity(task)
       else await this.validateIsolated(task)
       signal?.throwIfAborted()
+      delete task.resolution
       delete task.review
       task.phase = 'working'
       await save()
@@ -553,10 +630,12 @@ export class TaskStore {
           await this.cleanup(task, expected.discardFingerprint!, save)
         } else if ((action === 'preview' || action === 'commit_ready') && task.phase === 'ready' && task.review) {
           await this.validateIsolated(task)
-          const res = await engine.plan(this.input(task), task.review)
+          await this.validateResolution(task)
+          const input = this.input(task)
+          const res = await engine.plan(input, task.review)
           if (res.status === 'error') engineError(res)
           const localPlan = res.status === 'conflict' ? res : res.plan
-          if (localPlan.localHeadRef !== task.localHeadRef || !await isAncestor(task.local.root, task.baseOid, localPlan.localHeadOid)) {
+          if (localPlan.localHeadRef !== task.localHeadRef || !await isAncestor(task.local.root, input.baseOid, localPlan.localHeadOid)) {
             throw new Error('Local 分支或历史已变化；未写入 Local。')
           }
           if (res.status === 'conflict') throw new PreviewConflict(res)
@@ -588,6 +667,7 @@ export class TaskStore {
             beforeWrite: async receipt => {
               await this.validateLocal(task)
               await this.validateIsolated(task)
+              await this.validateResolution(task)
               task.receipt = receipt
               task.journal = { operation: 'preview', at: Date.now() }
               await save()
@@ -630,6 +710,7 @@ export class TaskStore {
           delete task.receipt
           delete task.journal
           if (revision) {
+            delete task.resolution
             delete task.review
             task.phase = 'working'
           } else task.phase = 'ready'

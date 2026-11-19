@@ -101,7 +101,7 @@ async function chooseReviewFiles(ctx: ExtensionContext, files: readonly string[]
 function phaseLabel(isolated: boolean, task?: Task) {
   const scope = isolated ? 'Worktree' : '原对话'
   if (!task) return scope
-  const phase = task.journal ? '恢复记录：已停止' : phases[task.phase]
+  const phase = task.journal ? '恢复记录：已停止' : task.recovery ? '解决冲突中' : phases[task.phase]
   return `${scope} · ${isolated ? '' : 'Worktree '}${phase}`
 }
 function phaseTone(task?: Task) {
@@ -112,6 +112,9 @@ function phaseTone(task?: Task) {
 }
 
 function conflictPrompt(recovery: NonNullable<Task['recovery']>) {
+  if (recovery.workspace) {
+    return `只在独立冲突目录 ${JSON.stringify(recovery.workspace.checkout.root)} 解决冲突，不修改项目目录或外部 Worktree。只修 Git 报出的冲突并暂存，不必提交。跑相关测试后调用 ${TOOL}，列出该目录相对 ${recovery.localHeadOid} 的完整改动。不要预览。`
+  }
   return `只在当前 detached Worktree 解决冲突，不写 Local。若未开始，先将已验收改动提交为 checkpoint，再运行 git -c core.hooksPath=/dev/null -c rerere.enabled=false -c merge.renames=false -c merge.directoryRenames=false merge --no-edit --no-autostash --no-overwrite-ignore ${recovery.localHeadOid}。已在合并中就继续，已合并就不要重做。只解决 Git 报出的冲突，保留其余自动合并结果；提交时禁用 Git hooks。只跑相关测试，再用 ${TOOL} 提交相对合并目标的完整任务文件清单；有歧义就停下问我，不要预览。`
 }
 const historyTasks = (tasks: Task[]) => tasks.filter(task =>
@@ -414,13 +417,15 @@ type Draft = Prompt & { token: string; inherited?: FollowUpHistory }
 type ClickIntent = { token: string; sessionId: string; taskVersion: ReturnType<typeof taskVersion>; choice: MenuAction }
 type Confirmation = { token: string; expires: number; session: SessionLink } & (
   | { kind: 'adopt'; request: AdoptionRequest; shown: AdoptionInspection }
-  | { kind: 'action'; task: Task; verb: ActionVerb; discardFingerprint?: string })
+  | { kind: 'action'; task: Task; verb: ActionVerb; discardFingerprint?: string; text?: true }
+  | { kind: 'recover'; task: Task; conflict: PreviewConflict })
 const standaloneCommands = [
   ['new', '', '下次发送时新建 Worktree'],
   ['status', '', '查看 Worktree 与验收状态'],
   ['resume', '', '进入关联的 Worktree 对话'],
   ['back', '', '返回原对话'],
   ['preview', '', '发起预览改动'],
+  ['recover', '', '让 Agent 继续解决冲突'],
   ['rollback', '', '发起撤回预览'],
   ['commit', '', '发起提交已预览的改动'],
   ['discard', '', '发起放弃任务或解除外部登记'],
@@ -491,6 +496,7 @@ export default function extension(pi: ExtensionAPI) {
   let confirmation: Confirmation | undefined
   let commandAsk: AbortController | undefined
   let runningCommand = false
+  let conflictKickoff = false
   let activeHold: { data: TaskStore; id: string } | undefined
   let pendingHold: { data: TaskStore; id: string } | undefined
   let incomingHoldFailed = false
@@ -619,7 +625,7 @@ export default function extension(pi: ExtensionAPI) {
   // Pi changes its logical cwd without chdir. Coordinate managed sessions with
   // removal, including the interval between native switch and session_start.
   pi.on('session_before_switch', async (event, ctx) => {
-    if (revising || commandAsk || delivering(ctx)) {
+    if (revising || commandAsk || conflictKickoff || delivering(ctx)) {
       if (ctx.hasUI) ctx.ui.notify('请等待当前操作结束。', 'warning')
       return { cancel: true }
     }
@@ -692,7 +698,7 @@ export default function extension(pi: ExtensionAPI) {
       return { action: 'handled' }
     }
     const history = historyView !== undefined
-    if (revising || runningCommand || delivering(ctx) && !history) {
+    if (revising || runningCommand || conflictKickoff || delivering(ctx) && !history) {
       if (ctx.hasUI) { restoreDraft(ctx, event.text); commandNotice(ctx, 'error', '操作尚未结束；消息未发送。') }
       return { action: 'handled' }
     }
@@ -757,13 +763,16 @@ export default function extension(pi: ExtensionAPI) {
     if (!task) return
     const canWork = editingSession(ctx, task) && !task.journal && ['working', 'ready', 'previewed'].includes(task.phase) &&
       (!task.external || await state!.data.isEditingSession(task, sessionLink(ctx)!).catch(() => false))
-    const guidance = canWork && task.external
+    const guidance = canWork && task.recovery?.workspace
+      ? `For requested conflict work, resolve only unmerged paths in the independent directory and stage the results. Keep auto-merged files unchanged. Verify the result and call ${TOOL} with the full changed-file list relative to ${task.recovery.localHeadOid}. For discussion, do not edit.`
+      : canWork && task.external
       ? `Status: ${task.phase}. For requested edits in ready or previewed state, call ${REVISE} alone and wait for success; on cancellation stop. If already working, continue directly. After editing and testing, call ${TOOL} alone with the exact paths for the current task, including earlier changes still intended for delivery and any newly relevant paths. Exclude unrelated files. For discussion, leave the review unchanged.`
       : canWork
       ? `Status at the start of this request: ${task.phase}. For questions, explanations, and discussion, use read-only tools; do not invalidate a review or ask to roll back. If the user actually requests changes after a review was marked ready (including when a Local preview is active), call ${REVISE} alone before editing or running shell commands. The tool handles any required user confirmation. Wait for its success, then implement the existing request yourself in this Worktree, in the same turn, without asking the user to repeat it. If cancelled or unsuccessful, do not edit or retry unless asked again. After verifying, call ${TOOL} with a short commit title and only the exact repo-relative paths for the entire task, including earlier rounds and both sides of renames. Never blindly submit git status or include unrelated runtime/generated files. Then stop editing.`
       : task.external ? 'This session can run acceptance commands but is not bound to the source Worktree for revision or review.' :
         'This session or task is not editable. Use it for inspection only; do not modify files or mark it ready.'
-    const ownership = task.external ? 'This is an adopted external Git worktree. Work in the source checkout, not the delivery target.' :
+    const ownership = task.recovery?.workspace ? `For conflict recovery, work only in ${JSON.stringify(task.recovery.workspace.checkout.root)}, not in the source or delivery checkout.` :
+      task.external ? 'This is an adopted external Git worktree. Work in the source checkout, not the delivery target.' :
       'This is a managed isolated Git worktree. Work only in the active Worktree cwd.'
     const delivery = task.external ? 'The user controls the plugin’s preview, rollback, delivery and discard actions.' :
       'Do not write to Local yourself; the user alone controls preview, rollback, delivery and discard.'
@@ -1038,9 +1047,24 @@ export default function extension(pi: ExtensionAPI) {
     }
   }
 
+  function scheduleConflictTurn(ctx: ExtensionContext, data: TaskStore, task: Task, session: SessionLink, recovery: NonNullable<Task['recovery']>) {
+    conflictKickoff = true
+    setImmediate(() => { void (async () => {
+      try {
+        await data.resumeConflictRecovery(task.id, session, recovery)
+        if (!isBoundSession(ctx, session) || !ctx.isIdle() || busy || runningCommand) {
+          throw new Error('未启动 Agent；可在原对话继续解决冲突。')
+        }
+        conflictKickoff = false // Allow just this extension-initiated input to pass.
+        pi.sendUserMessage(conflictPrompt(recovery))
+      } finally { conflictKickoff = false }
+    })().catch(error => { try { commandNotice(ctx, 'error', message(error)) } catch { /* Session closed. */ } }) })
+  }
+
   async function runCommand(ctx: ExtensionCommandContext, args: string) {
     let replaced = false
-    if (busy || draft || !ctx.isIdle() || delivering(ctx)) {
+    let kickoff: (() => void) | undefined
+    if (busy || draft || conflictKickoff || !ctx.isIdle() || delivering(ctx)) {
       commandNotice(ctx, 'error', commandAsk ? '请先回答或关闭当前确认。' : '当前对话忙碌，请等待操作结束。')
       return
     }
@@ -1067,6 +1091,7 @@ export default function extension(pi: ExtensionAPI) {
         commandNotice(ctx, 'ok', JSON.stringify(task ? { id: task.id, phase: task.phase, external: !!task.external,
           source: task.isolatedPath, target: task.local.root, ready: task.review?.files,
           preview: task.receipt?.changedFiles, commit: task.commitOid, cleanup: task.cleanup,
+          conflict: task.recovery?.workspace && { directory: task.recovery.workspace.checkout.root, files: task.recovery.conflictingFiles },
           ...(task.journal ? { recovery: data.statePath, operation: task.journal.operation } : {}) } :
           { phase: 'none', cwd: ctx.cwd, armed: armed?.sessionId === link.id }))
         return
@@ -1172,6 +1197,20 @@ export default function extension(pi: ExtensionAPI) {
         }
         return
       }
+      const startRecovery = async (approved: Task, conflict: PreviewConflict) => {
+        if (!approved.external || !approved.review || !await data.isEditingSession(approved, link)) throw new Error('请在绑定的源 Worktree 对话中解决冲突。')
+        const recovery = await withLoading(ctx, '正在准备冲突处理…', () => data.beginConflictRecovery(approved.id, link, approved.review!.id, conflict.plan))
+        commandNotice(ctx, 'ok', '已准备独立冲突目录，未修改两个 checkout。', 'Worktree · 解决冲突中')
+        kickoff = () => scheduleConflictTurn(ctx, data, approved, link, recovery)
+      }
+      if (command.kind === 'recover') {
+        if (!task?.external || !task.recovery?.workspace) throw new Error('当前没有可继续的外部冲突处理。')
+        const recovery = task.recovery
+        await data.resumeConflictRecovery(task.id, link, recovery)
+        commandNotice(ctx, 'ok', '正在继续解决冲突。', 'Worktree · 解决冲突中')
+        kickoff = () => scheduleConflictTurn(ctx, data, task, link, recovery)
+        return
+      }
       if (command.kind === 'action') {
         if (!task || task.journal || (command.verb === 'preview' ? task.phase !== 'ready' :
             command.verb === 'discard' ? !((task.external || isolated) && ['ready', 'working'].includes(task.phase)) :
@@ -1179,7 +1218,7 @@ export default function extension(pi: ExtensionAPI) {
         const act = commandActions[command.verb]
         const discardFingerprint = act === 'discard' && !task.external ? await data.discardFingerprint(task) : undefined
         const accept = task.external && act === 'discard' ? '解除登记' : act === 'finalize' && task.external ? '提交' : confirmationCopy[act].button
-        approval = await offer({ kind: 'action', task, verb: command.verb, discardFingerprint, token: randomUUID(), expires: Date.now() + confirmationTTL, session: link },
+        approval = await offer({ kind: 'action', task, verb: command.verb, discardFingerprint, text: command.text, token: randomUUID(), expires: Date.now() + confirmationTTL, session: link },
           commandActionDetails(task, act, ctx.mode === 'rpc' && !command.text), accept, command.text)
         if (!approval) return
       } else if (command.kind !== 'confirm' || !approval || approval.token !== command.token || approval.expires <= Date.now() ||
@@ -1190,6 +1229,8 @@ export default function extension(pi: ExtensionAPI) {
       }
       const approved = approval.task
       if (!task || task.id !== approved.id || taskVersion(task) !== taskVersion(approved)) throw new Error('任务已变化；请重新发起操作。')
+      if (approval.kind === 'recover') { await startRecovery(approved, approval.conflict); return }
+      const useText = approval.text
       const act = commandActions[approval.verb]
       const execute = async (next: ExtensionContext) => {
         const owner = sessionLink(next)
@@ -1209,11 +1250,22 @@ export default function extension(pi: ExtensionAPI) {
         pendingDelivery.add(target.file)
         try { await move(target, execute) }
         finally { pendingDelivery.delete(target.file) }
-      } else await execute(ctx)
+      } else {
+        try { await execute(ctx) }
+        catch (error) {
+          if (!(error instanceof PreviewConflict) || act !== 'preview' || !approved.external || !error.plan.cleanEntries ||
+              !error.plan.committedConflictingFiles.length || !await data.isEditingSession(approved, link)) throw error
+          const accepted = await offer({ kind: 'recover', task: approved, conflict: error, token: randomUUID(), expires: Date.now() + confirmationTTL, session: link },
+            ['预览冲突 · 项目目录未修改。', `提交冲突：${error.plan.committedConflictingFiles.length} 个文件。`,
+              '仅在独立目录解决；完成后重新验收。'].join('\n'), '让 Agent 解决冲突', useText)
+          if (accepted?.kind === 'recover') await startRecovery(approved, error)
+        }
+      }
     } catch (error) { if (!replaced) commandNotice(ctx, 'error', message(error)) }
     finally {
-      busy = runningCommand = false
       if (!replaced) await refresh(ctx).catch(() => {})
+      busy = runningCommand = false
+      kickoff?.()
     }
   }
 
@@ -1243,7 +1295,7 @@ export default function extension(pi: ExtensionAPI) {
       // Native history controls use the existing private-view navigation.
       const historyNav = !busy && !!historyView && (args === 'back' || args === 'resume')
       if (!intent && !historyNav && (args.trim() || ctx.mode === 'rpc')) { await runCommand(ctx, args); return }
-      if (busy) return
+      if (busy || conflictKickoff) return
       if (historyView !== undefined) {
         if (!historyView || delivering(ctx) || draft || !ctx.isIdle() || (args !== 'back' && args !== 'resume')) return
         const view = historyView
@@ -1276,6 +1328,7 @@ export default function extension(pi: ExtensionAPI) {
       if (draft || !ctx.isIdle()) return
       busy = true
       let switching = false
+      let kickoff: (() => void) | undefined
       try {
         const { local, isolated, tasks, data, cwd } = await context(ctx)
         const task = currentTask(ctx, isolated, tasks)
@@ -1374,6 +1427,14 @@ export default function extension(pi: ExtensionAPI) {
           const moved = await switchTo(ctx, target.isolatedSession, '正在恢复 Worktree 会话…', async () => { switching = true })
           if (moved.cancelled) throw new Error('Pi 取消了切换。')
         } else if (choice === 'recover' && task?.recovery) {
+          if (task.external && task.recovery.workspace) {
+            const link = sessionLink(ctx)
+            if (!link) throw new Error('找不到绑定的 Pi 会话。')
+            const recovery = task.recovery
+            await data.resumeConflictRecovery(task.id, link, recovery)
+            kickoff = () => scheduleConflictTurn(ctx, data, task, link, recovery)
+            return
+          }
           const target = task.isolatedSession
           if (!target) throw new Error('找不到任务的 Worktree 会话。')
           const resume = async (next: ExtensionContext, send: (text: string) => unknown) => {
@@ -1450,13 +1511,15 @@ export default function extension(pi: ExtensionAPI) {
           const recoverConflict = async (conflict: PreviewConflict) => {
             const plan = conflict.plan
             const target = task.isolatedSession
-            const canRecover = !!target && !!task.review && !task.review.partial && !!plan.cleanEntries && plan.committedConflictingFiles.length > 0
+            const source = sessionLink(ctx)
+            const externalRecovery = !!task.external && !!source && await data.isEditingSession(task, source)
+            const canRecover = (!!target && !task.review?.partial || externalRecovery) && !!task.review && !!plan.cleanEntries && plan.committedConflictingFiles.length > 0
             const canNarrow = (!!target || !!task.external) && !!task.review && task.review.files.length > 1 && !task.recovery
             const paths = plan.conflictingFiles.slice(0, 6).map(path => `• ${JSON.stringify(path)}`)
             if (plan.conflictingFiles.length > paths.length) paths.push(`… 共 ${plan.conflictingFiles.length} 个冲突文件`)
             const recover = await pick(ctx, '预览冲突 · 项目目录未修改', [
               !plan.committedConflictingFiles.length ? '冲突文件若不属于任务，可调整交付清单；否则请先处理项目目录的未提交改动。' :
-                canRecover ? `只在 Worktree 合并项目目录的提交 ${plan.localHeadOid.slice(0, 12)}，生成新验收。` : '这组冲突不能安全地自动交给 Agent。',
+                canRecover ? `只在${externalRecovery ? '独立冲突目录' : ' Worktree'}合并项目目录的提交 ${plan.localHeadOid.slice(0, 12)}，生成新验收。` : '这组冲突不能安全地自动交给 Agent。',
               ...(canRecover && plan.dirtyConflict ? ['项目目录的未提交改动不会带入 Worktree。'] : []),
               ...paths,
             ], [...(canRecover ? [{ label: '让 Agent 解决冲突', value: 'recover' as const, tone: 'primary' as const }] : []),
@@ -1471,6 +1534,11 @@ export default function extension(pi: ExtensionAPI) {
               await withLoading(ctx, '正在更新交付清单…', () => data.restrictReview(task.id, link, reviewId, files))
               await refresh(ctx)
               ctx.ui.notify('已更新交付清单；请重新点击预览。', 'info')
+              return
+            }
+            if (externalRecovery && source) {
+              const recovery = await withLoading(ctx, '正在准备冲突处理…', () => data.beginConflictRecovery(task.id, source, reviewId, plan))
+              kickoff = () => scheduleConflictTurn(ctx, data, task, source, recovery)
               return
             }
             if (!target) return
@@ -1582,8 +1650,9 @@ export default function extension(pi: ExtensionAPI) {
           try { ctx.ui.notify(message(error), 'error') } catch { /* A failed replacement may have invalidated the original context. */ }
         }
       } finally {
-        busy = false
         if (!switching) await refresh(ctx).catch(() => {})
+        busy = false
+        kickoff?.()
       }
     },
   })
