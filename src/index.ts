@@ -22,7 +22,9 @@ const deliveryKey = Symbol.for('pi-worktree-preview.pending-delivery-views')
 const deliveryState = globalThis as typeof globalThis & { [deliveryKey]?: Set<string> }
 const pendingDelivery = deliveryState[deliveryKey] ??= new Set<string>()
 const delivering = (ctx: ExtensionContext) => pendingDelivery.has(ctx.sessionManager.getSessionFile() ?? '')
-const guardedTools = new Set(['edit', 'write', 'bash', 'powershell', TOOL])
+const guardedTools = new Set(['edit', 'write', 'bash', 'powershell'])
+const workflowTools = new Set([TOOL, REVISE, FOLLOW_UP])
+const noWorkflow = '当前对话未绑定 Worktree 任务；无需使用此工具，可按用户要求正常继续。'
 const labels: Record<Action, string> = {
   preview: '预览改动', rollback: '撤回预览', finalize: '确认提交',
   commit_ready: '跳过预览，直接提交', discard: '放弃任务',
@@ -124,6 +126,19 @@ const retainedTasks = (tasks: Task[]) => tasks.filter(task =>
 const taskVersion = (task?: Task) => task && JSON.stringify([task.id, task.phase, task.review?.id, task.receipt?.previewId])
 async function existing(file: string) {
   try { return (await lstat(file)).isFile() } catch (e) { if ((e as NodeJS.ErrnoException).code === 'ENOENT') return false; throw e }
+}
+async function sessionCwd(file: string): Promise<string | undefined> {
+  // Only the native switch should load/migrate or repair the selected session.
+  if (!await existing(file).catch(() => false)) return
+  const fd = await open(file, 'r').catch(() => undefined)
+  if (!fd) return
+  try {
+    const buffer = Buffer.alloc(64 * 1024)
+    const { bytesRead } = await fd.read(buffer)
+    const value = JSON.parse(buffer.toString('utf8', 0, bytesRead).split('\n', 1)[0])
+    if (value?.type === 'session' && typeof value.cwd === 'string') return value.cwd
+  } catch { /* Let Pi handle unreadable session files. */ }
+  finally { await fd.close() }
 }
 async function isWorktreePath(root: string, path: string, cwd: string) {
   const within = (target: string) => {
@@ -497,7 +512,7 @@ export default function extension(pi: ExtensionAPI) {
   let commandAsk: AbortController | undefined
   let runningCommand = false
   let conflictKickoff = false
-  let activeHold: { data: TaskStore; id: string } | undefined
+  let activeHold: { data: TaskStore; id: string; editor: boolean } | undefined
   let pendingHold: { data: TaskStore; id: string } | undefined
   let incomingHoldFailed = false
   let revisionStopped = false
@@ -527,6 +542,10 @@ export default function extension(pi: ExtensionAPI) {
   const editingTask = (ctx: ExtensionContext, state: Pick<Awaited<ReturnType<typeof workspace>>, 'isolated' | 'tasks'>) =>
     state.isolated ?? externalTask(ctx, state.tasks)
   const editingSession = (ctx: ExtensionContext, task: Task) => isBoundSession(ctx, task.external ? task.localSession : task.isolatedSession)
+  async function isWorkflowEditor(ctx: ExtensionContext, data: TaskStore, task: Task): Promise<boolean> {
+    const link = sessionLink(ctx)
+    return !!link && editingSession(ctx, task) && (!task.external || await data.isEditingSession(task, link).catch(() => false))
+  }
   const isBuiltin = (name: string) => pi.getAllTools().some(tool => tool.name === name && tool.sourceInfo.path === `builtin:${name}`)
   async function verifyExternalEditor(data: TaskStore, task: Task, link?: SessionLink) {
     if (!link || !await data.isEditingSession(task, link)) throw new Error('只能在绑定的 Worktree 源对话中返修。')
@@ -633,11 +652,14 @@ export default function extension(pi: ExtensionAPI) {
       if (pendingHold && pendingHold.id !== activeHold?.id) await pendingHold.data.releaseWorktree(pendingHold.id)
       pendingHold = undefined
       const file = event.targetSessionFile
-      if (!file || !await existing(file)) return
-      const data = store ??= new TaskStore(join(await realpath(getAgentDir()), NAME))
-      const targetCwd = SessionManager.open(file).getHeader()?.cwd
+      if (!file) return
+      const targetCwd = await sessionCwd(file)
       if (!targetCwd) return
-      const path = await realpath(targetCwd)
+      const path = await realpath(targetCwd).catch(() => targetCwd)
+      const data = store ??= new TaskStore(join(await realpath(getAgentDir()), NAME))
+      // Only sessions entering the plugin-owned directory can need a lease.
+      const prefix = join(data.directory, 'worktrees') + sep
+      if (!path.startsWith(prefix) && !targetCwd.startsWith(prefix)) return
       const target = (await data.read()).tasks.find(task => !task.external && (path === task.isolatedPath || path.startsWith(task.isolatedPath + '/')))
       if (target) {
         await data.holdWorktree(target.id)
@@ -655,7 +677,7 @@ export default function extension(pi: ExtensionAPI) {
       if (event.reason === 'quit' && pendingHold && pendingHold.id !== activeHold?.id) await pendingHold.data.releaseWorktree(pendingHold.id)
       if (!activeHold || (event.reason !== 'quit' && event.reason !== 'resume')) return
       if (event.reason === 'resume' && event.targetSessionFile) {
-        const targetCwd = SessionManager.open(event.targetSessionFile).getCwd()
+        const targetCwd = await sessionCwd(event.targetSessionFile)
         if (targetCwd === ctx.cwd) return
       }
       await activeHold.data.releaseWorktree(activeHold.id)
@@ -685,7 +707,7 @@ export default function extension(pi: ExtensionAPI) {
         // Native startup can reach a managed cwd while another Pi deletes it.
         incomingHoldFailed = true
         await data.holdWorktree(isolated.id)
-        activeHold = { data, id: isolated.id }
+        activeHold = { data, id: isolated.id, editor: editingSession(ctx, isolated) }
         incomingHoldFailed = false
       }
       await refresh(ctx)
@@ -758,25 +780,36 @@ export default function extension(pi: ExtensionAPI) {
       return
     }
     revisionStopped = false
+    const tools = event.systemPromptOptions.selectedTools.filter(name => !workflowTools.has(name))
+    event.systemPromptOptions.selectedTools = tools
+    delete event.systemPromptOptions.sections.worktree_preview
     const state = await workspace(ctx).catch(() => undefined)
-    const task = state && editingTask(ctx, state)
+    const candidate = state && editingTask(ctx, state)
+    const task = candidate && await isWorkflowEditor(ctx, state.data, candidate) ? candidate : undefined
+    const canWork = !!task && !task.journal && !incomingHoldFailed && ['working', 'ready', 'previewed'].includes(task.phase)
+    if (canWork) tools.push(TOOL, REVISE)
+    else {
+      // Pi restores the live loadout when selectedTools equals the base list.
+      // Drop former workflow tools there too, including after external delivery.
+      const active = pi.getActiveTools()
+      const regular = active.filter(name => !workflowTools.has(name))
+      if (regular.length !== active.length) pi.setActiveTools(regular)
+    }
     if (!task) return
-    const canWork = editingSession(ctx, task) && !task.journal && ['working', 'ready', 'previewed'].includes(task.phase) &&
-      (!task.external || await state!.data.isEditingSession(task, sessionLink(ctx)!).catch(() => false))
     const guidance = canWork && task.recovery?.workspace
       ? `For requested conflict work, resolve only unmerged paths in the independent directory and stage the results. Keep auto-merged files unchanged. Verify the result and call ${TOOL} with the full changed-file list relative to ${task.recovery.localHeadOid}. For discussion, do not edit.`
       : canWork && task.external
       ? `Status: ${task.phase}. For requested edits in ready or previewed state, call ${REVISE} alone and wait for success; on cancellation stop. If already working, continue directly. After editing and testing, call ${TOOL} alone with the exact paths for the current task, including earlier changes still intended for delivery and any newly relevant paths. Exclude unrelated files. For discussion, leave the review unchanged.`
       : canWork
       ? `Status at the start of this request: ${task.phase}. For questions, explanations, and discussion, use read-only tools; do not invalidate a review or ask to roll back. If the user actually requests changes after a review was marked ready (including when a Local preview is active), call ${REVISE} alone before editing or running shell commands. The tool handles any required user confirmation. Wait for its success, then implement the existing request yourself in this Worktree, in the same turn, without asking the user to repeat it. If cancelled or unsuccessful, do not edit or retry unless asked again. After verifying, call ${TOOL} with a short commit title and only the exact repo-relative paths for the entire task, including earlier rounds and both sides of renames. Never blindly submit git status or include unrelated runtime/generated files. Then stop editing.`
-      : task.external ? 'This session can run acceptance commands but is not bound to the source Worktree for revision or review.' :
-        'This session or task is not editable. Use it for inspection only; do not modify files or mark it ready.'
+      : task.external ? 'Worktree delivery tools are unavailable in the current task state. Use the host client’s normal tools as appropriate.' :
+        'This managed task is not editable. Use it for inspection only; do not modify files or mark it ready.'
     const ownership = task.recovery?.workspace ? `For conflict recovery, work only in ${JSON.stringify(task.recovery.workspace.checkout.root)}, not in the source or delivery checkout.` :
       task.external ? 'This is an adopted external Git worktree. Work in the source checkout, not the delivery target.' :
       'This is a managed isolated Git worktree. Work only in the active Worktree cwd.'
     const delivery = task.external ? 'The user controls the plugin’s preview, rollback, delivery and discard actions.' :
       'Do not write to Local yourself; the user alone controls preview, rollback, delivery and discard.'
-    return { systemPrompt: `${event.systemPrompt}\n\n${ownership} ${guidance} ${delivery}` }
+    event.systemPromptOptions.sections.worktree_preview = `${ownership} ${guidance} ${delivery}`
   })
   // In managed Worktrees, keep built-in mutators behind the revision step,
   // including sibling calls while confirmation is open.
@@ -793,17 +826,17 @@ export default function extension(pi: ExtensionAPI) {
       }
       return { block: true, reason: '历史对话只读，不执行修改或 shell。' }
     }
-    if (event.toolName === FOLLOW_UP) return { block: true, reason: 'Only available in ended task conversations.' }
-    if (canReadInHistory(event.toolName)) return
+    if (event.toolName === FOLLOW_UP || canReadInHistory(event.toolName)) return
     const workflowTool = event.toolName === TOOL || event.toolName === REVISE
-    // An adopted Worktree remains under the host client's tool policy. Only
-    // intercept its own workflow tools, not the client's workspace tools.
-    if (!workflowTool && ((!activeHold && !incomingHoldFailed) || !guardedTools.has(event.toolName))) return
+    // A lease protects the directory from cleanup; only the bound managed
+    // conversation gets editing gates. Adopted sessions use the host tools.
+    const managedEditor = activeHold?.editor || incomingHoldFailed
+    if (!workflowTool && (!managedEditor || !guardedTools.has(event.toolName))) return
     let state: Awaited<ReturnType<typeof workspace>>
     try { state = await workspace(ctx) }
-    catch (error) { return { block: true, reason: `无法核对 Worktree 状态：${message(error)}` } }
+    catch (error) { return managedEditor ? { block: true, reason: `无法核对 Worktree 状态：${message(error)}` } : undefined }
     const task = editingTask(ctx, state)
-    if (!activeHold && !incomingHoldFailed && !task?.external) return
+    if (!managedEditor && (!task || !await isWorkflowEditor(ctx, state.data, task))) return
     const assistant = ctx.sessionManager.getBranch().reverse().find(entry => entry.type === 'message' && entry.message.role === 'assistant')
     const calls = assistant?.type === 'message' && assistant.message.role === 'assistant'
       ? assistant.message.content.filter(part => part.type === 'toolCall') : []
@@ -832,6 +865,7 @@ export default function extension(pi: ExtensionAPI) {
     description: 'Answer or clarify here read-only; call this tool alone only if the user explicitly asks for project changes.',
     parameters: Type.Object({}),
     async execute(_id, _params, signal, _update, ctx) {
+      if (historyView === undefined) return { content: [{ type: 'text', text: noWorkflow }], details: {}, isError: true }
       const turn = historyTurn
       if (!turn || !historyCanFollowUp || delivering(ctx) || turn.requested || !isBoundSession(ctx, turn.source) || signal?.aborted) {
         return { content: [{ type: 'text', text: '未开启下一轮。' }], details: {}, isError: true }
@@ -861,23 +895,24 @@ export default function extension(pi: ExtensionAPI) {
     }
   })
   pi.registerTool({
-    name: REVISE, label: '开始返修', executionMode: 'sequential',
+    name: REVISE, label: '开始返修', defaultActive: false, exposure: 'model-only', executionMode: 'sequential',
     description: 'Call alone only for requested edits, not discussion. Wait for any required approval and rollback; on success continue the same request, on failure stop.',
     parameters: Type.Object({}),
     async execute(_id, _params, signal, _update, ctx) {
       const result = (ok: boolean, text: string) => ({ content: [{ type: 'text' as const, text }], details: { ok }, isError: !ok })
+      const state = await workspace(ctx).catch(() => undefined)
+      const task = state && editingTask(ctx, state)
+      const link = sessionLink(ctx)
+      if (!state || !task || !link || !await isWorkflowEditor(ctx, state.data, task)) return result(false, noWorkflow)
       if (busy || revisionStopped) return result(false, '不能开始返修。请勿编辑，也不要在本轮重试。')
       busy = true
       revising = true
       try {
         signal?.throwIfAborted()
-        const state = await workspace(ctx)
-        const task = editingTask(ctx, state)
         const { data } = state
-        const link = sessionLink(ctx)
-        const resuming = task?.external && task.phase === 'working'
-        const rollingBack = task?.phase === 'previewed' && !!task.receipt
-        if (incomingHoldFailed || !task || !link || !editingSession(ctx, task) || task.journal ||
+        const resuming = task.external && task.phase === 'working'
+        const rollingBack = task.phase === 'previewed' && !!task.receipt
+        if (incomingHoldFailed || task.journal ||
             (!resuming && (!task.review || (task.phase !== 'ready' && !rollingBack)))) {
           throw new Error('当前不在可返修的 Worktree 验收状态。')
         }
@@ -930,7 +965,7 @@ export default function extension(pi: ExtensionAPI) {
     },
   })
   pi.registerTool({
-    name: TOOL, label: '标记待验收', executionMode: 'sequential', description: 'Mark the current Worktree ready for user review. Does not write to Local or commit. Call after edits and tests.',
+    name: TOOL, label: '标记待验收', defaultActive: false, exposure: 'model-only', executionMode: 'sequential', description: 'Mark the current Worktree ready for user review. Does not write to Local or commit. Call after edits and tests.',
     parameters: Type.Object({
       commitMessage: Type.String({ description: 'A one-line commit title (1–200 characters). Follow the language of the current task conversation, not UI labels, tool output, or automatic recovery instructions. Honor any explicit title or language requested by the user.' }),
       commitBody: Type.Optional(Type.String({ maxLength: MAX_COMMIT_BODY, description: 'Optional commit body, without the title. Add only necessary details, such as why the change was made, important behavior, or compatibility impact. Use the title language unless the user requests otherwise. Omit when the title is enough.' })),
@@ -938,12 +973,10 @@ export default function extension(pi: ExtensionAPI) {
     }),
     async execute(_id, params, signal, _update, ctx) {
       if (signal?.aborted) throw new Error('已取消。')
-      const state = await workspace(ctx)
+      const state = await workspace(ctx).catch(() => undefined)
       const link = sessionLink(ctx)
-      const task = editingTask(ctx, state)
-      if (!task || !link || !editingSession(ctx, task) || task.external && !await state.data.isEditingSession(task, link)) {
-        throw new Error('只能在绑定的 Worktree 源对话中标记待验收。')
-      }
+      const task = state && editingTask(ctx, state)
+      if (!state || !task || !link || !await isWorkflowEditor(ctx, state.data, task)) throw new Error(noWorkflow)
       const review = await withLoading(ctx, '正在标记待验收…', () =>
         state.data.markReady(task.id, link, params.commitMessage, params.files, { body: params.commitBody,
           ...(task.external ? { expectedReview: { id: task.review?.id } } : {}) }))

@@ -168,6 +168,18 @@ def main():
         head = git(repo, 'rev-parse', 'HEAD')
         record = agent / 'worktree-preview/tasks.json'
         with PiRPC(repo, agent, provider) as pi:
+            pi.start_turn('Edit in an ordinary conversation.')
+            pi.finish_turn('Write succeeded.')
+            ordinary = repo / 'ordinary.txt'
+            assert ordinary.read_text() == 'ordinary edit' and not record.exists()
+            ordinary.unlink()
+            # A resumed model can remember the old tool name even when it is
+            # not declared; the miscall must not affect its next normal write.
+            pi.start_turn('Old transcript mistakenly calls revision.')
+            pi.finish_turn('Write succeeded.')
+            assert ordinary.read_text() == 'ordinary edit' and not record.exists()
+            assert not any(e.get('method') == 'select' for e in pi.inbox)
+            ordinary.unlink()
             origin = pi.state()
             verbs = ['new', 'status', 'resume', 'back', 'preview', 'recover', 'rollback', 'commit', 'discard', 'adopt', 'confirm', 'cancel']
             available = pi.reply(pi.send('get_commands'))['commands']
@@ -185,7 +197,7 @@ def main():
             sent = 'Edit task.txt and mark ready.'
             assert pi.reply(pi.send('prompt', message=sent))['disposition'] == 'handled'
             pi.notice('ok')
-            pi.wait(lambda e: e.get('type') == 'agent_end')
+            pi.wait(lambda e: e.get('type') == 'agent_settled')
             current = pi.status()
             assert current['phase'] == 'ready' and not current['external'], current
             isolated = Path(current['source'])
@@ -198,8 +210,22 @@ def main():
                         if (m := json.loads(line).get('message', {})).get('role') == 'user']
             assert not any(sent in json.dumps(m) for m in user_messages(origin))
             assert sum(sent in json.dumps(m) for m in user_messages(child)) == 1
+            # Visiting a managed checkout in another native session holds its
+            # cleanup lease, but does not bind the conversation to that task.
+            with PiRPC(isolated, agent, provider) as visitor:
+                assert visitor.state()['sessionId'] != child['sessionId']
+                visitor.start_turn('Edit in an ordinary conversation.')
+                visitor.finish_turn('Write succeeded.')
+                ordinary = isolated / 'ordinary.txt'
+                assert ordinary.read_text() == 'ordinary edit'
+                ordinary.unlink()
             pi.command('back')
             assert pi.state()['sessionId'] == origin['sessionId']
+            pi.start_turn('Edit in an ordinary conversation.')
+            pi.finish_turn('Write succeeded.')
+            ordinary = repo / 'ordinary.txt'
+            assert ordinary.read_text() == 'ordinary edit'
+            ordinary.unlink()
             pi.command('resume')
             assert pi.state()['sessionId'] == child['sessionId']
             token, detail = pi.challenge('preview')
@@ -228,7 +254,7 @@ def main():
             pi.command('new')
             assert pi.reply(pi.send('prompt', message='/var/folders/pi-clipboard-regression.png Open a task to discard.'))['disposition'] == 'handled'
             pi.notice('ok')
-            pi.wait(lambda e: e.get('type') == 'agent_end')
+            pi.wait(lambda e: e.get('type') == 'agent_settled')
             discarded = Path(pi.status()['source'])
             pi.act('discard')
             assert not discarded.exists() and pi.status()['phase'] == 'discarded'
@@ -263,9 +289,9 @@ export default function(pi) {
             pi.start_turn('Try to write during review.')
             pi.finish_turn('Write succeeded.')
             assert (repo / 'forbidden.txt').read_text() == 'must not be written'
-            pi.start_turn('Revise before preview external.')
-            pi.finish_turn('Revision stopped.')
-            shell = pi.reply(pi.send('bash', command='rm forbidden.txt', excludeFromContext=True))
+            pi.start_turn('Edit in an ordinary conversation.')
+            pi.finish_turn('Write succeeded.')
+            shell = pi.reply(pi.send('bash', command='rm forbidden.txt ordinary.txt', excludeFromContext=True))
             assert shell['exitCode'] == 0
             assert not (repo / 'forbidden.txt').exists() and target_file.read_text() == 'task edit\n'
             pi.act('discard')
@@ -292,6 +318,11 @@ export default function(pi) {
             assert target_file.read_text() == 'task edit\n' and not (repo / 'source only.txt').exists()
             with PiRPC(source, agent, provider) as other:
                 other.command(f'adopt {number}', 'error')
+                other.start_turn('Edit in an ordinary conversation.')
+                other.finish_turn('Write succeeded.')
+                ordinary = source / 'ordinary.txt'
+                assert ordinary.read_text() == 'ordinary edit'
+                ordinary.unlink()
             pi.command('adopt 99', 'error')
             source_file.write_text('drift before narrowing\n')
             pi.command(f'adopt {number}', 'error')
@@ -396,6 +427,11 @@ export default function(pi) {
             pi.act('commit')
             assert pi.state()['sessionId'] == origin['sessionId']
             assert pi.status()['phase'] == 'delivered'
+            pi.start_turn('Edit in an ordinary conversation.')
+            pi.finish_turn('Write succeeded.')
+            ordinary = subdir / 'ordinary.txt'
+            assert ordinary.read_text() == 'ordinary edit'
+            ordinary.unlink()
         assert git(source, 'symbolic-ref', 'HEAD') == 'refs/heads/external-revision'
         assert git(source, 'rev-parse', 'HEAD') == source_head and source_file.read_text() == 'previewed revision\n'
         assert git(source, 'status', '--porcelain=v1') == source_status + '\n?? "new revision.txt"'

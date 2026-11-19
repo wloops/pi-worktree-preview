@@ -86,6 +86,9 @@ export default function(pi) {
       const badWrite = () => tool("write", {path:"forbidden.txt",content:"must not be written"});
       const declared = getCurrentTools(context.messages.filter(message => message.role === 'system'));
       const routesHistory = declared.some(tool => tool.name === 'worktree_start_follow_up');
+      const ordinaryProbe = text === 'Edit in an ordinary conversation.';
+      const staleWorkflowProbe = text === 'Old transcript mistakenly calls revision.';
+      const ordinaryWrite = () => tool('write', {path:'ordinary.txt',content:'ordinary edit'});
       const runtime = text === "Edit with runtime state." || text === "Edit with overbroad review.";
       const chineseTask = text === "修改 task.txt，并新增 32 个文件。";
       const titleGuidance = declared.find(tool => tool.name === "worktree_ready_for_review")?.parameters.properties.commitMessage.description ?? "";
@@ -117,7 +120,9 @@ export default function(pi) {
           }
           case "edit": content = last.isError ? say('External edit failed.') : [checkRevision()]; break;
           case "write": content = say(last.isError ? 'Write was blocked.' : 'Write succeeded.'); break;
-          case "worktree_begin_revision": content = last.isError ? say(text?.includes('after Local drift.') || text?.includes('after Local drift external.') ?
+          case "worktree_begin_revision": content = staleWorkflowProbe ?
+            last.isError && last.content.some(part => part.type === 'text' && /not found|未绑定/u.test(part.text)) ? [ordinaryWrite()] : say('Unexpected revision restriction.') :
+            last.isError ? say(text?.includes('after Local drift.') || text?.includes('after Local drift external.') ?
             'Revision blocked by Local drift.' : 'Revision stopped.') : externalRevision ? [tool('read', {path:'../task.txt'})] : [edit()]; break;
           default: content = say(last.isError ? "Review failed." : privateRecovery ? "Conflict resolved in private workspace." : recover ? "Conflict resolved in Worktree." : revision || externalRevision ? "Revision ready." : "Worktree ready.");
         }
@@ -130,7 +135,15 @@ export default function(pi) {
       else if (text === 'Refresh external delivery list.') content = [tool('worktree_ready_for_review', {
         commitMessage: 'Isolated smoke change', files: ['task.txt', 'new revision.txt'],
       })];
-      else if (revision) content = [revise()];
+      else if (ordinaryProbe) {
+        const latestPolicy = context.messages.findLast(message => message.role === 'system' &&
+          message.sections && Object.hasOwn(message.sections, 'worktree_preview'));
+        const normal = declared.some(tool => tool.name === 'write') && !declared.some(tool => tool.name.startsWith('worktree_')) &&
+          !latestPolicy?.sections.worktree_preview &&
+          !context.messages.some(message => message.role === 'system' && typeof message.content === 'string' && message.content.includes('<worktree_preview>'));
+        content = normal ? [ordinaryWrite()] : say(`Unexpected Worktree control in ordinary conversation: ${JSON.stringify({ names: declared.map(tool => tool.name), latest: latestPolicy?.sections.worktree_preview, opaque: context.messages.filter(message => message.role === 'system' && typeof message.content === 'string' && message.content.includes('<worktree_preview>')).length })}`);
+      }
+      else if (staleWorkflowProbe || revision) content = [revise()];
       else if (text === "Try a parallel write.") content = [revise(), badWrite()];
       else if (text === "Try to write during review.") content = [badWrite()];
       else if (text === 'Explain the external change.') content = [tool('read', {path:'../task.txt'})];
