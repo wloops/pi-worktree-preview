@@ -358,7 +358,11 @@ export default function(pi) {
             assert pi.status() == previewed and source_file.read_text() == 'ready revision\n'
             assert target_file.read_text() == 'user edited preview\n'
             target_file.write_text('ready revision\n')
-            prompt = 'Revise with scope expansion external.'
+            # A normal source branch and HEAD change must not invalidate the task.
+            git(source, 'switch', '-c', 'external-revision')
+            git(source, 'commit', '--allow-empty', '-m', 'Source checkpoint', '--only')
+            source_head = git(source, 'rev-parse', 'HEAD')
+            prompt = 'Revise with a new file external.'
             pi.inbox.clear()
             pi.start_turn(prompt)
             ask = pi.revision_ask()
@@ -367,7 +371,7 @@ export default function(pi) {
                 assert pi.reply(pi.send(kind, message='Do not enqueue this.'))['disposition'] == 'handled'
             assert target_file.read_text() == 'ready revision\n' and source_file.read_text() == 'ready revision\n'
             pi.write({'type': 'extension_ui_response', 'id': ask['id'], 'value': ask['options'][1]})
-            pi.finish_turn('Review failed.')
+            pi.finish_turn('Revision ready.')
             def event_index(match):
                 return next(i for i, e in enumerate(pi.inbox) if match(e))
             assert event_index(lambda e: e.get('statusText') == 'Worktree 返修中') < event_index(
@@ -376,26 +380,27 @@ export default function(pi) {
                 lambda e: e.get('type') == 'tool_execution_end' and e.get('toolName') == 'edit' and not e.get('isError')) < event_index(
                 lambda e: e.get('type') == 'tool_execution_end' and e.get('toolName') == 'bash' and not e.get('isError')) < event_index(
                 lambda e: e.get('type') == 'tool_execution_end' and e.get('toolName') == 'worktree_ready_for_review')
-            assert pi.status()['phase'] == 'working' and target_file.read_text() == 'task edit\n'
-            assert source_file.read_text() == 'previewed revision\n' and not (repo / 'source only.txt').exists()
-            pi.start_turn('Continue existing revision external.')
-            pi.finish_turn('Revision ready.')
-            assert not any(e.get('method') == 'select' for e in pi.inbox)
             transcript = Path(pi.state()['sessionFile']).read_text()
             assert transcript.count(prompt) == 1 and 'Do not enqueue this.' not in transcript
             ready = pi.status()
-            assert ready['phase'] == 'ready' and ready['id'] == previewed['id'] and ready['ready'] == ['task.txt']
+            assert ready['phase'] == 'ready' and ready['id'] == previewed['id'] and ready['ready'] == ['new revision.txt', 'task.txt']
             assert source_file.read_text() == 'previewed revision\n' and target_file.read_text() == 'task edit\n'
-            assert not (repo / 'source only.txt').exists()
+            assert (source / 'new revision.txt').read_text() == 'new in revision\n'
+            assert not (repo / 'source only.txt').exists() and not (repo / 'new revision.txt').exists()
+            (source / 'new revision.txt').write_text('refreshed revision\n')
+            pi.start_turn('Refresh external delivery list.')
+            pi.finish_turn('Worktree ready.')
+            assert pi.status()['id'] == ready['id'] and pi.status()['ready'] == ready['ready']
             pi.act('preview')
+            assert (repo / 'new revision.txt').read_text() == 'refreshed revision\n'
             pi.act('commit')
             assert pi.state()['sessionId'] == origin['sessionId']
             assert pi.status()['phase'] == 'delivered'
-        assert git(source, 'symbolic-ref', 'HEAD') == 'refs/heads/external'
-        assert git(source, 'rev-parse', 'HEAD') == base and source_file.read_text() == 'previewed revision\n'
-        assert git(source, 'status', '--porcelain=v1') == source_status
-        assert git(repo, 'show', '-1', '--format=%s', '--name-only') == 'Isolated smoke change\n\ntask.txt'
-        print('PASS real Pi RPC: native Ask, same-turn revision with client read/edit and shell, independent resume and source preservation', flush=True)
+        assert git(source, 'symbolic-ref', 'HEAD') == 'refs/heads/external-revision'
+        assert git(source, 'rev-parse', 'HEAD') == source_head and source_file.read_text() == 'previewed revision\n'
+        assert git(source, 'status', '--porcelain=v1') == source_status + '\n?? "new revision.txt"'
+        assert git(repo, 'show', '-1', '--format=%s', '--name-only') == 'Isolated smoke change\n\nnew revision.txt\ntask.txt'
+        print('PASS real Pi RPC: native Ask, same-turn revision adds a file after source branch/HEAD change; only reviewed files delivered', flush=True)
 
 
 if __name__ == '__main__':

@@ -75,8 +75,9 @@ export default function(pi) {
       const revision = text?.startsWith("Revise ");
       const externalRevision = text?.endsWith(' external.');
       const externalNewText = text === 'Revise before preview external.' ? 'ready revision' : 'previewed revision';
-      const revisionFiles = text === 'Revise with scope expansion external.' ? ['task.txt','source only.txt'] :
-        text === 'Revise with missing file external.' ? ['source only.txt'] : ['task.txt'];
+      const addsFile = text === 'Revise with a new file external.';
+      const revisionFiles = addsFile ? ['task.txt', 'new revision.txt'] : ['task.txt'];
+      const checkRevision = () => tool('bash', {command: `grep -qx '${externalNewText}' ../task.txt${addsFile ? " && echo 'new in revision' > '../new revision.txt'" : ''}`});
       const recover = text?.startsWith("只在当前 detached Worktree 解决冲突") && text.match(/--no-overwrite-ignore ([0-9a-f]{40,64})/);
       const revise = () => tool("worktree_begin_revision");
       const badWrite = () => tool("write", {path:"forbidden.txt",content:"must not be written"});
@@ -102,7 +103,7 @@ export default function(pi) {
             if (externalRevision) {
               const previous = last.content.find(part => part.type === 'text')?.text.trim();
               content = last.isError || !previous ? say('External read failed.') : previous === externalNewText ?
-                [tool('bash', {command:`grep -qx '${externalNewText}' ../task.txt`})] : [tool('edit', {
+                [checkRevision()] : [tool('edit', {
                   path: '../task.txt', edits: [{oldText: previous, newText: externalNewText}],
                 })];
             } else content = say(last.isError ? 'Read was blocked.' : text === 'Read from resumed Worktree.'
@@ -111,7 +112,7 @@ export default function(pi) {
               : 'Explained without edits.');
             break;
           }
-          case "edit": content = last.isError ? say('External edit failed.') : [tool('bash', {command:`grep -qx '${externalNewText}' ../task.txt`})]; break;
+          case "edit": content = last.isError ? say('External edit failed.') : [checkRevision()]; break;
           case "write": content = say(last.isError ? 'Write was blocked.' : 'Write succeeded.'); break;
           case "worktree_begin_revision": content = last.isError ? say(text?.includes('after Local drift.') || text?.includes('after Local drift external.') ?
             'Revision blocked by Local drift.' : 'Revision stopped.') : externalRevision ? [tool('read', {path:'../task.txt'})] : [edit()]; break;
@@ -120,7 +121,9 @@ export default function(pi) {
       } else if (recover) content = [tool('bash', {command: `git add -- task.txt && git commit -m checkpoint &&
         (git -c merge.renames=false -c merge.directoryRenames=false merge --no-edit --no-overwrite-ignore ${recover[1]}; test $? -eq 1) &&
         test "$(git rev-parse MERGE_HEAD)" = ${recover[1]} && printf 'merged task\\\\n' > task.txt && git add -- task.txt && git commit -m resolve`})];
-      else if (text === 'Continue existing revision external.') content = [tool('read', {path:'../task.txt'})];
+      else if (text === 'Refresh external delivery list.') content = [tool('worktree_ready_for_review', {
+        commitMessage: 'Isolated smoke change', files: ['task.txt', 'new revision.txt'],
+      })];
       else if (revision) content = [revise()];
       else if (text === "Try a parallel write.") content = [revise(), badWrite()];
       else if (text === "Try to write during review.") content = [badWrite()];

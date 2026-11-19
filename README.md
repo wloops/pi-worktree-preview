@@ -19,7 +19,7 @@ pi
 
 Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就能点击 Worktree 按钮。如果你把 Pi 设置成了 regular，可用 `/worktree-preview` 打开菜单并用键盘操作；想用鼠标时，再用 `pi --tui-mode fullscreen` 启动。
 
-也可从 [GitHub](https://github.com/wloops/pi-worktree-preview/releases) 安装：`pi install git:github.com/wloops/pi-worktree-preview@v0.2.0`。切换安装来源前，先用 `pi list` 找到旧入口，再用 `pi remove <旧入口>` 移除，避免重复加载。
+也可从 [GitHub](https://github.com/wloops/pi-worktree-preview/releases) 安装：`pi install git:github.com/wloops/pi-worktree-preview@v0.2.1`。切换安装来源前，先用 `pi list` 找到旧入口，再用 `pi remove <旧入口>` 移除，避免重复加载。
 
 1. **新建 Worktree**：勾选编辑器上方的复选框，再发送任务。可以先在原对话讨论；新会话自动带上当前分支的聊天上下文，但目录仍从发送时的 `HEAD` 创建，不复制未提交的文件（聊天里已经出现的内容仍会带上）。这条消息只发到新会话。
 2. **待验收**：Agent 用任务对话的语言拟定提交标题，必要时补充正文，并标记要交付的文件，不改项目目录。清单里有无关文件，可在 **⋯ 更多 → 调整交付清单** 移除。提交前可滚动查看标题、正文和文件清单。
@@ -46,7 +46,7 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 2. **核对并预览**：运行 `/worktree-preview-status` 查看文件，再运行 `/worktree-preview-preview` 并确认。预览写入目标目录，不暂存、不提交。默认清单包含所有检测到的改动，包括未忽略的新文件；如只交付部分，可先运行 `/worktree-preview-adopt 1,3` 保留第 1、3 项，或在 fullscreen TUI 里用 **⋯ 更多 → 调整交付清单**。
 3. **返修或提交**：需要改就直接在同一对话里说。已预览时，确认 **撤回预览，继续返修** 后，Agent 接着处理同一条消息；未预览时可直接返修。改完重新标记待验收，不用重新接入。验收通过就运行 `/worktree-preview-commit`；想撤回用 `/worktree-preview-rollback`。
 
-**工具权限由原客户端管理。** 插件不额外拦截外部会话的读写、shell 或其他工具。插件只管理验收：不切换源分支或删除目录，放弃只解除登记，不能跳过预览直接提交。交付清单不会自动扩大；需要改清单时，可在 fullscreen TUI 用 **⋯ 更多 → 标记待验收（手动）**，或先撤回（如有）、解除登记，再按新清单接入。源分支或 `HEAD` 变化后，先处理已有预览，再重新接入。
+**外部 Worktree 由原客户端管理。** 返修可以增删交付文件、提交或切换源分支，不用重新接入；Agent 按当前任务重新列清单，不自动带入无关文件。已有预览不会随源改动自动更新，先撤回再预览新版。插件不会拦截外部会话的工具、切换源分支或删除源目录；放弃只解除登记。外部任务需先预览再确认提交。
 
 <details>
 <summary>手动指定目标、基点和交付文件</summary>

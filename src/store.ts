@@ -27,9 +27,9 @@ export interface Task {
   localSession: SessionLink
   isolatedSession?: SessionLink
   followUpOf?: string
-  external?: { headOid: string; headRef: string | null } // Never own, switch, or remove the source checkout.
+  // Never own, switch, or remove the source checkout. Older records carry adoption-time Git state.
+  external?: true | { headOid: string; headRef: string | null }
   review?: Review
-  externalRevisionFiles?: string[] // Last reviewed scope while the external task is working.
   recovery?: ConflictRecovery
   receipt?: PreviewReceipt
   // A null indexBefore explicitly records that no index file existed.
@@ -246,7 +246,7 @@ export class TaskStore {
   async adopt(session: SessionLink, request: AdoptionRequest, shown: AdoptionInspection): Promise<Task> {
     return this.locked(async (state, save) => {
       const current = await this.inspectAdoption(session, request)
-      const { isolated, local, baseOid, localHeadRef, review, isolatedHeadOid, isolatedHeadRef } = current
+      const { isolated, local, baseOid, localHeadRef, review } = current
       // Bind the exact selected contents and checkout identities to confirmation.
       // Unrelated working copy drift doesn't affect the selected delivery.
       if (!this.sameAdoptionHeads(current, shown) || review.message !== shown.review.message ||
@@ -259,7 +259,7 @@ export class TaskStore {
           overlaps(isolated, t.isolated) || overlaps(isolated, t.local) || overlaps(local, t.isolated)))) {
         throw new Error('当前会话或相关 checkout 已有冲突的任务；请先结束该任务。')
       }
-      const task: Task = { id: randomUUID(), external: { headOid: isolatedHeadOid, headRef: isolatedHeadRef },
+      const task: Task = { id: randomUUID(), external: true,
         phase: 'ready', baseOid, localHeadRef, local,
         isolatedPath: isolated.root, isolated, localSession: session, review: { id: randomUUID(), ...review } }
       state.tasks.push(task)
@@ -318,14 +318,14 @@ export class TaskStore {
   }
 
   async validateIsolated(task: Task) {
-    const checkout = await this.validateIsolatedIdentity(task)
-    await assertOrdinary(checkout)
-    if (task.external) {
-      const ref = await runGit(checkout.root, ['symbolic-ref', '--quiet', 'HEAD'], { allowedExitCodes: [0, 1] })
-      if (task.external.headRef !== (ref.stdout.toString('utf8').trim() || null) ||
-          task.external.headOid !== await out(checkout.root, ['rev-parse', 'HEAD'])) {
-        throw new Error('外部 Worktree 的分支或 HEAD 已变化；请重新接入。')
-      }
+    await assertOrdinary(await this.validateIsolatedIdentity(task))
+  }
+
+  private async validateExternalDeliverySource(task: Task) {
+    const source = await this.validateIsolatedIdentity(task)
+    const ref = await runGit(source.root, ['symbolic-ref', '--quiet', 'HEAD'], { allowedExitCodes: [0, 1] })
+    if (ref.stdout.toString('utf8').trim() === task.localHeadRef) {
+      throw new Error('外部 Worktree 和目标检出了同一个分支；交付会影响源目录。请先在源 Worktree 切回不同分支。')
     }
   }
 
@@ -424,14 +424,14 @@ export class TaskStore {
   }
 
   async markReady(id: string, session: SessionLink, message: string, files: readonly string[],
-    options?: { body?: string; expectedReview?: { id: string | undefined }; userSelectedFiles?: true }): Promise<Review> {
+    options?: { body?: string; expectedReview?: { id: string | undefined } }): Promise<Review> {
     const title = message.trim()
     if (!title || title.length > 200 || /[\x00-\x1f\x7f]/.test(title)) throw new Error('请提供 1–200 字符的单行提交标题。')
     const body = normalizeCommitBody(options?.body)
     if (!Array.isArray(files) || !files.length) throw new Error('请明确列出本次任务要交付的改动文件。')
     return this.locked(async (state, save) => {
       const task = state.tasks.find(t => t.id === id)
-      if (!task || task.journal || !(task.phase === 'working' || !task.external && task.phase === 'ready') || !await this.isEditingSession(task, session)) {
+      if (!task || task.journal || (task.phase !== 'working' && task.phase !== 'ready') || !await this.isEditingSession(task, session)) {
         throw new Error('当前不是可标记待验收的隔离会话。')
       }
       if (options?.expectedReview && task.review?.id !== options.expectedReview.id) throw new Error('待验收记录已变化，请重新选择。')
@@ -441,15 +441,14 @@ export class TaskStore {
       const inspected = await this.engineFactory().inspectReview({ ...this.input(task), baseOid }, files)
       if (inspected.status === 'error') engineError(inspected)
       if (task.external) {
-        const previous = task.externalRevisionFiles
-        if (!options?.userSelectedFiles && (!previous || inspected.changedFiles.some(path => !previous.includes(path)) ||
-            previous.some(path => inspected.allChangedFiles.includes(path) && !inspected.changedFiles.includes(path)))) {
-          throw new Error('返修必须保留仍有改动的原交付文件，不能自动扩大清单；请由用户选择新清单。')
-        }
-        if (inspected.isolatedHeadOid !== task.external.headOid || inspected.isolatedHeadRef !== task.external.headRef) {
-          throw new Error('外部 Worktree 的分支或 HEAD 已变化，不能标记待验收。')
-        }
+        // A new review can select a new set of paths at any source HEAD.
+        // Only a checkout change during this very scan requires a retry.
         await this.validateIsolated(task)
+        const ref = await runGit(task.isolatedPath, ['symbolic-ref', '--quiet', 'HEAD'], { allowedExitCodes: [0, 1] })
+        if (inspected.isolatedHeadRef !== (ref.stdout.toString('utf8').trim() || null) ||
+            inspected.isolatedHeadOid !== await out(task.isolatedPath, ['rev-parse', 'HEAD'])) {
+          throw new Error('扫描期间源 Worktree 已变化；请重新标记待验收。')
+        }
       }
       if (recovery) {
         if (inspected.partial) throw new Error('合并完成后的交付清单必须包含相对合并目标的全部改动。')
@@ -479,7 +478,6 @@ export class TaskStore {
       const review: Review = { id: randomUUID(), fingerprint: inspected.isolatedFingerprint, files: inspected.changedFiles,
         message: title, ...(body ? { body } : {}), snapshot: inspected.snapshot, ...(inspected.partial ? { partial: true } : {}) }
       task.review = review
-      delete task.externalRevisionFiles
       task.phase = 'ready'
       await save()
       return review
@@ -492,9 +490,9 @@ export class TaskStore {
       if (!task || task.phase !== 'ready' || task.review?.id !== reviewId || task.receipt || task.journal || !await this.isEditingSession(task, session)) {
         throw new Error('待验收状态或隔离会话已变化，不能继续修改。')
       }
-      await this.validateIsolated(task)
+      if (task.external) await this.validateIsolatedIdentity(task)
+      else await this.validateIsolated(task)
       signal?.throwIfAborted()
-      if (task.external) task.externalRevisionFiles = [...task.review.files]
       delete task.review
       task.phase = 'working'
       await save()
@@ -505,10 +503,10 @@ export class TaskStore {
     await this.locked(async state => {
       const task = state.tasks.find(t => t.id === id)
       if (!task?.external || task.phase !== 'working' || task.review || task.receipt || task.journal ||
-          !task.externalRevisionFiles || !await this.isEditingSession(task, session)) {
+          !await this.isEditingSession(task, session)) {
         throw new Error('返修状态或绑定会话已变化。')
       }
-      await this.validateIsolated(task)
+      await this.validateIsolatedIdentity(task)
       signal?.throwIfAborted()
     })
   }
@@ -614,13 +612,15 @@ export class TaskStore {
           const revision = expected.revision
           if (revision) {
             if (!task.review || !await this.isEditingSession(task, revision.session)) throw new Error('待验收状态或隔离会话已变化，不能继续修改。')
-            await this.validateIsolated(task)
+            if (task.external) await this.validateIsolatedIdentity(task)
+            else await this.validateIsolated(task)
             revision.signal?.throwIfAborted()
           }
           const rolled = await engine.rollback({ localPath: task.local.root, receipt: task.receipt, beforeWrite: async () => {
             await this.validateLocal(task)
             if (revision) {
-              await this.validateIsolated(task)
+              if (task.external) await this.validateIsolatedIdentity(task)
+              else await this.validateIsolated(task)
               revision.signal?.throwIfAborted()
             }
             task.journal = { operation: 'rollback', at: Date.now() }
@@ -630,7 +630,6 @@ export class TaskStore {
           delete task.receipt
           delete task.journal
           if (revision) {
-            if (task.external) task.externalRevisionFiles = [...task.review!.files]
             delete task.review
             task.phase = 'working'
           } else task.phase = 'ready'
@@ -643,7 +642,7 @@ export class TaskStore {
             await this.validateLocal(task)
             // Both checkouts share refs. An external source that changed to
             // the target branch must not have its HEAD moved by delivery.
-            if (task.external) await this.validateIsolated(task)
+            if (task.external) await this.validateExternalDeliverySource(task)
             else if (expected.keepWorktree) await this.validateIsolatedIdentity(task)
             await this.recordCommit(task, 'finalize', task.receipt!, commitOid, before, after, save)
           } })

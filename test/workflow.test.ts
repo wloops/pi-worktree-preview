@@ -146,29 +146,45 @@ test('external adoption freezes named paths, shares preview slot and never owns 
   assert.match(await git(f.local, 'worktree', 'list', '--porcelain'), /branch refs\/heads\/external\nlocked/)
 })
 
-test('external revision preserves the last reviewed scope unless the user selects a new one', async t => {
+test('external rollback and revision can replace the delivery list and move source HEAD without re-adopting', async t => {
   const f = await fixture(t)
   const source = join(f.dir, 'external')
   await git(f.local, 'worktree', 'add', '-b', 'external', '--', source, f.base.trim())
-  for (const file of ['task.txt', 'unstaged.txt', 'staged.txt']) await writeFile(join(source, file), `${file} external\n`)
-  await git(source, 'add', 'staged.txt')
+  for (const file of ['task.txt', 'unstaged.txt']) await writeFile(join(source, file), `${file} external\n`)
   const session = { cwd: source, file: join(f.dir, 'adopt.jsonl'), id: 'adopt' }
   const request = { source, target: f.local, base: f.base.trim(), title: 'External', files: ['task.txt', 'unstaged.txt'] }
   const adopted = await f.store.adopt(session, request, await f.store.inspectAdoption(session, request))
+  // Old on-disk records must not keep applying their original restrictions.
+  const state = JSON.parse(await readFile(f.store.statePath, 'utf8'))
+  const legacy = state.tasks.find((item: Task) => item.id === adopted.id)
+  legacy.external = { headOid: f.base.trim(), headRef: 'refs/heads/external' }
+  legacy.externalRevisionFiles = adopted.review!.files
+  await writeFile(f.store.statePath, JSON.stringify(state))
   await assert.rejects(f.store.continueEditing(adopted.id, { ...session, id: 'other' }, adopted.review!.id), /隔离会话已变化/)
-  await f.store.continueEditing(adopted.id, session, adopted.review!.id)
-  await assert.rejects(f.store.markReady(adopted.id, session, 'Revision', ['task.txt']), /仍有改动的原交付文件/)
-  await writeFile(join(source, 'unstaged.txt'), 'unstaged.txt base\n')
-  await assert.rejects(f.store.markReady(adopted.id, session, 'Revision', ['task.txt', 'staged.txt']), /不能自动扩大清单/)
-  const review = await f.store.markReady(adopted.id, session, 'Revision', ['task.txt'])
-  assert.deepEqual(review.files, ['task.txt'])
-  assert.notEqual(review.id, adopted.review!.id)
-  await f.store.continueEditing(adopted.id, session, review.id)
-  const manual = await f.store.markReady(adopted.id, session, 'User changed the selection', ['staged.txt'], { userSelectedFiles: true })
-  assert.deepEqual(manual.files, ['staged.txt'])
+  const act = (action: Parameters<TaskStore['act']>[1], task: Task, revision?: { session: typeof session }) =>
+    f.store.act(task.id, action, { phase: task.phase, reviewId: task.review?.id, previewId: task.receipt?.previewId, session, revision })
+  const previewed = await act('preview', adopted)
+  await git(source, 'switch', '-c', 'revision')
+  await git(source, 'commit', '-m', 'Revision checkpoint', '--', 'task.txt')
+  const working = await act('rollback', previewed, { session })
+  assert.equal(working.phase, 'working')
+  await f.store.resumeExternalEditing(working.id, session)
+  await writeFile(join(source, 'new.txt'), 'new revision file\n')
+  const review = await f.store.markReady(working.id, session, 'Revision', ['task.txt', 'new.txt'])
+  assert.deepEqual(review.files, ['new.txt', 'task.txt'])
+  const rerendered = await f.store.markReady(working.id, session, 'Updated review', review.files, { expectedReview: { id: review.id } })
+  assert.notEqual(rerendered.id, review.id)
   assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
-  assert.equal(await content(f.local, 'staged.txt'), 'staged.txt base\n')
-  assert.equal(await git(source, 'rev-parse', 'HEAD'), f.base)
+  assert.equal(await content(f.local, 'unstaged.txt'), 'unstaged.txt base\n')
+  assert.equal(await exists(join(f.local, 'new.txt')), false)
+  const ready = { ...working, phase: 'ready' as const, review: rerendered }
+  const revised = await act('preview', ready)
+  assert.equal(await content(f.local, 'new.txt'), 'new revision file\n')
+  const sourceHead = await git(source, 'rev-parse', 'HEAD')
+  await act('finalize', revised)
+  assert.equal(await git(f.local, 'show', '--format=%s', '--name-only'), 'Updated review\n\nnew.txt\ntask.txt\n')
+  assert.equal(await content(source, 'unstaged.txt'), 'unstaged.txt external\n')
+  assert.equal(await git(source, 'rev-parse', 'HEAD'), sourceHead)
 })
 
 test('external source branch drift after preview blocks delivery while preserving rollback', async t => {
@@ -183,7 +199,7 @@ test('external source branch drift after preview blocks delivery while preservin
   // Git normally forbids this, but an external manager can override it.
   await git(source, 'symbolic-ref', 'HEAD', 'refs/heads/main')
   const opts = { phase: previewed.phase, reviewId: previewed.review?.id, previewId: previewed.receipt?.previewId, session }
-  await assert.rejects(f.store.act(adopted.id, 'finalize', opts), /分支或 HEAD 已变化/)
+  await assert.rejects(f.store.act(adopted.id, 'finalize', opts), /检出了同一个分支/)
   assert.equal(await git(f.local, 'rev-parse', 'HEAD'), f.base)
   assert.equal(await content(f.local, 'task.txt'), 'external preview\n')
   const rolled = await f.store.act(adopted.id, 'rollback', opts)
@@ -194,7 +210,7 @@ test('external source branch drift after preview blocks delivery while preservin
   await assert.rejects(f.store.inspectAdoption(session, request), /不能检出同一个分支/)
 })
 
-test('external source HEAD drift blocks preview but unregister never touches source', async t => {
+test('external preview tolerates new commits but revalidates frozen bytes; unregister never touches source', async t => {
   const f = await fixture(t)
   const source = join(f.dir, 'external')
   await git(f.local, 'worktree', 'add', '--detach', '--', source, f.base.trim())
@@ -205,10 +221,14 @@ test('external source HEAD drift blocks preview but unregister never touches sou
   await git(source, 'commit', '--allow-empty', '-m', 'external HEAD changed')
   const after = await git(source, 'rev-parse', 'HEAD')
   const opts = { phase: adopted.phase, reviewId: adopted.review?.id, session }
-  await assert.rejects(f.store.act(adopted.id, 'preview', opts), /分支或 HEAD 已变化/)
+  const preview = await f.store.act(adopted.id, 'preview', opts)
+  assert.equal(await content(f.local, 'task.txt'), 'original external\n')
+  await f.store.act(adopted.id, 'rollback', { ...opts, phase: 'previewed', previewId: preview.receipt?.previewId })
+  await writeFile(join(source, 'task.txt'), 'not reviewed\n')
+  await assert.rejects(f.store.act(adopted.id, 'preview', opts), /已变化|已改变/)
   assert.equal((await f.store.act(adopted.id, 'discard', opts)).phase, 'discarded')
   assert.equal(await git(source, 'rev-parse', 'HEAD'), after)
-  assert.equal(await content(source, 'task.txt'), 'original external\n')
+  assert.equal(await content(source, 'task.txt'), 'not reviewed\n')
   assert.equal(await content(f.local, 'task.txt'), 'task.txt base\n')
 })
 
