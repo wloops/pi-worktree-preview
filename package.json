@@ -1,6 +1,6 @@
 {
   "name": "pi-worktree-preview",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Review isolated Git worktree changes in your original checkout from Pi",
   "license": "MIT",
   "repository": {
