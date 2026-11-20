@@ -1,13 +1,14 @@
 import { isValidCommitMessage } from './commit-message.ts'
 import { createTranslator } from './i18n/core.ts'
-import { hostMessages } from './i18n/host-messages.ts'
+import { getDisplayLanguage, tr } from './i18n/display.ts'
+import { hostMessages, type HostTranslator } from './i18n/host-messages.ts'
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { constants, realpathSync } from 'node:fs'
 import { lstat, mkdir, mkdtemp, open, readFile, readdir, readlink, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path'
-const hostMessage = createTranslator(hostMessages, 'zh')
+const hostMessage: HostTranslator = (key, ...args) => createTranslator(hostMessages, getDisplayLanguage())(key, ...args)
 type ApplyBaseStrategy = 'recorded_base' | 'isolated_contains_local_head' | 'local_contains_isolated_head'
 
 export interface ApplyPlanInput {
@@ -469,7 +470,7 @@ function entryMap(raw: Buffer, kind: 'tree' | 'index', paths: ReadonlySet<string
     const object = kind === 'tree' ? third : second
     if (tab < 0 || !/^(100644|100755|120000)$/.test(mode) || !OID_PATTERN.test(object) ||
         (kind === 'tree' ? second !== 'blob' : third !== '0') || entries.has(path)) {
-      throw new Error(`无法核验待验收文件的 Git 条目：${JSON.stringify(path)}`)
+      throw new Error(tr(`无法核验待验收文件的 Git 条目：${JSON.stringify(path)}`, `Could not verify Git entries for the review file: ${JSON.stringify(path)}`))
     }
     entries.set(path, `${mode} ${object}`)
   }
@@ -482,11 +483,11 @@ function reviewEntryPath(path: string, prefix: string): boolean {
 }
 
 function selectReviewPaths(available: readonly string[], files: readonly string[]): string[] {
-  if (!files.length) throw new Error('请选择至少一个要交付的改动文件。')
+  if (!files.length) throw new Error(tr('请选择至少一个要交付的改动文件。', 'Select at least one changed file to deliver.'))
   const known = new Set(available)
   const selected = new Set(files)
   if (selected.size !== files.length || files.some(path => !known.has(path))) {
-    throw new Error('交付清单必须包含实际有改动的文件路径，且不能有重复路径。')
+    throw new Error(tr('交付清单必须包含实际有改动的文件路径，且不能有重复路径。', 'The delivery list must contain only paths with changes and must not contain duplicates.'))
   }
   return available.filter(path => selected.has(path))
 }
@@ -502,8 +503,8 @@ function validateReview(review: FrozenReview, expected: ExpectedReview, prefix: 
 
 class StaleReviewError extends Error {
   constructor(path?: string) {
-    super(path === undefined ? '无法核验此前的待验收记录，请重新标记待验收。' :
-      `待验收文件已变化：${JSON.stringify(path)}。请重新标记待验收。`)
+    super(path === undefined ? tr('无法核验此前的待验收记录，请重新标记待验收。', 'Could not verify the previous review record. Mark the task ready for review again.') :
+      tr(`待验收文件已变化：${JSON.stringify(path)}。请重新标记待验收。`, `A review file has changed: ${JSON.stringify(path)}. Mark the task ready for review again.`))
   }
 }
 
@@ -511,7 +512,7 @@ async function readReviewFile(path: string) {
   const fd = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   try {
     const info = await fd.stat()
-    if (!info.isFile()) throw new Error(`待验收路径不是普通文件：${JSON.stringify(path)}`)
+    if (!info.isFile()) throw new Error(tr(`待验收路径不是普通文件：${JSON.stringify(path)}`, `The review path is not a regular file: ${JSON.stringify(path)}`))
     return { bytes: await fd.readFile(), mode: (info.mode & 0o100) ? '100755' : '100644' }
   } finally { await fd.close() }
 }
@@ -580,7 +581,7 @@ async function reviewedTree(root: string, indexPath: string, baseOid: string, re
   const tree = stdoutText(await runGit(root, ['write-tree'], { env }))
   const actual = new Set(await changedTreePaths(root, baseOid, tree, objectDirectory ?? null, sourceObjects ?? null))
   if (actual.size !== review.entries.length || review.entries.some(entry => !actual.has(entry.path))) {
-    throw new Error('无法将预览限制在待验收文件内；Local 未写入。')
+    throw new Error(tr('无法将预览限制在待验收文件内；Local 未写入。', 'Could not limit the preview to the review files. Local was not changed.'))
   }
   return tree
 }
@@ -604,10 +605,10 @@ function snapshotFingerprint(
 
 async function assertSupportedCheckout(cwd: string) {
   const sparse = await runGit(cwd, ['config', '--bool', '--get', 'core.sparseCheckout'], { allowedExitCodes: [0, 1] })
-  if (stdoutText(sparse) === 'true') throw new Error('不支持 sparse checkout。')
+  if (stdoutText(sparse) === 'true') throw new Error(tr('不支持 sparse checkout。', 'Sparse checkout is not supported.'))
   const attrsConfig = await runGit(cwd, ['config', '--get-regexp', '^(core\\.(symlinks|filemode)|filter\\.)'], { allowedExitCodes: [0, 1] })
   if (stdoutText(attrsConfig).split('\n').some(entry => /^filter\.|^core\.(symlinks|filemode) (false|no|off|0)$/i.test(entry))) {
-    throw new Error('不支持启用了内容转换或禁用文件模式/符号链接的 Git checkout。')
+    throw new Error(tr('不支持启用了内容转换或禁用文件模式/符号链接的 Git checkout。', 'Git checkouts with content conversion enabled or file modes or symlinks disabled are not supported.'))
   }
   const index = (await runGit(cwd, ['ls-files', '--debug', '-z'])).stdout.toString('utf8')
   // Each debug record is NUL-delimited path + five stat lines. Parse exact boundaries so
@@ -616,21 +617,21 @@ async function assertSupportedCheckout(cwd: string) {
   while (next < index.length) {
     const nul = index.indexOf('\0', next)
     const end = index.indexOf('\n', index.indexOf('\tflags: ', nul + 1))
-    if (nul < 0 || end < 0) throw new Error('无法核验 Git 索引标志。')
+    if (nul < 0 || end < 0) throw new Error(tr('无法核验 Git 索引标志。', 'Could not verify the Git index flags.'))
     const flags = /\tflags: ([\da-f]+)\n$/i.exec(index.slice(nul + 1, end + 1))
     if (!flags || (Number.parseInt(flags[1], 16) & 0x6000b000) !== 0) {
-      throw new Error('不支持冲突、intent-to-add、assume-unchanged 或 skip-worktree 的索引。')
+      throw new Error(tr('不支持冲突、intent-to-add、assume-unchanged 或 skip-worktree 的索引。', 'Indexes with conflicts or intent-to-add, assume-unchanged, or skip-worktree entries are not supported.'))
     }
     next = end + 1
   }
   const paths = (await runGit(cwd, ['ls-files', '--cached', '--others', '--exclude-standard', '-z'])).stdout
   if (!paths.length) return
-  if (!Buffer.from(paths.toString('utf8')).equals(paths)) throw new Error('不支持非 UTF-8 的 Git 文件名。')
+  if (!Buffer.from(paths.toString('utf8')).equals(paths)) throw new Error(tr('不支持非 UTF-8 的 Git 文件名。', 'Non-UTF-8 Git file names are not supported.'))
   const attributes = (await runGit(cwd, ['check-attr', '-z', '--stdin', 'filter', 'text', 'eol', 'ident', 'working-tree-encoding', 'merge'], { input: paths })).stdout.toString('utf8').split('\0')
   for (let i = 0; i + 2 < attributes.length; i += 3) {
     const value = attributes[i + 2]
     if (value !== 'unspecified' && (value !== 'unset' || attributes[i + 1] === 'merge')) {
-      throw new Error(`不支持影响文件内容或合并语义的 Git 属性：${attributes[i + 1]}。`)
+      throw new Error(tr(`不支持影响文件内容或合并语义的 Git 属性：${attributes[i + 1]}。`, `Git attributes that affect file contents or merge behavior are not supported: ${attributes[i + 1]}.`))
     }
   }
 }
@@ -678,7 +679,7 @@ async function captureSnapshot(
   const treeOid = stdoutText(await runGit(checkoutPath, ['write-tree'], { env }))
   const paths = (await runGit(checkoutPath, ['ls-files', '--stage', '-z'], { env })).stdout
   if (paths.toString('utf8').split('\0').some(record => record.startsWith('160000 '))) {
-    throw new Error('不支持 Submodule 或嵌套的 Git 仓库。')
+    throw new Error(tr('不支持 Submodule 或嵌套的 Git 仓库。', 'Submodules and nested Git repositories are not supported.'))
   }
   const fingerprint = snapshotFingerprint(headOid, headRef, indexEntries, treeOid)
 
@@ -709,7 +710,7 @@ async function createSnapshotCommit(
 
 async function initMergeCheckout(mergePath: string, checkoutPath: string, hooksPath: string) {
   const format = stdoutText(await runGit(checkoutPath, ['rev-parse', '--show-object-format']))
-  if (format !== 'sha1' && format !== 'sha256') throw new Error('不支持的 Git 对象格式。')
+  if (format !== 'sha1' && format !== 'sha256') throw new Error(tr('不支持的 Git 对象格式。', 'Unsupported Git object format.'))
   await runGit(mergePath, ['init', '--template=', `--object-format=${format}`])
   await mkdir(join(mergePath, '.git', 'info'), { recursive: true })
   // Historical trees can contain custom merge/conversion attributes even when neither
@@ -784,7 +785,7 @@ async function computeMerge(
     if (keepWorkspace) {
       // Git alternates are read-only object lookups. The workspace has its own
       // refs, index and object writes; don't clone the entire project history.
-      if ([objectDirectory, sourceObjects].some(path => /[\r\n]/u.test(path))) throw new Error('冲突工作区不支持换行路径。')
+      if ([objectDirectory, sourceObjects].some(path => /[\r\n]/u.test(path))) throw new Error(tr('冲突工作区不支持换行路径。', 'The conflict workspace does not support paths containing newlines.'))
       await writeFile(join(mergePath, '.git', 'objects', 'info', 'alternates'), `${objectDirectory}\n${sourceObjects}\n`)
     }
     return result
@@ -817,7 +818,7 @@ async function computeMerge(
   ).stdout
   const changedPaths = parseNullSeparated(changed.stdout)
   if (changedPaths.some(path => !reviewedPaths.has(path))) {
-    throw new Error('合并结果包含待验收清单之外的文件；Local 未写入。')
+    throw new Error(tr('合并结果包含待验收清单之外的文件；Local 未写入。', 'The merge result contains files outside the review list. Local was not changed.'))
   }
   const changedFiles = changedPaths.map(path => toProjectPath(path, projectPathPrefix)).sort()
   const centralIndex = join(tempRoot, 'merged-central.index')
@@ -840,7 +841,7 @@ async function computeMerge(
 export async function prepareExternalConflictWorkspace(
   root: string, input: ApplyPlanInput, review: ExpectedReview, plan: ApplyConflictPlanResult,
 ): Promise<string> {
-  if (!review.snapshot || !plan.cleanEntries || !plan.committedConflictingFiles.length) throw new Error('找不到可验证的冲突快照。')
+  if (!review.snapshot || !plan.cleanEntries || !plan.committedConflictingFiles.length) throw new Error(tr('找不到可验证的冲突快照。', 'No verifiable conflict snapshot was found.'))
   validateReview(review.snapshot, review, '')
   const objects = join(root, 'objects')
   await mkdir(objects, { mode: 0o700 })
@@ -856,11 +857,11 @@ export async function prepareExternalConflictWorkspace(
     await mkdir(tempObjects)
     local = await captureSnapshot(input.localPath, join(temp, 'local.index'), tempObjects, sourceObjects)
   } finally { await rm(temp, { recursive: true, force: true }) }
-  if (projected !== plan.reviewedTreeOid || local.fingerprint !== plan.localFingerprint) throw new Error('冲突快照已变化，请重新预览。')
+  if (projected !== plan.reviewedTreeOid || local.fingerprint !== plan.localFingerprint) throw new Error(tr('冲突快照已变化，请重新预览。', 'The conflict snapshot has changed. Preview again.'))
   const merged = await computeMerge(root, sourceObjects, objects, input.baseOid, local, projected, input.localPath,
     '', new Set(review.files), true, true)
   if (merged.status !== 'conflict' || JSON.stringify(merged.conflictingFiles) !== JSON.stringify(plan.committedConflictingFiles) ||
-      JSON.stringify(merged.cleanEntries) !== JSON.stringify(plan.cleanEntries)) throw new Error('无法重建相同的冲突现场。')
+      JSON.stringify(merged.cleanEntries) !== JSON.stringify(plan.cleanEntries)) throw new Error(tr('无法重建相同的冲突现场。', 'Could not reconstruct the same conflict state.'))
   return join(root, 'committed merge checkout')
 }
 
@@ -1031,7 +1032,7 @@ async function receiptPaths(root: string, project: string, receipt: PreviewRecei
   const recorded = new Set(receipt.changedFiles)
   if (prefix === null || paths.length !== recorded.size || paths.some(path =>
     !reviewEntryPath(path, prefix) || !recorded.has(toProjectPath(path, prefix)))) {
-    throw new Error('预览记录中的文件清单与快照不一致；保留现场。')
+    throw new Error(tr('预览记录中的文件清单与快照不一致；保留现场。', 'The file list in the preview record does not match the snapshot. The environment was preserved for inspection.'))
   }
   return paths
 }
@@ -1047,7 +1048,8 @@ async function checkWorkingScope(root: string, actual: string, expected: string,
   const changed = (await changedTreePaths(root, expected, actual, objectDirectory, sourceObjects))
     .find(path => paths.some(task => pathsOverlap(path, task)))
   if (changed !== undefined) {
-    return { code: 'preview_modified', message: `Local 的预览路径自预览后已变化：${JSON.stringify(changed)}；保留现场。` }
+    return { code: 'preview_modified', message: tr(`Local 的预览路径自预览后已变化：${JSON.stringify(changed)}；保留现场。`,
+      `A Local preview path has changed since the preview: ${JSON.stringify(changed)}. The environment was preserved for inspection.`) }
   }
   // Git's view can omit ignored replacements or normalize an aliased name.
   const entries = entryMap((await runGit(root, ['ls-tree', '-rz', expected])).stdout, 'tree', new Set(paths))
@@ -1065,7 +1067,8 @@ async function checkWorkingScope(root: string, actual: string, expected: string,
       if (!(error instanceof StaleReviewError)) throw error
     }
     if (!matches) {
-      return { code: 'preview_modified', message: `Local 的预览路径自预览后已变化：${JSON.stringify(path)}；保留现场。` }
+      return { code: 'preview_modified', message: tr(`Local 的预览路径自预览后已变化：${JSON.stringify(path)}；保留现场。`,
+        `A Local preview path has changed since the preview: ${JSON.stringify(path)}. The environment was preserved for inspection.`) }
     }
   }
 }
@@ -1126,7 +1129,7 @@ async function prepareFinalizeAssessment(
   if (taskTree.status === 'conflict') {
     return {
       status: 'blocked', code: 'commit_isolation_conflict',
-      message: hostMessage('previewTaskChangesCannotBeReliablySeparatedFromThe', { p0: taskTree.conflictingFiles.join('、') }),
+      message: hostMessage('previewTaskChangesCannotBeReliablySeparatedFromThe', { p0: taskTree.conflictingFiles.join(tr('、', ', ')) }),
       conflictingFiles: [...taskTree.conflictingFiles],
     }
   }
@@ -1143,7 +1146,7 @@ async function prepareFinalizeAssessment(
   if (finalIndexTree.status === 'conflict') {
     return {
       status: 'blocked', code: 'commit_isolation_conflict',
-      message: hostMessage('thePreviewCommitCannotBeReliablySeparatedFromLocal', { p0: finalIndexTree.conflictingFiles.join('、') }),
+      message: hostMessage('thePreviewCommitCannotBeReliablySeparatedFromLocal', { p0: finalIndexTree.conflictingFiles.join(tr('、', ', ')) }),
       conflictingFiles: [...finalIndexTree.conflictingFiles],
     }
   }
@@ -1170,7 +1173,7 @@ async function readIndexBytes(path: string): Promise<Buffer | null> {
     throw error
   }
   try {
-    if (!(await handle.stat()).isFile()) throw new Error('Local 的 Git 索引不是普通文件。')
+    if (!(await handle.stat()).isFile()) throw new Error(tr('Local 的 Git 索引不是普通文件。', 'The Local Git index is not a regular file.'))
     return await handle.readFile()
   } finally { await handle.close() }
 }
@@ -1189,7 +1192,7 @@ async function syncPatchedPaths(root: string, paths: string[]) {
   const dirs = new Set([root])
   for (const path of paths) {
     const parts = path.split('/')
-    if (parts.some(part => !part || part === '.' || part === '..')) throw new Error('无效的 Git 路径。')
+    if (parts.some(part => !part || part === '.' || part === '..')) throw new Error(tr('无效的 Git 路径。', 'Invalid Git path.'))
     let full = root
     for (const part of parts) {
       full = join(full, part)
@@ -1212,7 +1215,8 @@ async function checkPreviewPatch(root: string, patch: Buffer, changedPaths: stri
   const paths = new Set(changedPaths)
   const [before, after] = await Promise.all([beforeTreeOid, afterTreeOid].map(async tree =>
     entryMap((await runGit(root, ['ls-tree', '-rz', tree], { env })).stdout, 'tree', paths)))
-  const stop = (path: string): never => { throw new Error(`Local 路径与预览改动冲突，Local 未写入：${JSON.stringify(path)}`) }
+  const stop = (path: string): never => { throw new Error(tr(`Local 路径与预览改动冲突，Local 未写入：${JSON.stringify(path)}`,
+    `A Local path conflicts with a preview change. Local was not changed: ${JSON.stringify(path)}`)) }
   const statAt = (path: string) => lstat(join(root, path)).catch((err: NodeJS.ErrnoException) => {
     if (err.code !== 'ENOENT') throw err
     return undefined
@@ -1364,7 +1368,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       if (allChanged.some((path) => !isProjectPath(path, localPrefix))) {
         return { status: 'error', error: { code: 'invalid_input', message: hostMessage('isolatedContainsChangesOutsideTheProjectRootAReview') } }
       }
-      if (allChanged.some(path => !reviewEntryPath(path, localPrefix))) throw new Error('待验收文件包含无效 Git 路径。')
+      if (allChanged.some(path => !reviewEntryPath(path, localPrefix))) throw new Error(tr('待验收文件包含无效 Git 路径。', 'The files for review include an invalid Git path.'))
       const changedFiles = files ? selectReviewPaths(allChanged, files.map(path => localPrefix ? `${localPrefix}/${path}` : path)) : allChanged
       const paths = new Set(changedFiles)
       const partial = changedFiles.length !== allChanged.length || (!!files && (await Promise.all(
@@ -1528,7 +1532,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       return { status: 'error', error: { code: 'stale_local', message: hostMessage('localChangedAfterPlanningRecalculateThePlan') } }
     }
     if (!stored.patch.length) {
-      return { status: 'error', error: { code: 'operation_not_allowed', message: '本次任务没有可写入 Local 的新改动。' } }
+      return { status: 'error', error: { code: 'operation_not_allowed', message: tr('本次任务没有可写入 Local 的新改动。', 'This task has no new changes to write to Local.') } }
     }
     await verifyReview(isolatedGitRoot, stored.review, undefined, !stored.input.privateResolution)
     if (stored.input.privateResolution) {
@@ -1544,7 +1548,8 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
     // These files can change the visibility or representation of unrelated paths.
     const metadata = paths.find(path => ['.gitignore', '.gitattributes'].includes(path.split('/').at(-1)?.toLowerCase() ?? ''))
     if (metadata) {
-      return { status: 'error', error: { code: 'operation_not_allowed', message: `暂不支持交付影响 Git 快照规则的改动：${JSON.stringify(metadata)}；Local 未写入。` } }
+      return { status: 'error', error: { code: 'operation_not_allowed', message: tr(`暂不支持交付影响 Git 快照规则的改动：${JSON.stringify(metadata)}；Local 未写入。`,
+        `Delivering changes that affect Git snapshot rules is not yet supported: ${JSON.stringify(metadata)}. Local was not changed.`) } }
     }
     const previewWorkingTreeOid = await prepareIndexFromPatch(localGitRoot, join(tempRoot, 'planned-working.index'), local.treeOid, stored.patch)
     await checkPreviewPatch(localGitRoot, stored.patch, paths, local.treeOid, previewWorkingTreeOid)
@@ -1659,7 +1664,8 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       )
       const receipt = input.receipt
       if (!matchesReceiptIndex(current, receipt)) {
-        return { status: 'error', error: { code: 'stale_local', message: 'Local 自预览后已变化（分支、HEAD 或索引）；停止撤回，保留现场。' } }
+        return { status: 'error', error: { code: 'stale_local', message: tr('Local 自预览后已变化（分支、HEAD 或索引）；停止撤回，保留现场。',
+          'Local has changed since the preview (branch, HEAD, or index). Rollback stopped; the environment was preserved for inspection.') } }
       }
       const paths = await receiptPaths(localGitRoot, input.localPath, receipt)
       const checkScope = (actual: string, expected: string, objects: string | null, alternates: string | null) =>
@@ -1722,7 +1728,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
   async commitReady(plan: ApplyPlan, options: DirectCommitOptions): Promise<FinishResult> {
     const stored = this.plans.get(plan.revision)
     if (!stored || !planMatches(stored.plan, plan)) {
-      return { status: 'error', error: { code: 'invalid_plan', message: '直接提交的计划已变化，Local 未写入。' } }
+      return { status: 'error', error: { code: 'invalid_plan', message: tr('直接提交的计划已变化，Local 未写入。', 'The direct-commit plan has changed. Local was not changed.') } }
     }
     this.plans.delete(plan.revision)
     let tempRoot: string | null = null
@@ -1773,14 +1779,17 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       )
       const receipt = input.receipt
       if (!matchesReceiptIndex(current, receipt) || (direct && current.fingerprint !== receipt.localFingerprintBefore)) {
-        return { status: 'error', error: { code: 'stale_local', message: direct ? 'Local 在准备直接提交时已变化，未写入。' : 'Local 自预览后已变化（分支、HEAD 或索引）；停止提交，保留现场。' } }
+        return { status: 'error', error: { code: 'stale_local', message: direct
+          ? tr('Local 在准备直接提交时已变化，未写入。', 'Local changed while preparing the direct commit. Local was not changed.')
+          : tr('Local 自预览后已变化（分支、HEAD 或索引）；停止提交，保留现场。',
+            'Local has changed since the preview (branch, HEAD, or index). The commit was stopped; the environment was preserved for inspection.') } }
       }
       const paths = await receiptPaths(localGitRoot, input.localPath, receipt)
       const checkScope = (actual: string) =>
         checkWorkingScope(localGitRoot, actual, receipt.previewWorkingTreeOid, paths, objectDirectory, sourceObjects)
       if (direct) {
         if (!pathsMatch(sourceObjects, direct.scope.sourceObjects) || localGitRoot !== direct.scope.localGitRoot) {
-          return { status: 'error', error: { code: 'invalid_plan', message: 'Local 仓库身份已变化，未写入。' } }
+          return { status: 'error', error: { code: 'invalid_plan', message: tr('Local 仓库身份已变化，未写入。', 'The Local repository identity has changed. Local was not changed.') } }
         }
         // Never silently absorb a staged or working edit on a reviewed path,
         // including a dirty hunk Git dropped because it already matches the task.
@@ -1788,7 +1797,8 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
           changedTreePaths(localGitRoot, current.headTreeOid, tree, objectDirectory, sourceObjects)))).flat()
         const overlapping = dirty.find(path => direct.review.entries.some(entry => pathsOverlap(path, entry.path)))
         if (overlapping !== undefined) return { status: 'error', error: { code: 'commit_isolation_conflict',
-          message: `Local 原有改动与交付清单重叠：${JSON.stringify(overlapping)}。不能直接提交；请先处理 Local 改动，或使用预览检查。` } }
+          message: tr(`Local 原有改动与交付清单重叠：${JSON.stringify(overlapping)}。不能直接提交；请先处理 Local 改动，或使用预览检查。`,
+            `Existing Local changes overlap with the delivery list: ${JSON.stringify(overlapping)}. A direct commit is not possible. Resolve the Local changes or inspect them using a preview.`) } }
       } else {
         const initialError = await checkScope(current.treeOid)
         if (initialError) return { status: 'error', error: initialError }
@@ -1808,7 +1818,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       }
 
       if (!assessment.commitRequired) {
-        if (direct) return { status: 'error', error: { code: 'operation_not_allowed', message: '没有可直接提交的任务改动。' } }
+        if (direct) return { status: 'error', error: { code: 'operation_not_allowed', message: tr('没有可直接提交的任务改动。', 'There are no task changes to commit directly.') } }
         await this.options.beforeFinalLocalValidation?.()
         const finalLocal = await this.captureSnapshot(
           localGitRoot,
@@ -1835,7 +1845,8 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       ])
       const taskPaths = new Set(paths)
       if ([...committedPaths, ...reindexedPaths].some(path => !taskPaths.has(path))) {
-        return { status: 'error', error: { code: 'commit_isolation_conflict', message: '提交或索引结果包含预览之外的文件；Local 未提交。' } }
+        return { status: 'error', error: { code: 'commit_isolation_conflict', message: tr('提交或索引结果包含预览之外的文件；Local 未提交。',
+          'The resulting commit or index includes files outside the preview. No commit was made in Local.') } }
       }
       const taskPatch = await treePatch(
         localGitRoot,
@@ -1905,7 +1916,8 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       const finalIndexBytes = await readIndexBytes(realIndexPath)
       if (!matchesReceiptIndex(finalLocal, receipt) || !sameIndexBytes(finalIndexBytes, originalIndexBytes) ||
           (direct && finalLocal.fingerprint !== receipt.localFingerprintBefore)) {
-        return { status: 'error', error: { code: 'stale_local', message: direct ? 'Local 在直接提交前已变化，未写入。' : hostMessage('localChangedBeforeThePreviewCommitWasWrittenRetry') } }
+        return { status: 'error', error: { code: 'stale_local', message: direct ? tr('Local 在直接提交前已变化，未写入。',
+          'Local changed before the direct commit. Local was not changed.') : hostMessage('localChangedBeforeThePreviewCommitWasWrittenRetry') } }
       }
       if (direct) {
         await checkPreviewPatch(localGitRoot, direct.patch, paths, receipt.localWorkingTreeOid, receipt.previewWorkingTreeOid)
@@ -1932,10 +1944,10 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
           const patched = await this.captureSnapshot(localGitRoot, join(tempRoot, 'direct-patched.index'), objectDirectory, sourceObjects)
           const scopeError = await checkScope(patched.treeOid)
           if (scopeError || !matchesReceiptIndex(patched, receipt) || !sameIndexBytes(await readIndexBytes(realIndexPath), originalIndexBytes)) {
-            throw new Error(scopeError?.message ?? 'Local 在写入文件后发生变化。')
+            throw new Error(scopeError?.message ?? tr('Local 在写入文件后发生变化。', 'Local changed after the files were written.'))
           }
           const stillOnBranch = await runGit(localGitRoot, ['symbolic-ref', '--quiet', 'HEAD'], { allowedExitCodes: [0, 1] })
-          if (stillOnBranch.exitCode !== 0 || stdoutText(stillOnBranch) !== branchRef) throw new Error('Local 分支在写入文件后发生变化。')
+          if (stillOnBranch.exitCode !== 0 || stdoutText(stillOnBranch) !== branchRef) throw new Error(tr('Local 分支在写入文件后发生变化。', 'The Local branch changed after the files were written.'))
         }
         await runGit(localGitRoot, ['update-ref', '--no-deref', branchRef, commitOid, current.headOid])
         refUpdated = true
@@ -1983,8 +1995,12 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
 
       // No inverse patch or ref/index compensation for direct delivery: after
       // the first file write an external editor or Git process may own a change.
-      if (direct) return { status: 'error', error: { code: 'git_error', recoveryState: 'uncertain',
-        message: `未能确认直接提交完成：${this.errorMessage(writeError)}；未自动撤销，保留现场。` } }
+      if (direct) {
+        const detail = this.errorMessage(writeError)
+        return { status: 'error', error: { code: 'git_error', recoveryState: 'uncertain',
+          message: tr(`未能确认直接提交完成：${detail}；未自动撤销，保留现场。`,
+            `Could not verify that the direct commit completed: ${detail}. Nothing was rolled back automatically; the environment was preserved for inspection.`) } }
+      }
 
       const rollbackErrors: string[] = []
       if (refUpdated && !indexReplaced && ownedIndexLock) {
@@ -2063,7 +2079,7 @@ class DefaultSessionCheckoutApplyEngine implements SessionCheckoutApplyEngine {
       }
 
       preserveBackup = true
-      const rollbackDetail = rollbackErrors.length > 0 ? `；${rollbackErrors.join('；')}` : ''
+      const rollbackDetail = rollbackErrors.length > 0 ? tr('；', '; ') + rollbackErrors.join(tr('；', '; ')) : ''
       return {
         status: 'error',
         error: {

@@ -1,3 +1,5 @@
+import { tr } from './i18n/display.ts'
+import type { Language } from './i18n/core.ts'
 import type { AdoptionRequest, Action } from './store.ts'
 
 const actions = ['preview', 'rollback', 'commit', 'discard'] as const
@@ -7,6 +9,7 @@ export type WorktreeCommand =
   | { kind: 'help' | 'new' | 'status' | 'resume' | 'back' | 'cancel' }
   | { kind: 'action'; verb: ActionVerb; text?: true }
   | { kind: 'recover' }
+  | { kind: 'language'; language?: Language }
   | { kind: 'confirm'; token: string }
   | { kind: 'adopt'; request: AdoptionRequest; text?: true }
   | { kind: 'discoverAdoption' }
@@ -18,6 +21,11 @@ export function parseWorktreeCommand(args: string): WorktreeCommand {
   const useText = /^--text(?:\s|$)/u.test(argument ?? '')
   const payload = useText ? argument!.slice(6).trimStart() : argument
   if (!verb || verb === 'help' && !argument) return { kind: 'help' }
+  if (verb === 'language') {
+    if (!argument) return { kind: 'language' }
+    if (argument === 'zh' || argument === 'en') return { kind: 'language', language: argument }
+    throw new Error(tr('用法：/worktree-preview-language [zh|en]', 'Usage: /worktree-preview-language [zh|en]'))
+  }
   if (!payload && actions.some(action => action === verb)) return { kind: 'action', verb: verb as ActionVerb, ...(useText ? { text: true } : {}) }
   if (!argument && (verb === 'new' || verb === 'status' || verb === 'resume' || verb === 'back' || verb === 'cancel' || verb === 'recover')) return { kind: verb }
   if (verb === 'confirm' && !useText && payload && /^[a-f0-9-]{36}$/u.test(payload)) return { kind: 'confirm', token: payload }
@@ -27,7 +35,10 @@ export function parseWorktreeCommand(args: string): WorktreeCommand {
       const numbers = payload.split(',').map(Number)
       if (numbers.every(Number.isSafeInteger) && new Set(numbers).size === numbers.length) return { kind: 'selectAdoption', numbers }
     }
-    const usage = '运行 adopt 自动接入，adopt 1,3 只保留当前清单中对应文件，或显式传入 {"source":"/源目录","target":"/目标目录","base":"完整提交 OID","title":"提交标题","files":["相对路径"]}'
+    const usage = tr(
+      '运行 adopt 自动接入，adopt 1,3 只保留当前清单中对应文件，或显式传入 {"source":"/源目录","target":"/目标目录","base":"完整提交 OID","title":"提交标题","files":["相对路径"]}',
+      'Run adopt to register the worktree automatically, use adopt 1,3 to keep only those files in the current list, or pass explicit JSON: {"source":"/source-dir","target":"/target-dir","base":"full commit OID","title":"commit title","files":["relative/path"]}',
+    )
     let values: unknown
     try { values = JSON.parse(payload ?? '') } catch { throw new Error(usage) }
     const req = values as Partial<AdoptionRequest> | null
@@ -36,5 +47,5 @@ export function parseWorktreeCommand(args: string): WorktreeCommand {
         !req.files.length || req.files.some(path => typeof path !== 'string')) throw new Error(usage)
     return { kind: 'adopt', request: { source: req.source, target: req.target, base: req.base, title: req.title, files: req.files }, ...(useText ? { text: true } : {}) }
   }
-  throw new Error('不支持的参数。使用 /worktree-preview help 查看命令。')
+  throw new Error(tr('不支持的参数。使用 /worktree-preview help 查看命令。', 'Unsupported arguments. Use /worktree-preview help to see available commands.'))
 }

@@ -28,6 +28,8 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 
 ## 其他常用操作
 
+默认界面为简体中文。在 **⋯ 更多 → 显示语言** 可切换 **English**，也可运行 `/worktree-preview-language en`；用 `zh` 切回。设置会保存，当前会话立即生效，其他已开的 Pi 会话重新加载扩展后生效。它只影响本扩展的显示，不设置 Pi、聊天或 Git 提交的语言。
+
 | 想做什么 | 怎么做 |
 | --- | --- |
 | 并行开发或恢复任务 | 每个原对话可开一个任务；同一项目一次只能有一份预览。运行 `pi -r`，按 `Tab` 切到 **All**，在 **Threaded** 视图下可从原对话下面直接恢复新建且目录仍在的 Worktree。也可恢复原对话后点 **进入 / 恢复 Worktree**（旧任务也适用）；已清理的任务从 **任务历史** 打开。 |
@@ -81,6 +83,7 @@ Pi 默认使用 fullscreen。在支持鼠标的终端里，直接运行 `pi` 就
 | `/worktree-preview-discard` | 发起放弃任务或解除外部登记 |
 | `/worktree-preview-confirm <确认码>` | 仅用于文本确认（同一对话、单次有效、5 分钟过期） |
 | `/worktree-preview-cancel` | 取消文本确认或下次新建 |
+| `/worktree-preview-language [zh\|en]` | 查看或切换本扩展的显示语言 |
 
 RPC 确认用的是 **Pi 原生 `select`**（支持的客户端可显示为 Ask），不依赖 T3 Code。取消或超时不执行。确认只显示摘要，完整文件清单用 `status` 查看。不支持 Ask 的客户端可用 `/worktree-preview-preview --text` 等命令索取确认码，再运行 `/worktree-preview-confirm <确认码>`。命令模式中，自建任务提交或放弃后会回到原对话。
 

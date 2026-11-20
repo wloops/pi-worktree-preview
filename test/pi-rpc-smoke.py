@@ -95,10 +95,10 @@ class PiRPC:
         detail = self.command(f'{name} --text {rest}'.strip(), 'confirm')
         return re.search(r'/worktree-preview-confirm ([a-f0-9-]+)', detail)[1], detail
 
-    def ask(self, args):
+    def ask(self, args, *, cancel_label='取消'):
         identifier = self.send('prompt', message=f'{NAME}-{args}')
         dialog = self.wait(lambda e: e.get('type') == 'extension_ui_request' and e.get('method') == 'select')
-        assert dialog['options'][0] == '取消' and len(dialog['options']) == 2 and dialog['timeout'] == 300_000, dialog
+        assert dialog['options'][0] == cancel_label and len(dialog['options']) == 2 and dialog['timeout'] == 300_000, dialog
         assert not any(e.get('id') == identifier and e.get('type') == 'response' for e in self.inbox)
         return identifier, dialog
 
@@ -181,7 +181,7 @@ def main():
             assert not any(e.get('method') == 'select' for e in pi.inbox)
             ordinary.unlink()
             origin = pi.state()
-            verbs = ['new', 'status', 'resume', 'back', 'preview', 'recover', 'rollback', 'commit', 'discard', 'adopt', 'confirm', 'cancel']
+            verbs = ['new', 'status', 'resume', 'back', 'preview', 'recover', 'rollback', 'commit', 'discard', 'adopt', 'confirm', 'cancel', 'language']
             available = pi.reply(pi.send('get_commands'))['commands']
             extensions = {cmd['name']: cmd for cmd in available if cmd['source'] == 'extension'}
             assert 'worktree-preview' in extensions
@@ -205,6 +205,21 @@ def main():
             assert child['sessionId'] != origin['sessionId']
             contents = target_file.read_text(), (isolated / 'task.txt').read_text()
             assert contents == ('base\n', 'task edit\n'), (contents, current)
+            assert pi.command('language') == '显示语言：简体中文'
+            assert '用法' in pi.command('language fr', 'error')
+            assert pi.command('language en') == 'Display language: English'
+            assert pi.status() == current  # Protocol keys, paths and review stay unchanged.
+            available = pi.reply(pi.send('get_commands'))['commands']
+            descriptions = {c['name']: c.get('description') for c in available if c['source'] == 'extension'}
+            assert descriptions['worktree-preview'] == 'Open the Worktree menu; use help to list commands'
+            assert descriptions['worktree-preview-preview'] == 'Start previewing changes'
+            request = pi.ask('preview', cancel_label='Cancel')
+            assert 'Preview changes?' in request[1]['title'], request[1]
+            assert pi.answer(request, cancel=True) == 'The operation was not performed.'
+            assert target_file.read_text() == 'base\n' and git(repo, 'rev-parse', 'HEAD') == head
+            with PiRPC(repo, agent, provider) as visitor:
+                assert visitor.command('language') == 'Display language: English'
+            assert pi.command('language zh') == '显示语言：简体中文'
             def user_messages(state):
                 return [m for line in Path(state['sessionFile']).read_text().splitlines()
                         if (m := json.loads(line).get('message', {})).get('role') == 'user']
@@ -230,6 +245,8 @@ def main():
             assert pi.state()['sessionId'] == child['sessionId']
             token, detail = pi.challenge('preview')
             assert 'task.txt' in detail and str(repo) in detail and target_file.read_text() == 'base\n'
+            assert pi.command('language en') == 'Display language: English'
+            assert pi.command('language zh') == '显示语言：简体中文'
             with PiRPC(repo, agent, provider) as unrelated:
                 assert unrelated.status()['phase'] == 'none'
                 unrelated.command(f'confirm {token}', 'error')

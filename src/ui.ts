@@ -1,5 +1,6 @@
 import type { ExtensionContext, Theme, ThemeStyle } from '@earendil-works/pi-coding-agent'
 import { Key, Loader, matchesKey, rgbColor, truncateToWidth, visibleWidth, wrapTextWithAnsi, type TuiMouseEvent } from '@earendil-works/pi-tui'
+import { tr } from './i18n/display.ts'
 
 export const clean = (text: string) => text.replace(/[\p{Cc}\p{Cf}]/gu, '?')
 
@@ -168,7 +169,7 @@ export async function pick<T>(ctx: ExtensionContext, title: string, detail: stri
         tooSmall = (requiredDetails > 0 && required.length + choices.length > budget) ||
           (requireDetailViewport && (!footer || budget - required.length < 2)) ||
           ((requiredDetails > 0 || requireDetailViewport) && choices.some(({ label }) => visibleWidth(clean(label)) > labelCols))
-        const fixed = tooSmall ? ['请放大终端后再确认。'].slice(0, budget - 1) : required
+        const fixed = tooSmall ? [tr('请放大终端后再确认。', 'Resize to confirm.')].slice(0, budget - 1) : required
         const room = budget - fixed.length
         // Keep the deletion warning and target pinned; extra context scrolls independently.
         const reserve = tooSmall ? 0 : Math.max(0, Math.min(paragraphs.length, Math.floor(room / 2), 8))
@@ -225,8 +226,8 @@ export async function pick<T>(ctx: ExtensionContext, title: string, detail: stri
         detailControl = undefined
         if (footer) {
           const position = !inline && !tooSmall && rows < choices.length ? `${selected + 1}/${choices.length} · ` : ''
-          const chip = detailRows && detailMax ? `详情 ${detailOffset + 1}–${detailOffset + detailRows}/${paragraphs.length} ↕` : ''
-          const help = tooSmall ? '终端太小 · Esc 关闭' : `${position}${inline ? '←→' : '↑↓'} · Enter · Esc`
+          const chip = detailRows && detailMax ? `${tr('详情', 'Info')} ${detailOffset + 1}–${detailOffset + detailRows}/${paragraphs.length} ↕` : ''
+          const help = tooSmall ? tr('终端太小 · Esc 关闭', 'Too small · Esc') : `${position}${inline ? '←→' : '↑↓'} · Enter · Esc`
           const prefix = chip ? `${pad}${chip}` : pad
           if (chip && visibleWidth(prefix) <= inner) detailControl = { y: lines.length, from: inset + padding, to: inset + visibleWidth(prefix) }
           lines.push(row(prefix + (chip ? '   ' : '') + help, { fg: p.secondary, bg: p.surface }))

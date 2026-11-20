@@ -1,3 +1,4 @@
+import { getDisplayLanguage, loadDisplayLanguage, saveDisplayLanguage, tf, tr } from './i18n/display.ts'
 import { CURRENT_SESSION_VERSION, getAgentDir, SessionManager, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, type InputEvent, type SessionEntry } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
 import { createHash, randomUUID } from 'node:crypto'
@@ -14,7 +15,7 @@ const REVISE = 'worktree_begin_revision'
 const FOLLOW_UP = 'worktree_start_follow_up'
 const HISTORY_VIEW = `${NAME}-history-view`
 const HISTORY_DIR = 'history-views'
-const HISTORY_HINT = '历史对话 · 只读'
+const HISTORY_HINT = () => tr('历史对话 · 只读', 'History · Read-only')
 const historyReadTools = new Set(['read', 'grep', 'find', 'ls'])
 // Native session replacement reloads the extension. Share only the transient
 // delivery lock across the two instances, not UI or session contexts.
@@ -24,28 +25,28 @@ const pendingDelivery = deliveryState[deliveryKey] ??= new Set<string>()
 const delivering = (ctx: ExtensionContext) => pendingDelivery.has(ctx.sessionManager.getSessionFile() ?? '')
 const guardedTools = new Set(['edit', 'write', 'bash', 'powershell'])
 const workflowTools = new Set([TOOL, REVISE, FOLLOW_UP])
-const noWorkflow = '当前对话未绑定 Worktree 任务；无需使用此工具，可按用户要求正常继续。'
-const labels: Record<Action, string> = {
-  preview: '预览改动', rollback: '撤回预览', finalize: '确认提交',
-  commit_ready: '跳过预览，直接提交', discard: '放弃任务',
-}
-const confirmationCopy: Record<Action, { title: string; lead: string; button: string }> = {
-  preview: { title: '预览改动？', lead: '改动写入项目目录，不暂存、不提交。', button: '预览' },
-  rollback: { title: '撤回预览？', lead: '只还原本次预览。', button: '撤回' },
-  finalize: { title: '提交本次预览？', lead: '只提交任务改动。', button: '提交并安全清理' },
-  commit_ready: { title: '跳过预览，直接提交？', lead: '写入项目目录并提交。', button: '提交并安全清理' },
-  discard: { title: '放弃任务？', lead: '安全检查通过后删除隔离目录，项目目录不变。', button: '放弃' },
-}
-const completed: Record<Action, string> = {
-  preview: '改动已写入项目目录，未暂存、未提交。', rollback: '已撤回本次预览。',
-  finalize: '已提交本次预览', commit_ready: '已直接提交本次任务', discard: '任务已放弃，项目目录未改动。',
-}
-const progress: Record<Action, string> = {
-  preview: '正在写入预览改动…', rollback: '正在撤回预览…', finalize: '正在提交预览…',
-  commit_ready: '正在直接提交…', discard: '正在放弃任务并检查清理…',
-}
-type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'scope' | 'recover' | 'close'
-const phases = { creating: '创建中断', working: '进行中', ready: '待验收', previewed: '已预览', delivered: '已交付', discarded: '已放弃' }
+const noWorkflow = () => tr('当前对话未绑定 Worktree 任务；无需使用此工具，可按用户要求正常继续。', 'This conversation has no linked Worktree task. Skip this tool and proceed with the user\'s request.')
+const labels = (): Record<Action, string> => ({
+  preview: tr('预览改动', 'Preview changes'), rollback: tr('撤回预览', 'Undo preview'), finalize: tr('确认提交', 'Confirm commit'),
+  commit_ready: tr('跳过预览，直接提交', 'Skip preview and commit'), discard: tr('放弃任务', 'Discard task'),
+})
+const confirmationCopy = (): Record<Action, { title: string; lead: string; button: string }> => ({
+  preview: { title: tr('预览改动？', 'Preview changes?'), lead: tr('改动写入项目目录，不暂存、不提交。', 'Writes changes to the project folder without staging or committing.'), button: tr('预览', 'Preview') },
+  rollback: { title: tr('撤回预览？', 'Undo preview?'), lead: tr('只还原本次预览。', 'Only this preview will be undone.'), button: tr('撤回', 'Undo') },
+  finalize: { title: tr('提交本次预览？', 'Commit this preview?'), lead: tr('只提交任务改动。', 'Only task changes will be committed.'), button: tr('提交并安全清理', 'Commit and safely clean up') },
+  commit_ready: { title: tr('跳过预览，直接提交？', 'Skip preview and commit?'), lead: tr('写入项目目录并提交。', 'Writes changes to the project folder and commits them.'), button: tr('提交并安全清理', 'Commit and safely clean up') },
+  discard: { title: tr('放弃任务？', 'Discard task?'), lead: tr('安全检查通过后删除隔离目录，项目目录不变。', 'Removes the isolated directory if safety checks pass. The project folder is unchanged.'), button: tr('放弃', 'Discard') },
+})
+const completed = (): Record<Action, string> => ({
+  preview: tr('改动已写入项目目录，未暂存、未提交。', 'Changes written to the project folder, without staging or committing.'), rollback: tr('已撤回本次预览。', 'Preview undone.'),
+  finalize: tr('已提交本次预览', 'Preview committed'), commit_ready: tr('已直接提交本次任务', 'Task committed directly'), discard: tr('任务已放弃，项目目录未改动。', 'Task discarded. The project folder was not changed.'),
+})
+const progress = (): Record<Action, string> => ({
+  preview: tr('正在写入预览改动…', 'Writing preview changes…'), rollback: tr('正在撤回预览…', 'Undoing preview…'), finalize: tr('正在提交预览…', 'Committing preview…'),
+  commit_ready: tr('正在直接提交…', 'Committing directly…'), discard: tr('正在放弃任务并检查清理…', 'Discarding task and checking cleanup…'),
+})
+type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'scope' | 'recover' | 'language' | 'close'
+const phases = () => ({ creating: tr('创建中断', 'Creation interrupted'), working: tr('进行中', 'In progress'), ready: tr('待验收', 'Ready for review'), previewed: tr('已预览', 'Preview active'), delivered: tr('已交付', 'Delivered'), discarded: tr('已放弃', 'Discarded') })
 const message = (e: unknown) => clean(e instanceof Error ? e.message : String(e))
 function taskSummary(text: string) {
   // A pasted screenshot can precede the actual request, on the same line or above it.
@@ -64,7 +65,7 @@ function isBoundSession(ctx: ExtensionContext, target?: SessionLink) {
   return !!link && !!target && link.id === target.id && link.file === target.file && link.cwd === target.cwd
 }
 const isOpenTask = (task: Task) => !!task.journal || !['delivered', 'discarded'].includes(task.phase)
-const sessionBusy = '原对话已有未完成的任务或恢复记录；可新开对话并行开发。'
+const sessionBusy = () => tr('原对话已有未完成的任务或恢复记录；可新开对话并行开发。', 'This conversation already has an open task or recovery record. Start a new conversation to work in parallel.')
 function currentTask(ctx: ExtensionContext, isolated: Task | undefined, tasks: Task[]) {
   if (isolated) return isBoundSession(ctx, isolated.isolatedSession) ? isolated : undefined
   const own = tasks.filter(task => isBoundSession(ctx, task.localSession))
@@ -72,38 +73,38 @@ function currentTask(ctx: ExtensionContext, isolated: Task | undefined, tasks: T
 }
 function deliveryChoices(task: Task | undefined): Choice<Action>[] {
   if (!task || task.journal) return []
-  if (task.phase === 'ready') return [{ label: labels.preview, value: 'preview', tone: 'primary' }]
-  if (task.phase === 'previewed') return [{ label: labels.finalize, value: 'finalize', tone: 'primary' }, { label: labels.rollback, value: 'rollback' }]
+  if (task.phase === 'ready') return [{ label: labels().preview, value: 'preview', tone: 'primary' }]
+  if (task.phase === 'previewed') return [{ label: labels().finalize, value: 'finalize', tone: 'primary' }, { label: labels().rollback, value: 'rollback' }]
   return []
 }
-const localCheck = { label: '打开项目目录检查', value: 'return' } as const
-const retainedChoice = { label: '已保留的 Worktree', value: 'retained' } as const
-const historyChoice = { label: '任务历史', value: 'history' } as const
-const recoverChoice = { label: '让 Agent 继续解决冲突', value: 'recover', tone: 'primary' } as const
-const resumeChoice = { label: '进入 / 恢复 Worktree', value: 'resume' } as const
-const scopeChoice = { label: '调整交付清单', value: 'scope' } as const
+const localCheck = () => ({ label: tr('打开项目目录检查', 'Inspect project folder'), value: 'return' } as const)
+const retainedChoice = () => ({ label: tr('已保留的 Worktree', 'Retained Worktrees'), value: 'retained' } as const)
+const historyChoice = () => ({ label: tr('任务历史', 'Task history'), value: 'history' } as const)
+const recoverChoice = () => ({ label: tr('让 Agent 继续解决冲突', 'Let Agent continue resolving'), value: 'recover', tone: 'primary' } as const)
+const resumeChoice = () => ({ label: tr('进入 / 恢复 Worktree', 'Open / resume Worktree'), value: 'resume' } as const)
+const scopeChoice = () => ({ label: tr('调整交付清单', 'Change delivery scope'), value: 'scope' } as const)
 
 async function chooseReviewFiles(ctx: ExtensionContext, files: readonly string[], narrow: boolean, initial = narrow ? files : []) {
-  if (!files.length) throw new Error('没有可验收的 Git 改动。')
+  if (!files.length) throw new Error(tr('没有可验收的 Git 改动。', 'No Git changes to review.'))
   const selected = new Set(initial.filter(path => files.includes(path)))
   const choices: Choice<boolean>[] = files.map(path => ({
     get label() { return `[${selected.has(path) ? 'x' : ' '}] ${JSON.stringify(path)}` },
     value: false,
     toggle() { if (!selected.delete(path)) selected.add(path) },
   }))
-  const apply = await pick(ctx, narrow ? '调整交付清单' : '选择交付文件', [
-    narrow ? '取消勾选即可移除文件；保留文件的验收内容不变。' : '只勾选本次任务要交付的文件。',
-    '保存只更新验收清单，不会写入项目目录。',
-  ], [...choices, { label: '保存交付清单', value: true, tone: 'primary' }, { label: '取消', value: false, tone: 'quiet' }])
+  const apply = await pick(ctx, narrow ? tr('调整交付清单', 'Change delivery scope') : tr('选择交付文件', 'Choose files to deliver'), [
+    narrow ? tr('取消勾选即可移除文件；保留文件的验收内容不变。', 'Uncheck files to remove them. The remaining files keep their reviewed contents.') : tr('只勾选本次任务要交付的文件。', 'Select only files that belong to this task.'),
+    tr('保存只更新验收清单，不会写入项目目录。', 'Saving updates the review only. It does not write to the project folder.'),
+  ], [...choices, { label: tr('保存交付清单', 'Save file list'), value: true, tone: 'primary' }, { label: tr('取消', 'Cancel'), value: false, tone: 'quiet' }])
   if (!apply) return
-  if (!selected.size) throw new Error('请选择至少一个要交付的改动文件。')
+  if (!selected.size) throw new Error(tr('请选择至少一个要交付的改动文件。', 'Select at least one changed file to deliver.'))
   return files.filter(path => selected.has(path))
 }
 
 function phaseLabel(isolated: boolean, task?: Task) {
-  const scope = isolated ? 'Worktree' : '原对话'
+  const scope = isolated ? 'Worktree' : tr('原对话', 'Original conversation')
   if (!task) return scope
-  const phase = task.journal ? '恢复记录：已停止' : task.recovery ? '解决冲突中' : phases[task.phase]
+  const phase = task.journal ? tr('恢复记录：已停止', 'Recovery record: stopped') : task.recovery ? tr('解决冲突中', 'Resolving conflicts') : phases()[task.phase]
   return `${scope} · ${isolated ? '' : 'Worktree '}${phase}`
 }
 function phaseTone(task?: Task) {
@@ -169,13 +170,13 @@ async function isWorktreePath(root: string, path: string, cwd: string) {
 // Pi 1.5 keeps the origin of a first-message Worktree in memory. Publish its
 // own native header and entries, then reopen it so Pi knows the file is saved.
 // Do not substitute a new session, or add a fake chat message to force a flush.
-async function withSavedLocal(ctx: ExtensionCommandContext, run: (next: ExtensionCommandContext, send: (text: string) => unknown) => Promise<void>, initialName = '原对话 · Worktree 任务') {
+async function withSavedLocal(ctx: ExtensionCommandContext, run: (next: ExtensionCommandContext, send: (text: string) => unknown) => Promise<void>, initialName = tr('原对话 · Worktree 任务', 'Original conversation · Worktree task')) {
   const source = sessionLink(ctx)
-  if (!source) throw new Error('无有效的持久化 Pi 会话。')
+  if (!source) throw new Error(tr('无有效的持久化 Pi 会话。', 'No valid saved Pi session.'))
   if (await existing(source.file)) { await run(ctx, () => {}); return }
   const header = ctx.sessionManager.getHeader()
   if (!header || header.id !== source.id || header.cwd !== source.cwd || header.version !== CURRENT_SESSION_VERSION) {
-    throw new Error('无法保存原对话。')
+    throw new Error(tr('无法保存原对话。', 'Could not save the original conversation.'))
   }
   const body = [header, ...ctx.sessionManager.getEntries()].map(entry => JSON.stringify(entry)).join('\n') + '\n'
   const dir = dirname(source.file)
@@ -203,16 +204,16 @@ async function withSavedLocal(ctx: ExtensionCommandContext, run: (next: Extensio
       await undoPublication()
       throw error
     }
-    const moved = await withLoading(ctx, '正在恢复原对话…', () => ctx.switchSession(source.file, { withSession: async next => {
+    const moved = await withLoading(ctx, tr('正在恢复原对话…', 'Restoring original conversation…'), () => ctx.switchSession(source.file, { withSession: async next => {
       if (!isBoundSession(next, source) || !next.isIdle()) {
-        next.ui.notify('未能恢复原对话；没有新建 Worktree。', 'error')
+        next.ui.notify(tr('未能恢复原对话；没有新建 Worktree。', 'Could not restore the original conversation. No Worktree was created.'), 'error')
         return
       }
       await run(next, text => next.sendUserMessage(text, { expandPromptTemplates: true }))
     } }))
     if (moved.cancelled) {
       await undoPublication()
-      throw new Error('Pi 取消了保存原对话。')
+      throw new Error(tr('Pi 取消了保存原对话。', 'Pi cancelled saving the original conversation.'))
     }
   } finally { await rm(stage, { recursive: true }) }
 }
@@ -222,7 +223,7 @@ type HistoryView = HistoryProof & { priorId: string; returnTo: SessionLink; afte
 const hashHistory = (lines: string[]) => createHash('sha256').update(lines.join('\n')).digest('hex')
 
 async function readHistory(source: SessionLink) {
-  if (!isAbsolute(source.file) || !await existing(source.file)) throw new Error('原 Pi 会话文件已不存在，无法续接。')
+  if (!isAbsolute(source.file) || !await existing(source.file)) throw new Error(tr('原 Pi 会话文件已不存在，无法续接。', 'The original Pi session file is missing. Cannot continue it.'))
   const fd = await open(source.file, 'r')
   try {
     // Pi's open/forkFrom loader can repair a missing final newline in place.
@@ -232,15 +233,15 @@ async function readHistory(source: SessionLink) {
     const [first, ...body] = (await fd.readFile('utf8')).trimEnd().split('\n')
     const after = await lstat(source.file, { bigint: true })
     if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size ||
-        before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) throw new Error('原 Pi 会话在续接时已变化，请重试。')
+        before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs) throw new Error(tr('原 Pi 会话在续接时已变化，请重试。', 'The original Pi session changed while continuing. Try again.'))
     const parse = (line: string) => {
-      try { return JSON.parse(line) } catch { throw new Error('原 Pi 会话内容已损坏，无法续接。') }
+      try { return JSON.parse(line) } catch { throw new Error(tr('原 Pi 会话内容已损坏，无法续接。', 'The original Pi session is damaged. Cannot continue it.')) }
     }
     const header = parse(first)
     if (header?.type !== 'session' || header.id !== source.id || header.cwd !== source.cwd) {
-      throw new Error('原 Pi 会话的身份或工作目录已变化。')
+      throw new Error(tr('原 Pi 会话的身份或工作目录已变化。', 'The identity or working directory of the original Pi session changed.'))
     }
-    if (header.version !== CURRENT_SESSION_VERSION) throw new Error('原 Pi 会话格式版本不兼容，无法续接。')
+    if (header.version !== CURRENT_SESSION_VERSION) throw new Error(tr('原 Pi 会话格式版本不兼容，无法续接。', 'The original Pi session uses an incompatible format version.'))
     const ids = new Set<string>()
     let stateSuffixStart = 0
     for (const [i, line] of body.entries()) {
@@ -248,7 +249,7 @@ async function readHistory(source: SessionLink) {
       const entry = parse(line)
       if (typeof entry?.type !== 'string' || entry.type === 'session' || typeof entry.id !== 'string' ||
           ids.has(entry.id) || (entry.parentId !== null && !ids.has(entry.parentId))) {
-        throw new Error('原 Pi 会话的历史链接不完整，无法续接。')
+        throw new Error(tr('原 Pi 会话的历史链接不完整，无法续接。', 'The original Pi session has incomplete history links. Cannot continue it.'))
       }
       ids.add(entry.id)
       if (entry.type !== 'custom' || typeof entry.customType !== 'string' || !entry.customType) stateSuffixStart = i + 1
@@ -290,17 +291,17 @@ async function createChildSession(cwd: string, parent: SessionLink, body: string
 
 async function makeHistoryView(data: TaskStore, task: Task, returnTo: SessionLink, delivery?: { leaf: string | null }) {
   const source = task.isolatedSession
-  if (!source || source.cwd !== task.isolatedPath) throw new Error('找不到原 Worktree 对话。')
+  if (!source || source.cwd !== task.isolatedPath) throw new Error(tr('找不到原 Worktree 对话。', 'Could not find the original Worktree conversation.'))
   await data.validateLocalIdentity(task)
   const { body, ids, hash } = await readHistory(source)
   const leaf = delivery?.leaf ?? undefined
-  if (leaf !== undefined && !ids.has(leaf)) throw new Error('当前对话分支尚未保存，无法保留对话。')
+  if (leaf !== undefined && !ids.has(leaf)) throw new Error(tr('当前对话分支尚未保存，无法保留对话。', 'The current conversation branch is not saved yet and cannot be preserved.'))
   const dir = join(data.directory, HISTORY_DIR)
   await mkdir(dir, { recursive: true, mode: 0o700 })
   const proof: HistoryProof = { historyHash: hash, ...(delivery ? { historyLines: body.length } : {}) }
   const target = await createChildSession(returnTo.cwd, source, body, sm => {
     if (leaf !== undefined) sm.branch(leaf)
-    sm.appendSessionInfo(`${delivery ? 'Worktree · 任务对话' : '历史对话'} · ${task.review?.message ?? shortSessionName(task.id)}`)
+    sm.appendSessionInfo(`${delivery ? tr('Worktree · 任务对话', 'Worktree · Task conversation') : tr('历史对话', 'Conversation history')} · ${task.review?.message ?? shortSessionName(task.id)}`)
     sm.appendCustomEntry(HISTORY_VIEW, { priorId: task.id, returnTo, ...proof, ...(delivery ? { afterCommit: true, leaf } : {}) } satisfies HistoryView)
   }, dir)
   return { target, source, proof }
@@ -356,11 +357,11 @@ function captureLocalBranch(ctx: ExtensionContext): string[] {
 }
 
 function captureFollowUp(ctx: ExtensionContext, leaf: string | null): FollowUpHistory {
-  if (!leaf) throw new Error('缺少原对话记录，未开启下一轮。')
+  if (!leaf) throw new Error(tr('缺少原对话记录，未开启下一轮。', 'The original conversation is missing. The next round was not started.'))
   const entries = ctx.sessionManager.getEntries()
   const marker = entries.map(entry => entry.type === 'custom' ? entry.customType : undefined).lastIndexOf(HISTORY_VIEW)
   const end = entries.findIndex(entry => entry.id === leaf)
-  if (marker < 0 || end < marker) throw new Error('无法保存当前对话分支，未开启下一轮。')
+  if (marker < 0 || end < marker) throw new Error(tr('无法保存当前对话分支，未开启下一轮。', 'Could not save the current conversation branch. The next round was not started.'))
   const prefix = entries.slice(0, end + 1)
   const failedRouting = new Set<string>()
   let turnStart = marker + 1
@@ -390,7 +391,7 @@ async function forkWorktreeSession(cwd: string, task: Task, prior: Task, view: H
   const source = prior.isolatedSession!
   const history = await readHistory(source)
   if (!matchesHistory(history, view) || (view.leaf !== undefined && !history.ids.has(view.leaf))) {
-    throw new Error('原 Pi 会话在打开后已变化；请返回原对话后重新打开任务历史。')
+    throw new Error(tr('原 Pi 会话在打开后已变化；请返回原对话后重新打开任务历史。', 'The original Pi session changed after opening. Return to the original conversation and reopen task history.'))
   }
   // Carry the read-only Q&A without the routing turn. Keep later rounds under
   // their origin in Pi's picker, independently of where their history came from.
@@ -408,10 +409,10 @@ async function forkWorktreeSession(cwd: string, task: Task, prior: Task, view: H
 type SwitchOptions = NonNullable<Parameters<ExtensionCommandContext['switchSession']>[1]>
 
 async function validateSession(link: SessionLink) {
-  if (!isAbsolute(link.file) || !await existing(link.file)) throw new Error(`Pi 会话文件不存在：${link.file}`)
-  if (!(await lstat(link.cwd)).isDirectory()) throw new Error(`会话工作目录不存在：${link.cwd}`)
+  if (!isAbsolute(link.file) || !await existing(link.file)) throw new Error(tf('Pi 会话文件不存在：{0}', 'Pi session file not found: {0}', link.file))
+  if (!(await lstat(link.cwd)).isDirectory()) throw new Error(tf('会话工作目录不存在：{0}', 'Session working directory not found: {0}', link.cwd))
   const sm = SessionManager.open(link.file)
-  if (sm.getSessionId() !== link.id || sm.getHeader()?.cwd !== link.cwd) throw new Error('会话身份或工作目录已变化。')
+  if (sm.getSessionId() !== link.id || sm.getHeader()?.cwd !== link.cwd) throw new Error(tr('会话身份或工作目录已变化。', 'The session identity or working directory changed.'))
 }
 
 async function switchTo(ctx: ExtensionCommandContext, link: SessionLink, loading: string, withSession?: SwitchOptions['withSession']) {
@@ -434,71 +435,74 @@ type Confirmation = { token: string; expires: number; session: SessionLink } & (
   | { kind: 'adopt'; request: AdoptionRequest; shown: AdoptionInspection }
   | { kind: 'action'; task: Task; verb: ActionVerb; discardFingerprint?: string; text?: true }
   | { kind: 'recover'; task: Task; conflict: PreviewConflict })
-const standaloneCommands = [
-  ['new', '', '下次发送时新建 Worktree'],
-  ['status', '', '查看 Worktree 与验收状态'],
-  ['resume', '', '进入关联的 Worktree 对话'],
-  ['back', '', '返回原对话'],
-  ['preview', '', '发起预览改动'],
-  ['recover', '', '让 Agent 继续解决冲突'],
-  ['rollback', '', '发起撤回预览'],
-  ['commit', '', '发起提交已预览的改动'],
-  ['discard', '', '发起放弃任务或解除外部登记'],
-  ['adopt', '', '接入当前 Worktree'],
-  ['confirm', ' <确认码>', '确认待执行的操作'],
-  ['cancel', '', '取消待确认操作或下次新建'],
+const standaloneCommands = () => [
+  ['new', '', tr('下次发送时新建 Worktree', 'Create a Worktree on the next send')],
+  ['status', '', tr('查看 Worktree 与验收状态', 'Show Worktree and review status')],
+  ['resume', '', tr('进入关联的 Worktree 对话', 'Open the linked Worktree conversation')],
+  ['back', '', tr('返回原对话', 'Return to original conversation')],
+  ['preview', '', tr('发起预览改动', 'Start previewing changes')],
+  ['recover', '', tr('让 Agent 继续解决冲突', 'Let Agent continue resolving')],
+  ['rollback', '', tr('发起撤回预览', 'Start undoing the preview')],
+  ['commit', '', tr('发起提交已预览的改动', 'Start committing previewed changes')],
+  ['discard', '', tr('发起放弃任务或解除外部登记', 'Discard a task or unlink an external Worktree')],
+  ['adopt', '', tr('接入当前 Worktree', 'Adopt the current Worktree')],
+  ['confirm', tr(' <确认码>', ' <confirmation code>'), tr('确认待执行的操作', 'Confirm a pending operation')],
+  ['cancel', '', tr('取消待确认操作或下次新建', 'Cancel pending confirmation or creation')],
+  ['language', ' [zh|en]', tr('查看或设置扩展显示语言', 'Show or set the extension display language')],
 ] as const
 const confirmationTTL = 5 * 60 * 1000
 function adoptionDetails(shown: AdoptionInspection) {
-  return [`来源：${JSON.stringify(shown.isolated.root)}`, `目标：${JSON.stringify(shown.local.root)} · ${JSON.stringify(shown.localHeadRef)}`,
-    `候选起点：${shown.baseOid}`, `提交标题：${JSON.stringify(shown.review.message)}`]
+  return [tf('来源：{0}', 'Source: {0}', JSON.stringify(shown.isolated.root)), tf('目标：{0} · {1}', 'Target: {0} · {1}', JSON.stringify(shown.local.root), JSON.stringify(shown.localHeadRef)),
+    tf('候选起点：{0}', 'Candidate base: {0}', shown.baseOid), tf('提交标题：{0}', 'Commit title: {0}', JSON.stringify(shown.review.message))]
 }
 function numberedAdoptionFiles(files: readonly string[]) {
   return files.map((file, index) => `${index + 1}. ${JSON.stringify(file)}`)
 }
 function commandNotice(ctx: ExtensionContext, kind: 'ok' | 'confirm' | 'error', text: string, summary?: string) {
   if (ctx.mode === 'rpc' && (summary || kind === 'error')) {
-    const status = clean(summary ?? `Worktree：${text.split('\n')[0]}`)
+    const status = clean(summary ?? tf('Worktree：{0}', 'Worktree: {0}', text.split('\n')[0]))
     ctx.ui.setStatus(NAME, Array.from(status).slice(0, 110).join(''))
   }
   ctx.ui.notify(`${NAME} ${kind}: ${text}`, kind === 'error' ? 'error' : 'info')
 }
 
 function commandFiles(files: readonly string[], compact: boolean): string[] {
-  return compact ? [`涉及 ${files.length} 个文件。`] : ['', `文件（${files.length}）：`, ...numberedAdoptionFiles(files)]
+  return compact ? [tf('涉及 {0} 个文件。', 'Files affected: {0}.', files.length)] : ['', tf('文件（{0}）：', 'Files ({0}):', files.length), ...numberedAdoptionFiles(files)]
 }
 
 function commandActionDetails(task: Task, act: Action, compact: boolean): string {
-  const { title, lead } = confirmationCopy[act]
+  const { title, lead } = confirmationCopy()[act]
   const externalDiscard = task.external && act === 'discard'
   const files = task.receipt?.changedFiles ?? task.review?.files ?? []
-  return [externalDiscard ? '解除外部 Worktree 登记？' : title,
-    externalDiscard ? '只解除登记，两个目录都不改动。' : lead,
-    ...(task.external && !externalDiscard ? ['不修改或删除源目录。'] : act === 'finalize' ? ['提交后尝试安全清理；不会强制删除。'] : []),
-    `目标：${JSON.stringify(task.local.root)} · ${JSON.stringify(task.localHeadRef)}`,
-    `来源：${JSON.stringify(task.isolatedPath)}`,
-    ...(task.external && act === 'preview' ? [`起点：${task.baseOid}`] : []),
-    ...(act === 'finalize' && task.review ? [`提交标题：${JSON.stringify(task.review.message)}`,
-      ...(task.review.body ? ['提交正文：', ...task.review.body.split('\n').map(clean)] : [])] : []),
+  return [externalDiscard ? tr('解除外部 Worktree 登记？', 'Unlink external Worktree?') : title,
+    externalDiscard ? tr('只解除登记，两个目录都不改动。', 'Only the registration is removed. Neither directory is changed.') : lead,
+    ...(task.external && !externalDiscard ? [tr('不修改或删除源目录。', 'The source directory will not be modified or deleted.')] : act === 'finalize' ? [tr('提交后尝试安全清理；不会强制删除。', 'Safe cleanup will be attempted after committing. Nothing will be force-deleted.')] : []),
+    tf('目标：{0} · {1}', 'Target: {0} · {1}', JSON.stringify(task.local.root), JSON.stringify(task.localHeadRef)),
+    tf('来源：{0}', 'Source: {0}', JSON.stringify(task.isolatedPath)),
+    ...(task.external && act === 'preview' ? [tf('起点：{0}', 'Base: {0}', task.baseOid)] : []),
+    ...(act === 'finalize' && task.review ? [tf('提交标题：{0}', 'Commit title: {0}', JSON.stringify(task.review.message)),
+      ...(task.review.body ? [tr('提交正文：', 'Commit body:'), ...task.review.body.split('\n').map(clean)] : [])] : []),
     ...commandFiles(files, compact),
   ].join('\n')
 }
 
 async function confirmRemoval(ctx: ExtensionContext, data: TaskStore, task: Task, title: string) {
-  const proof = await withLoading(ctx, '正在检查保留的 Worktree…', () => data.inspectRetainedRemoval(task, ctx.cwd))
+  const proof = await withLoading(ctx, tr('正在检查保留的 Worktree…', 'Checking retained Worktree…'), () => data.inspectRetainedRemoval(task, ctx.cwd))
   const remove = await pick(ctx, title, [
-    '强删将永久移除此目录，包括未交付改动和忽略文件。',
-    '目标目录：', task.isolatedPath,
-    '先备份需要的文件，并关闭其他使用该目录的会话。',
-    `原因：${task.cleanup?.reason ?? '保留环境'}`,
-  ], [{ label: '确认强删 Worktree', value: true, tone: 'danger' }, { label: '保留 Worktree', value: false, tone: 'quiet' }],
+    tr('强删将永久移除此目录，包括未交付改动和忽略文件。', 'Force removal permanently deletes this directory, including undelivered changes and ignored files.'),
+    tr('目标目录：', 'Target directory:'), task.isolatedPath,
+    tr('先备份需要的文件，并关闭其他使用该目录的会话。', 'Back up anything you need and close other sessions using this directory.'),
+    tf('原因：{0}', 'Reason: {0}', task.cleanup?.reason ?? tr('保留环境', 'Retained environment')),
+  ], [{ label: tr('确认强删 Worktree', 'Force-remove Worktree'), value: true, tone: 'danger' }, { label: tr('保留 Worktree', 'Keep Worktree'), value: false, tone: 'quiet' }],
   { tone: 'danger', requiredDetails: 3 })
   if (!remove || !ctx.isIdle()) return
-  await withLoading(ctx, '正在删除 Worktree…', () => data.removeRetained(task.id, ctx.cwd, proof))
-  ctx.ui.notify('Worktree 已删除；项目目录与对话历史未改动。', 'info')
+  await withLoading(ctx, tr('正在删除 Worktree…', 'Removing Worktree…'), () => data.removeRetained(task.id, ctx.cwd, proof))
+  ctx.ui.notify(tr('Worktree 已删除；项目目录与对话历史未改动。', 'Worktree removed. The project folder and conversation history are unchanged.'), 'info')
 }
 
 export default function extension(pi: ExtensionAPI) {
+  const preferencesDir = join(getAgentDir(), NAME)
+  loadDisplayLanguage(preferencesDir)
   let store: TaskStore | undefined
   let busy = false
   let armed: Armed | undefined
@@ -548,7 +552,7 @@ export default function extension(pi: ExtensionAPI) {
   }
   const isBuiltin = (name: string) => pi.getAllTools().some(tool => tool.name === name && tool.sourceInfo.path === `builtin:${name}`)
   async function verifyExternalEditor(data: TaskStore, task: Task, link?: SessionLink) {
-    if (!link || !await data.isEditingSession(task, link)) throw new Error('只能在绑定的 Worktree 源对话中返修。')
+    if (!link || !await data.isEditingSession(task, link)) throw new Error(tr('只能在绑定的 Worktree 源对话中返修。', 'Revisions must run in the linked source Worktree conversation.'))
     await data.validateIsolatedIdentity(task)
   }
 
@@ -578,7 +582,7 @@ export default function extension(pi: ExtensionAPI) {
             const matches = hit && pressed && Object.is(hit.value, pressed.value) && hit.row === pressed.row && hit.from === pressed.from && hit.to === pressed.to
             pressed = undefined
             if (!matches) return
-            if (busy || draft || clickIntent || !ctx.isIdle()) ctx.ui.notify('请等待当前操作结束。', 'warning')
+            if (busy || draft || clickIntent || !ctx.isIdle()) ctx.ui.notify(tr('请等待当前操作结束。', 'Wait for the current operation to finish.'), 'warning')
             else activate(hit.value)
             return { handled: true }
           }
@@ -598,14 +602,14 @@ export default function extension(pi: ExtensionAPI) {
       const canResume = !!prior?.isolatedSession && prior.phase !== 'delivered' && prior.phase !== 'discarded'
       installToolbar<'back' | 'resume'>(ctx, () => ({
         status: {
-          label: !view ? '历史会话记录无效 · 请退出此会话' : pending ? '任务对话' : !view.afterCommit ? HISTORY_HINT :
-            historyCanFollowUp ? `${prior?.phase === 'discarded' ? '已放弃' : '已交付'} · 只读对话` :
-            prior?.journal ? '操作已停止 · 请检查恢复记录' : '任务对话 · 尚未交付',
+          label: !view ? tr('历史会话记录无效 · 请退出此会话', 'Invalid history view · Close this session') : pending ? tr('任务对话', 'Task conversation') : !view.afterCommit ? HISTORY_HINT() :
+            historyCanFollowUp ? tf('{0} · 只读对话', '{0} · Read-only conversation', prior?.phase === 'discarded' ? tr('已放弃', 'Discarded') : tr('已交付', 'Delivered')) :
+            prior?.journal ? tr('操作已停止 · 请检查恢复记录', 'Operation stopped · Check the recovery record') : tr('任务对话 · 尚未交付', 'Task conversation · Not delivered'),
           tone: view?.afterCommit && historyCanFollowUp ? 'success' : 'warning',
         },
         buttons: view && !pending ? [
-          ...(canResume ? [{ label: '[ 回到 Worktree ]', value: 'resume' as const }] : []),
-          { label: '[ 返回原对话 ]', value: 'back' },
+          ...(canResume ? [{ label: tr('[ 回到 Worktree ]', '[ Back to Worktree ]'), value: 'resume' as const }] : []),
+          { label: tr('[ 返回原对话 ]', '[ Return to original ]'), value: 'back' },
         ] : [],
       }), choice => pi.sendUserMessage(`/${NAME} ${choice}`, { expandPromptTemplates: true }))
       return
@@ -614,22 +618,21 @@ export default function extension(pi: ExtensionAPI) {
     if (!state.local && !state.isolated) { ctx.ui.setWidget(NAME, undefined); return }
     const active = currentTask(ctx, state.isolated, state.tasks)
     const direct: Choice<MenuAction>[] = deliveryChoices(active)
-    if (state.isolated && active?.phase === 'previewed' && !active.journal) direct.push(localCheck)
-    if (active?.phase === 'working' && active.recovery && !active.journal) direct.push(recoverChoice)
+    if (state.isolated && active?.phase === 'previewed' && !active.journal) direct.push(localCheck())
+    if (active?.phase === 'working' && active.recovery && !active.journal) direct.push(recoverChoice())
     else if (!state.isolated && active?.phase === 'working' && !active.journal && active.isolatedSession) {
-      direct.push({ ...resumeChoice, tone: 'primary' })
+      direct.push({ ...resumeChoice(), tone: 'primary' })
     }
     const showCreate = !!state.local && (!active || !isOpenTask(active))
-    const showMenu = (active && (state.isolated || isOpenTask(active))) || retainedTasks(state.tasks).length > 0
     const id = ctx.sessionManager.getSessionId()
     const selected = () => armed?.sessionId === id
     installToolbar<MenuAction | 'menu'>(ctx, () => ({
       status: state.isolated || active ? { label: phaseLabel(!!state.isolated, active), tone: phaseTone(active) } : undefined,
       buttons: [
-        ...(showCreate ? [{ label: `[${selected() ? 'x' : ' '}] 新建 Worktree`, value: 'arm' as const, tone: 'primary' as const, checked: selected() }] : []),
+        ...(showCreate ? [{ label: tf('[{0}] 新建 Worktree', '[{0}] New Worktree', selected() ? 'x' : ' '), value: 'arm' as const, tone: 'primary' as const, checked: selected() }] : []),
         ...direct.map(({ label, ...choice }) => ({ ...choice, label: `[ ${label} ]` })),
-        ...(historyTasks(state.tasks).length ? [{ label: '[ 任务历史 ]', value: 'history' as const }] : []),
-        ...(showMenu ? [{ label: ' ⋯ 更多 ', value: 'menu' as const, trailing: true }] : []),
+        ...(historyTasks(state.tasks).length ? [{ label: tr('[ 任务历史 ]', '[ Task history ]'), value: 'history' as const }] : []),
+        { label: tr(' ⋯ 更多 ', ' ⋯ More '), value: 'menu' as const, trailing: true },
       ],
     }), choice => {
       if (choice === 'menu') openMenu()
@@ -645,7 +648,7 @@ export default function extension(pi: ExtensionAPI) {
   // removal, including the interval between native switch and session_start.
   pi.on('session_before_switch', async (event, ctx) => {
     if (revising || commandAsk || conflictKickoff || delivering(ctx)) {
-      if (ctx.hasUI) ctx.ui.notify('请等待当前操作结束。', 'warning')
+      if (ctx.hasUI) ctx.ui.notify(tr('请等待当前操作结束。', 'Wait for the current operation to finish.'), 'warning')
       return { cancel: true }
     }
     try {
@@ -716,19 +719,19 @@ export default function extension(pi: ExtensionAPI) {
   pi.on('input', (event, ctx) => {
     if (incomingHoldFailed) {
       if (ctx.hasUI && (event.source === 'interactive' || event.source === 'rpc')) restoreDraft(ctx, event.text)
-      if (ctx.hasUI) ctx.ui.notify('无法确认 Worktree 会话占用，请退出后重试。', 'error')
+      if (ctx.hasUI) ctx.ui.notify(tr('无法确认 Worktree 会话占用，请退出后重试。', 'Could not confirm the Worktree session hold. Exit and try again.'), 'error')
       return { action: 'handled' }
     }
     const history = historyView !== undefined
     if (revising || runningCommand || conflictKickoff || delivering(ctx) && !history) {
-      if (ctx.hasUI) { restoreDraft(ctx, event.text); commandNotice(ctx, 'error', '操作尚未结束；消息未发送。') }
+      if (ctx.hasUI) { restoreDraft(ctx, event.text); commandNotice(ctx, 'error', tr('操作尚未结束；消息未发送。', 'An operation is in progress. Message not sent.')) }
       return { action: 'handled' }
     }
     if (history && (!historyView || event.source !== 'interactive' || !ctx.hasUI)) return { action: 'handled' }
     if ((event.source !== 'interactive' && event.source !== 'rpc') || !ctx.hasUI || (!event.text.trim() && !event.images?.length)) return
     if (history && !historyCanFollowUp) {
       restoreDraft(ctx, event.text)
-      ctx.ui.notify(delivering(ctx) ? '请等待提交操作结束；消息未发送。' : '目前不能从此处继续。请回到 Worktree，或检查恢复记录。', 'warning')
+      ctx.ui.notify(delivering(ctx) ? tr('请等待提交操作结束；消息未发送。', 'Wait for the commit to finish. Message not sent.') : tr('目前不能从此处继续。请回到 Worktree，或检查恢复记录。', 'Cannot continue from here. Return to the Worktree or check the recovery record.'), 'warning')
       return { action: 'handled' }
     }
     confirmation = undefined // Task input invalidates earlier approval.
@@ -738,8 +741,8 @@ export default function extension(pi: ExtensionAPI) {
     if (!history && armed?.sessionId !== sessionId) return
     if (busy || draft || historyTurn || !ctx.isIdle() || event.streamingBehavior) {
       restoreDraft(ctx, event.text)
-      if (ctx.mode === 'rpc') commandNotice(ctx, 'error', '请等待当前操作结束再发送；消息未发送。')
-      else ctx.ui.notify('请等待当前操作结束再发送；消息未发送。', 'warning')
+      if (ctx.mode === 'rpc') commandNotice(ctx, 'error', tr('请等待当前操作结束再发送；消息未发送。', 'Wait for the current operation to finish before sending. Message not sent.'))
+      else ctx.ui.notify(tr('请等待当前操作结束再发送；消息未发送。', 'Wait for the current operation to finish before sending. Message not sent.'), 'warning')
       return { action: 'handled' }
     }
     const prompt = { sessionId, text: event.text, images: event.images }
@@ -760,7 +763,7 @@ export default function extension(pi: ExtensionAPI) {
   pi.on('session_before_tree', () => historyView !== undefined ? { cancel: true } : undefined)
   pi.on('user_bash', (_event, ctx) => {
     if (historyView === undefined) return
-    const output = '历史对话不执行 shell；请返回原对话。'
+    const output = tr('历史对话不执行 shell；请返回原对话。', 'Shell commands are disabled in history views. Return to the original conversation.')
     if (ctx.hasUI) ctx.ui.notify(output, 'warning')
     return { result: { output, exitCode: 1, cancelled: false, truncated: false } }
   })
@@ -826,7 +829,7 @@ export default function extension(pi: ExtensionAPI) {
         }
         return { block: true, reason: 'Call the follow-up tool by itself.' }
       }
-      return { block: true, reason: '历史对话只读，不执行修改或 shell。' }
+      return { block: true, reason: tr('历史对话只读，不执行修改或 shell。', 'History is read-only. Editing and shell commands are disabled.') }
     }
     if (event.toolName === FOLLOW_UP || canReadInHistory(event.toolName)) return
     const workflowTool = event.toolName === TOOL || event.toolName === REVISE
@@ -836,7 +839,7 @@ export default function extension(pi: ExtensionAPI) {
     if (!workflowTool && (!managedEditor || !guardedTools.has(event.toolName))) return
     let state: Awaited<ReturnType<typeof workspace>>
     try { state = await workspace(ctx) }
-    catch (error) { return managedEditor ? { block: true, reason: `无法核对 Worktree 状态：${message(error)}` } : undefined }
+    catch (error) { return managedEditor ? { block: true, reason: tf('无法核对 Worktree 状态：{0}', 'Could not verify Worktree state: {0}', message(error)) } : undefined }
     const task = editingTask(ctx, state)
     if (!managedEditor && (!task || !await isWorkflowEditor(ctx, state.data, task))) return
     const assistant = ctx.sessionManager.getBranch().reverse().find(entry => entry.type === 'message' && entry.message.role === 'assistant')
@@ -844,7 +847,7 @@ export default function extension(pi: ExtensionAPI) {
       ? assistant.message.content.filter(part => part.type === 'toolCall') : []
     if ((calls.length > 1 && calls.some(call => call.name === TOOL || call.name === REVISE)) ||
         (event.parentToolCallId && (event.toolName === TOOL || event.toolName === REVISE))) {
-      return { block: true, reason: `${REVISE} 和 ${TOOL} 都必须单独调用，不可与其他工具批量执行。` }
+      return { block: true, reason: tf('{0} 和 {1} 都必须单独调用，不可与其他工具批量执行。', '{0} and {1} must each be called on their own, not in a batch with other tools.', REVISE, TOOL) }
     }
     if (event.toolName === REVISE) return
     const canRefreshReview = task?.external && task.phase === 'ready' && event.toolName === TOOL
@@ -852,28 +855,28 @@ export default function extension(pi: ExtensionAPI) {
         !revising && !revisionStopped && !incomingHoldFailed && editingSession(ctx, task)) {
       if ((event.toolName === 'edit' || event.toolName === 'write') &&
           (typeof event.input.path !== 'string' || !await isWorktreePath(task.isolatedPath, event.input.path, ctx.cwd))) {
-        return { block: true, reason: '只允许编辑当前 Worktree 内的文件。' }
+        return { block: true, reason: tr('只允许编辑当前 Worktree 内的文件。', 'Only files inside the current Worktree may be edited.') }
       }
       return
     }
     const reason = !revisionStopped && task && !task.journal && editingSession(ctx, task) &&
         ['ready', 'previewed'].includes(task.phase)
-      ? `当前处于验收阶段。如果用户要求改动，先单独调用 ${REVISE}；如果只是讨论，请用只读工具。`
-      : '当前会话不允许编辑或执行 shell；请勿绕过。'
+      ? tf('当前处于验收阶段。如果用户要求改动，先单独调用 {0}；如果只是讨论，请用只读工具。', 'The task is under review. For requested edits, first call {0} alone. For discussion, use read-only tools.', REVISE)
+      : tr('当前会话不允许编辑或执行 shell；请勿绕过。', 'Editing and shell commands are not allowed in this session. Do not bypass this restriction.')
     return { block: true, reason }
   })
   pi.registerTool({
-    name: FOLLOW_UP, label: '开启下一轮 Worktree', defaultActive: false, exposure: 'model-only', executionMode: 'sequential',
+    name: FOLLOW_UP, label: tr('开启下一轮 Worktree', 'Start next Worktree round'), defaultActive: false, exposure: 'model-only', executionMode: 'sequential',
     description: 'Answer or clarify here read-only; call this tool alone only if the user explicitly asks for project changes.',
     parameters: Type.Object({}),
     async execute(_id, _params, signal, _update, ctx) {
-      if (historyView === undefined) return { content: [{ type: 'text', text: noWorkflow }], details: {}, isError: true }
+      if (historyView === undefined) return { content: [{ type: 'text', text: noWorkflow() }], details: {}, isError: true }
       const turn = historyTurn
       if (!turn || !historyCanFollowUp || delivering(ctx) || turn.requested || !isBoundSession(ctx, turn.source) || signal?.aborted) {
-        return { content: [{ type: 'text', text: '未开启下一轮。' }], details: {}, isError: true }
+        return { content: [{ type: 'text', text: tr('未开启下一轮。', 'The next round was not started.') }], details: {}, isError: true }
       }
       turn.requested = true
-      return { content: [{ type: 'text', text: '将在新 Worktree 继续。' }], details: {}, terminate: true }
+      return { content: [{ type: 'text', text: tr('将在新 Worktree 继续。', 'Continuing in a new Worktree.') }], details: {}, terminate: true }
     },
   })
   pi.on('agent_settled', async (event, ctx) => {
@@ -897,7 +900,7 @@ export default function extension(pi: ExtensionAPI) {
     }
   })
   pi.registerTool({
-    name: REVISE, label: '开始返修', defaultActive: false, exposure: 'model-only', executionMode: 'sequential',
+    name: REVISE, label: tr('开始返修', 'Start revision'), defaultActive: false, exposure: 'model-only', executionMode: 'sequential',
     description: 'Call alone only for requested edits, not discussion. Wait for any required approval and rollback; on success continue the same request, on failure stop.',
     parameters: Type.Object({}),
     async execute(_id, _params, signal, _update, ctx) {
@@ -905,11 +908,11 @@ export default function extension(pi: ExtensionAPI) {
       const state = await workspace(ctx).catch(() => undefined)
       const task = state && editingTask(ctx, state)
       const link = sessionLink(ctx)
-      if (!state || !task || !link || !await isWorkflowEditor(ctx, state.data, task)) return result(false, noWorkflow)
+      if (!state || !task || !link || !await isWorkflowEditor(ctx, state.data, task)) return result(false, noWorkflow())
       if (task.recovery && !task.journal && !incomingHoldFailed) {
-        return result(true, '已在解决冲突，不需要开始返修。请按当前请求继续处理冲突，不要再次调用此工具。')
+        return result(true, tr('已在解决冲突，不需要开始返修。请按当前请求继续处理冲突，不要再次调用此工具。', 'Conflict recovery is already underway. Continue the current conflict request without calling this tool again.'))
       }
-      if (busy || revisionStopped) return result(false, '不能开始返修。请勿编辑，也不要在本轮重试。')
+      if (busy || revisionStopped) return result(false, tr('不能开始返修。请勿编辑，也不要在本轮重试。', 'Cannot start revision. Do not edit or retry in this turn.'))
       busy = true
       revising = true
       try {
@@ -919,19 +922,19 @@ export default function extension(pi: ExtensionAPI) {
         const rollingBack = task.phase === 'previewed' && !!task.receipt
         if (incomingHoldFailed || task.journal ||
             (!resuming && (!task.review || (task.phase !== 'ready' && !rollingBack)))) {
-          throw new Error('当前不在可返修的 Worktree 验收状态。')
+          throw new Error(tr('当前不在可返修的 Worktree 验收状态。', 'The Worktree is not in a review state that allows revision.'))
         }
         if (task.external) await verifyExternalEditor(data, task, link)
         signal?.throwIfAborted()
         if (rollingBack) {
-          const title = '返修前需撤回项目目录的预览'
-          const accept = '撤回预览，继续返修'
-          const detail = ['撤回后，Agent 会接着处理刚才的要求。',
-            '预览文件若已被修改，将停止并保留现场。', `项目目录：${JSON.stringify(task.local.root)}`]
+          const title = tr('返修前需撤回项目目录的预览', 'Undo the project preview before revising?')
+          const accept = tr('撤回预览，继续返修', 'Undo preview and revise')
+          const detail = [tr('撤回后，Agent 会接着处理刚才的要求。', 'The Agent will continue the request you just made once the preview is undone.'),
+            tr('预览文件若已被修改，将停止并保留现场。', 'If previewed files were edited, the operation will stop and leave them as they are.'), tf('项目目录：{0}', 'Project folder: {0}', JSON.stringify(task.local.root))]
           let confirmed: boolean | undefined
           if (ctx.hasUI && ctx.mode === 'tui') {
             confirmed = await pick(ctx, title, detail, [
-              { label: accept, value: true, tone: 'primary' }, { label: '取消', value: false, tone: 'quiet' },
+              { label: accept, value: true, tone: 'primary' }, { label: tr('取消', 'Cancel'), value: false, tone: 'quiet' },
             ], { signal, tone: 'warning' })
           } else if (ctx.hasUI && ctx.mode === 'rpc') {
             const ask = new AbortController()
@@ -940,28 +943,28 @@ export default function extension(pi: ExtensionAPI) {
             const expires = Date.now() + confirmationTTL
             try {
               const choice = await ctx.ui.select([title, ...detail,
-                `涉及 ${task.receipt!.changedFiles.length} 个文件。`].join('\n'),
-                ['取消', accept], { signal: approvalSignal, timeout: confirmationTTL })
+                tf('涉及 {0} 个文件。', 'Files affected: {0}.', task.receipt!.changedFiles.length)].join('\n'),
+                [tr('取消', 'Cancel'), accept], { signal: approvalSignal, timeout: confirmationTTL })
               confirmed = choice === accept && !approvalSignal.aborted && Date.now() < expires
             } finally { if (commandAsk === ask) commandAsk = undefined }
-          } else throw new Error(`请先运行 /${NAME}-rollback 并确认，再重试修改。`)
+          } else throw new Error(tf('请先运行 /{0}-rollback 并确认，再重试修改。', 'Run /{0}-rollback and confirm, then retry your edit request.', NAME))
           signal?.throwIfAborted()
-          if (!confirmed) throw new Error('未确认撤回，预览保留。')
+          if (!confirmed) throw new Error(tr('未确认撤回，预览保留。', 'Rollback was not confirmed. The preview remains active.'))
         }
         if (rollingBack) {
-          await withLoading(ctx, progress.rollback, () => data.act(task.id, 'rollback', {
+          await withLoading(ctx, progress().rollback, () => data.act(task.id, 'rollback', {
             phase: task.phase, reviewId: task.review!.id, previewId: task.receipt!.previewId, revision: { session: link, signal }, session: link,
           }))
         } else if (resuming) {
-          await withLoading(ctx, '正在检查返修状态…', () => data.resumeExternalEditing(task.id, link, signal))
+          await withLoading(ctx, tr('正在检查返修状态…', 'Checking revision state…'), () => data.resumeExternalEditing(task.id, link, signal))
         } else {
-          await withLoading(ctx, '正在准备返修…', () => data.continueEditing(task.id, link, task.review!.id, signal))
+          await withLoading(ctx, tr('正在准备返修…', 'Preparing revision…'), () => data.continueEditing(task.id, link, task.review!.id, signal))
         }
-        if (task.external && ctx.mode === 'rpc') ctx.ui.setStatus(NAME, 'Worktree 返修中')
-        return result(true, '已进入返修。请现在继续处理用户刚才的修改要求，只改本 Worktree，验证后重新标记待验收。')
+        if (task.external && ctx.mode === 'rpc') ctx.ui.setStatus(NAME, tr('Worktree 返修中', 'Worktree revision in progress'))
+        return result(true, tr('已进入返修。请现在继续处理用户刚才的修改要求，只改本 Worktree，验证后重新标记待验收。', 'Revision started. Continue the user\'s request now, edit only this Worktree, verify, and mark it ready for review again.'))
       } catch (error) {
         revisionStopped = true
-        return result(false, `${message(error)} 不要编辑，也不要在本轮重试。`)
+        return result(false, tf('{0} 不要编辑，也不要在本轮重试。', '{0} Do not edit or retry in this turn.', message(error)))
       } finally {
         await refresh(ctx).catch(() => {})
         revising = false
@@ -970,25 +973,25 @@ export default function extension(pi: ExtensionAPI) {
     },
   })
   pi.registerTool({
-    name: TOOL, label: '标记待验收', defaultActive: false, exposure: 'model-only', executionMode: 'sequential', description: 'Mark the current Worktree ready for user review. Does not write to Local or commit. Call after edits and tests.',
+    name: TOOL, label: tr('标记待验收', 'Mark ready for review'), defaultActive: false, exposure: 'model-only', executionMode: 'sequential', description: 'Mark the current Worktree ready for user review. Does not write to Local or commit. Call after edits and tests.',
     parameters: Type.Object({
       commitMessage: Type.String({ description: 'A one-line commit title (1–200 characters). Follow the language of the current task conversation, not UI labels, tool output, or automatic recovery instructions. Honor any explicit title or language requested by the user.' }),
       commitBody: Type.Optional(Type.String({ maxLength: MAX_COMMIT_BODY, description: 'Optional commit body, without the title. Add only necessary details, such as why the change was made, important behavior, or compatibility impact. Use the title language unless the user requests otherwise. Omit when the title is enough.' })),
       files: Type.Array(Type.String(), { minItems: 1, description: 'Exact repo-relative paths intentionally changed for this task, including deletions and both sides of a rename. Exclude unrelated runtime state and test artifacts.' }),
     }),
     async execute(_id, params, signal, _update, ctx) {
-      if (signal?.aborted) throw new Error('已取消。')
+      if (signal?.aborted) throw new Error(tr('已取消。', 'Cancelled.'))
       const state = await workspace(ctx).catch(() => undefined)
       const link = sessionLink(ctx)
       const task = state && editingTask(ctx, state)
-      if (!state || !task || !link || !await isWorkflowEditor(ctx, state.data, task)) throw new Error(noWorkflow)
-      const review = await withLoading(ctx, '正在标记待验收…', () =>
+      if (!state || !task || !link || !await isWorkflowEditor(ctx, state.data, task)) throw new Error(noWorkflow())
+      const review = await withLoading(ctx, tr('正在标记待验收…', 'Marking ready for review…'), () =>
         state.data.markReady(task.id, link, params.commitMessage, params.files, { body: params.commitBody,
           ...(task.external ? { expectedReview: { id: task.review?.id } } : {}) }))
       await refresh(ctx)
-      const next = ctx.mode === 'rpc' ? `可运行 /${NAME}-preview。` : '可点击「预览改动」。'
-      if (ctx.mode === 'rpc' && task.external) ctx.ui.setStatus(NAME, `Worktree 待验收 · ${review.files.length} 个文件 · /${NAME}-preview`)
-      return { content: [{ type: 'text', text: `已标记待验收（${review.files.length} 个文件）；未修改项目目录。${next}` }], details: { reviewId: review.id } }
+      const next = ctx.mode === 'rpc' ? tf('可运行 /{0}-preview。', 'Run /{0}-preview.', NAME) : tr('可点击「预览改动」。', 'Click “Preview changes”.')
+      if (ctx.mode === 'rpc' && task.external) ctx.ui.setStatus(NAME, tf('Worktree 待验收 · {0} 个文件 · /{1}-preview', 'Worktree ready for review · Files: {0} · /{1}-preview', review.files.length, NAME))
+      return { content: [{ type: 'text', text: tf('已标记待验收（{0} 个文件）；未修改项目目录。{1}', 'Marked ready for review (files: {0}). The project folder was not changed. {1}', review.files.length, next) }], details: { reviewId: review.id } }
     },
   })
 
@@ -1000,16 +1003,16 @@ export default function extension(pi: ExtensionAPI) {
       let entered = false
       try {
         const { local, isolated, tasks, data } = await context(current)
-        if (!local || isolated) throw new Error('只能从原 Git 项目目录新建 Worktree。')
-        if (process.platform === 'win32') throw new Error('当前版本仅支持 macOS/Linux。')
+        if (!local || isolated) throw new Error(tr('只能从原 Git 项目目录新建 Worktree。', 'Create a Worktree from the original Git project folder.'))
+        if (process.platform === 'win32') throw new Error(tr('当前版本仅支持 macOS/Linux。', 'Only macOS and Linux are currently supported.'))
         const active = sessionLink(current)
-        if (!active || view === null) throw new Error('无有效的持久化 Pi 会话，不能新建 Worktree。')
+        if (!active || view === null) throw new Error(tr('无有效的持久化 Pi 会话，不能新建 Worktree。', 'A saved Pi session is required to create a Worktree.'))
         const source = view?.returnTo ?? active
         if (tasks.some(task => task.localSession.id === source.id && task.localSession.file === source.file &&
-            task.localSession.cwd === source.cwd && isOpenTask(task))) throw new Error(sessionBusy)
-        const created = await withLoading(current, '正在创建 Worktree…', async () => {
+            task.localSession.cwd === source.cwd && isOpenTask(task))) throw new Error(sessionBusy())
+        const created = await withLoading(current, tr('正在创建 Worktree…', 'Creating Worktree…'), async () => {
           await validateSession(source)
-          if (view && !inherited) throw new Error('缺少续接对话记录。')
+          if (view && !inherited) throw new Error(tr('缺少续接对话记录。', 'The conversation history needed to continue is missing.'))
           return data.create(local, source, (path, task, prior) => {
             const name = summary ? `Worktree · ${summary}` : shortSessionName(task.id)
             return prior && view && inherited
@@ -1028,27 +1031,27 @@ export default function extension(pi: ExtensionAPI) {
         if (!view && current === ctx && summary && !ctx.sessionManager.getSessionName()) {
           // An already-persisted unnamed origin does not pass through the bootstrap above.
           // A display-name write must not block entering an already-created task.
-          try { pi.setSessionName(`原对话 · ${summary}`) } catch { /* optional metadata */ }
+          try { pi.setSessionName(tf('原对话 · {0}', 'Original conversation · {0}', summary)) } catch { /* optional metadata */ }
         }
-        const result = await switchTo(current, target, '正在进入 Worktree…', async next => {
+        const result = await switchTo(current, target, tr('正在进入 Worktree…', 'Opening Worktree…'), async next => {
           entered = replaced = true
           try {
-            if (!isBoundSession(next, target)) throw new Error('Pi 未进入预期的隔离 Worktree。')
+            if (!isBoundSession(next, target)) throw new Error(tr('Pi 未进入预期的隔离 Worktree。', 'Pi did not enter the expected isolated Worktree.'))
             if (view) await rm(active.file, { force: true }).catch(() => {})
-            if (next.mode === 'rpc') commandNotice(next, 'ok', `已进入 Worktree ${JSON.stringify(target.cwd)} · ${target.id}`)
+            if (next.mode === 'rpc') commandNotice(next, 'ok', tf('已进入 Worktree {0} · {1}', 'Opened Worktree {0} · {1}', JSON.stringify(target.cwd), target.id))
             await next.sendUserMessage(images?.length ? [{ type: 'text', text }, ...images] : text, { expandPromptTemplates: true })
           } catch (error) {
             restoreDraft(next, text)
-            const detail = `无法在 Worktree 发送消息：${message(error)}${images?.length ? '；请重新附加图片。' : ''}`
+            const detail = tf('无法在 Worktree 发送消息：{0}{1}', 'Could not send the message in the Worktree: {0}{1}', message(error), images?.length ? tr('；请重新附加图片。', ' Reattach the images and try again.') : '')
             if (next.mode === 'rpc') commandNotice(next, 'error', detail)
             else next.ui.notify(detail, 'error')
           }
         })
-        if (result.cancelled) throw new Error(`Pi 取消了切换；${view ? '返回原对话后，' : ''}可从工作台恢复已创建的 Worktree。`)
+        if (result.cancelled) throw new Error(tf('Pi 取消了切换；{0}可从工作台恢复已创建的 Worktree。', 'Pi cancelled the switch. {0}You can resume the Worktree from the menu.', view ? tr('返回原对话后，', 'Return to the original conversation first. ') : ''))
       } catch (error) {
         if (!entered && current !== ctx) {
           restoreDraft(current, text)
-          const detail = `消息未发送：${message(error)}${images?.length ? '；请重新附加图片。' : ''}`
+          const detail = tf('消息未发送：{0}{1}', 'Message not sent: {0}{1}', message(error), images?.length ? tr('；请重新附加图片。', ' Reattach the images and try again.') : '')
           if (current.mode === 'rpc') commandNotice(current, 'error', detail)
           else {
             current.ui.notify(detail, 'error')
@@ -1059,19 +1062,19 @@ export default function extension(pi: ExtensionAPI) {
     }
     busy = true
     try {
-      if (!ctx.isIdle() || sessionId !== ctx.sessionManager.getSessionId()) throw new Error('当前对话已变化或忙碌。')
+      if (!ctx.isIdle() || sessionId !== ctx.sessionManager.getSessionId()) throw new Error(tr('当前对话已变化或忙碌。', 'The current conversation changed or is busy.'))
       if (view) await create(ctx, () => {})
       else {
         const localBranch = captureLocalBranch(ctx)
         await withSavedLocal(ctx, async (current, send) => {
           if (current !== ctx) replaced = true
           await create(current, send, localBranch)
-        }, summary ? `原对话 · ${summary}` : undefined)
+        }, summary ? tf('原对话 · {0}', 'Original conversation · {0}', summary) : undefined)
       }
     } catch (error) {
       if (!replaced) {
         restoreDraft(ctx, text)
-        const detail = `消息未发送：${message(error)}${images?.length ? '；请重新附加图片。' : ''}`
+        const detail = tf('消息未发送：{0}{1}', 'Message not sent: {0}{1}', message(error), images?.length ? tr('；请重新附加图片。', ' Reattach the images and try again.') : '')
         if (ctx.mode === 'rpc') commandNotice(ctx, 'error', detail)
         else ctx.ui.notify(detail, 'error')
       }
@@ -1091,7 +1094,7 @@ export default function extension(pi: ExtensionAPI) {
       try {
         await data.resumeConflictRecovery(task.id, session, recovery)
         if (!isBoundSession(ctx, session) || !ctx.isIdle() || busy || runningCommand) {
-          throw new Error('未启动 Agent；可在原对话继续解决冲突。')
+          throw new Error(tr('未启动 Agent；可在原对话继续解决冲突。', 'The Agent did not start. You can resume conflict recovery from the original conversation.'))
         }
         conflictKickoff = false // Allow just this extension-initiated input to pass.
         pi.sendUserMessage(conflictPrompt(recovery))
@@ -1099,30 +1102,47 @@ export default function extension(pi: ExtensionAPI) {
     })().catch(error => { try { commandNotice(ctx, 'error', message(error)) } catch { /* Session closed. */ } }) })
   }
 
+  async function setLanguage(ctx: ExtensionContext, language: 'zh' | 'en') {
+    if (language !== getDisplayLanguage()) {
+      await saveDisplayLanguage(preferencesDir, language)
+      registerCommands()
+    }
+    const text = tr('显示语言：简体中文', 'Display language: English')
+    commandNotice(ctx, 'ok', text, text)
+  }
+
   async function runCommand(ctx: ExtensionCommandContext, args: string) {
     let replaced = false
     let kickoff: (() => void) | undefined
     if (busy || draft || conflictKickoff || !ctx.isIdle() || delivering(ctx)) {
-      commandNotice(ctx, 'error', commandAsk ? '请先回答或关闭当前确认。' : '当前对话忙碌，请等待操作结束。')
+      commandNotice(ctx, 'error', commandAsk ? tr('请先回答或关闭当前确认。', 'Answer or close the current confirmation first.') : tr('当前对话忙碌，请等待操作结束。', 'This conversation is busy. Wait for the current operation to finish.'))
       return
     }
     busy = runningCommand = true
     try {
       const command = parseWorktreeCommand(args)
       let approval = confirmation
-      if (command.kind !== 'status' && command.kind !== 'help') confirmation = undefined
+      if (command.kind !== 'status' && command.kind !== 'help' && command.kind !== 'language') confirmation = undefined
       if (command.kind === 'help') {
-        commandNotice(ctx, 'ok', `Worktree 命令：\n${standaloneCommands.map(([verb, usage, description]) =>
-          `/${NAME}-${verb}${usage} — ${description}`).join('\n')}`)
+        commandNotice(ctx, 'ok', tf('Worktree 命令：\n{0}', 'Worktree commands:\n{0}', standaloneCommands().map(([verb, usage, description]) =>
+          `/${NAME}-${verb}${usage} — ${description}`).join('\n')))
+        return
+      }
+      if (command.kind === 'language') {
+        if (command.language) await setLanguage(ctx, command.language)
+        else {
+          const text = tr('显示语言：简体中文', 'Display language: English')
+          commandNotice(ctx, 'ok', text, text)
+        }
         return
       }
       if (command.kind === 'cancel') {
         armed = undefined
-        commandNotice(ctx, 'ok', '已取消待确认操作／下次新建。', 'Worktree · 已取消')
+        commandNotice(ctx, 'ok', tr('已取消待确认操作／下次新建。', 'Pending operation or next Worktree creation cancelled.'), tr('Worktree · 已取消', 'Worktree · Cancelled'))
         return
       }
       const link = sessionLink(ctx)
-      if (!link || historyView !== undefined || incomingHoldFailed) throw new Error('当前不是可操作的持久化 Pi 会话。')
+      if (!link || historyView !== undefined || incomingHoldFailed) throw new Error(tr('当前不是可操作的持久化 Pi 会话。', 'This is not a saved Pi session that can perform the operation.'))
       const { local, isolated, tasks, data } = await context(ctx)
       const task = currentTask(ctx, isolated, tasks)
       if (command.kind === 'status') {
@@ -1135,29 +1155,29 @@ export default function extension(pi: ExtensionAPI) {
         return
       }
       if (command.kind === 'new') {
-        if (!local || isolated || process.platform === 'win32') throw new Error('只能从受支持的原 Git 项目目录新建 Worktree。')
-        if (task && isOpenTask(task)) throw new Error(sessionBusy)
+        if (!local || isolated || process.platform === 'win32') throw new Error(tr('只能从受支持的原 Git 项目目录新建 Worktree。', 'Create a Worktree from a supported original Git project folder.'))
+        if (task && isOpenTask(task)) throw new Error(sessionBusy())
         armed = { sessionId: link.id }
-        commandNotice(ctx, 'ok', '下次发送的任务消息将在新 Worktree 中执行。', '下次发送时新建 Worktree')
+        commandNotice(ctx, 'ok', tr('下次发送的任务消息将在新 Worktree 中执行。', 'Your next task message will run in a new Worktree.'), tr('下次发送时新建 Worktree', 'Create a Worktree on the next send'))
         return
       }
       const move = async (target: SessionLink, execute: (next: ExtensionContext) => Promise<void>) => {
-        const result = await switchTo(ctx, target, '正在切换对话…', async next => {
+        const result = await switchTo(ctx, target, tr('正在切换对话…', 'Switching conversation…'), async next => {
           replaced = true
           try {
-            if (!isBoundSession(next, target) || !next.isIdle()) throw new Error('未进入预期的空闲会话。')
+            if (!isBoundSession(next, target) || !next.isIdle()) throw new Error(tr('未进入预期的空闲会话。', 'Could not enter the expected idle conversation.'))
             await execute(next)
           } catch (error) { commandNotice(next, 'error', message(error)) }
           finally { await refresh(next).catch(() => {}) }
         })
-        if (result.cancelled) throw new Error('Pi 取消了切换，未执行操作。')
+        if (result.cancelled) throw new Error(tr('Pi 取消了切换，未执行操作。', 'Pi cancelled the switch. No operation was performed.'))
       }
       if (command.kind === 'back' || command.kind === 'resume') {
-        if (!task || task.external) throw new Error('没有可切换的插件 Worktree 对话；外部 Worktree 由原客户端管理。')
+        if (!task || task.external) throw new Error(tr('没有可切换的插件 Worktree 对话；外部 Worktree 由原客户端管理。', 'No managed Worktree conversation to switch to. External Worktrees are managed by their host client.'))
         const target = command.kind === 'back' && isolated ? task.localSession :
           command.kind === 'resume' && !isolated && !task.journal && task.phase !== 'creating' &&
           (isOpenTask(task) || task.cleanup?.status === 'retained') ? task.isolatedSession : undefined
-        if (!target) throw new Error('当前没有可切换的对话。')
+        if (!target) throw new Error(tr('当前没有可切换的对话。', 'There is no conversation to switch to.'))
         if (command.kind === 'back') await data.validateLocalIdentity(task)
         else await data.validateIsolatedIdentity(task)
         await move(target, async next => commandNotice(next, 'ok', JSON.stringify({ cwd: target.cwd, session: target.id })))
@@ -1166,7 +1186,7 @@ export default function extension(pi: ExtensionAPI) {
       const offer = async (candidate: NonNullable<Confirmation>, details: string, accept: string, text?: true) => {
         if (ctx.mode !== 'rpc' || text) {
           confirmation = candidate
-          commandNotice(ctx, 'confirm', `${details}\n5 分钟内运行 /${NAME}-confirm ${candidate.token}，或 /${NAME}-cancel。`, 'Worktree · 等待确认')
+          commandNotice(ctx, 'confirm', tf('{0}\n5 分钟内运行 /{1}-confirm {2}，或 /{3}-cancel。', '{0}\nWithin 5 minutes, run /{1}-confirm {2} or /{3}-cancel.', details, NAME, candidate.token, NAME), tr('Worktree · 等待确认', 'Worktree · Awaiting confirmation'))
           return
         }
         // A native select requires an explicit choice every time. Some hosts
@@ -1174,26 +1194,26 @@ export default function extension(pi: ExtensionAPI) {
         const ask = new AbortController()
         commandAsk = ask
         let choice: string | undefined
-        try { choice = await ctx.ui.select(details, ['取消', accept], { signal: ask.signal, timeout: confirmationTTL }) }
+        try { choice = await ctx.ui.select(details, [tr('取消', 'Cancel'), accept], { signal: ask.signal, timeout: confirmationTTL }) }
         finally { if (commandAsk === ask) commandAsk = undefined }
         if (choice !== accept || ask.signal.aborted || Date.now() >= candidate.expires) {
-          commandNotice(ctx, 'ok', '未执行操作。', 'Worktree · 未执行操作')
+          commandNotice(ctx, 'ok', tr('未执行操作。', 'The operation was not performed.'), tr('Worktree · 未执行操作', 'Worktree · Not performed'))
           return
         }
-        if (!isBoundSession(ctx, candidate.session) || !ctx.isIdle() || delivering(ctx)) throw new Error('验收对话已变化，未执行操作。')
+        if (!isBoundSession(ctx, candidate.session) || !ctx.isIdle() || delivering(ctx)) throw new Error(tr('验收对话已变化，未执行操作。', 'The review conversation changed. The operation was not performed.'))
         return candidate
       }
       const registerAdoption = async (owner: SessionLink, request: AdoptionRequest, shown: AdoptionInspection) => {
         await withSavedLocal(ctx, async (next, send) => {
           if (next !== ctx) replaced = true
           try {
-            if (!isBoundSession(next, owner) || !next.isIdle()) throw new Error('接入对话已变化，未登记。')
-            const registered = await withLoading(next, '正在接入外部 Worktree…', () => data.adopt(owner, request, shown))
+            if (!isBoundSession(next, owner) || !next.isIdle()) throw new Error(tr('接入对话已变化，未登记。', 'The adoption conversation changed. Nothing was registered.'))
+            const registered = await withLoading(next, tr('正在接入外部 Worktree…', 'Adopting external Worktree…'), () => data.adopt(owner, request, shown))
             armed = undefined
             const files = registered.review?.files ?? []
-            commandNotice(next, 'ok', [`已接入 · ${files.length} 个文件。可直接运行 /${NAME}-preview。`,
-              `未改动源或目标目录。任务：${registered.id}`, ...adoptionDetails(shown), ...numberedAdoptionFiles(files),
-            ].join('\n'), `Worktree 已接入 · ${files.length} 个文件 · 下一步：/${NAME}-preview`)
+            commandNotice(next, 'ok', [tf('已接入 · {0} 个文件。可直接运行 /{1}-preview。', 'Worktree adopted · Files: {0}. Run /{1}-preview to continue.', files.length, NAME),
+              tf('未改动源或目标目录。任务：{0}', 'The source and target directories were not changed. Task: {0}', registered.id), ...adoptionDetails(shown), ...numberedAdoptionFiles(files),
+            ].join('\n'), tf('Worktree 已接入 · {0} 个文件 · 下一步：/{1}-preview', 'Worktree adopted · Files: {0} · Next: /{1}-preview', files.length, NAME))
           } catch (error) { commandNotice(next, 'error', message(error)) }
           finally {
             // A native reopen loads a new extension runtime. Let that runtime
@@ -1202,24 +1222,24 @@ export default function extension(pi: ExtensionAPI) {
               try { await send(`/${NAME} refresh`) } catch { /* Registration is already durable. */ }
             }
           }
-        }, '外部 Worktree · 验收')
+        }, tr('外部 Worktree · 验收', 'External Worktree · Review'))
       }
       if (command.kind === 'selectAdoption') {
         if (!task?.external || task.phase !== 'ready' || !task.review || task.journal) {
-          throw new Error('只能调整本对话中尚未预览的外部 Worktree 清单。')
+          throw new Error(tr('只能调整本对话中尚未预览的外部 Worktree 清单。', 'Only an unpreviewed external Worktree in this conversation can have its file list narrowed.'))
         }
         const review = task.review
-        if (command.numbers.some(number => number > review.files.length)) throw new Error('文件编号不在当前清单中。')
+        if (command.numbers.some(number => number > review.files.length)) throw new Error(tr('文件编号不在当前清单中。', 'A file number is outside the current list.'))
         const selected = new Set(command.numbers)
         const files = review.files.filter((_file, index) => selected.has(index + 1))
-        const updated = await withLoading(ctx, '正在更新交付清单…', () => data.restrictReview(task.id, link, review.id, files))
-        commandNotice(ctx, 'ok', ['已缩小交付清单；可继续预览。', ...numberedAdoptionFiles(updated.files)].join('\n'),
-          `交付清单已更新 · ${updated.files.length} 个文件 · 下一步：/${NAME}-preview`)
+        const updated = await withLoading(ctx, tr('正在更新交付清单…', 'Updating delivery scope…'), () => data.restrictReview(task.id, link, review.id, files))
+        commandNotice(ctx, 'ok', [tr('已缩小交付清单；可继续预览。', 'Delivery scope narrowed. You can preview now.'), ...numberedAdoptionFiles(updated.files)].join('\n'),
+          tf('交付清单已更新 · {0} 个文件 · 下一步：/{1}-preview', 'Delivery scope updated · Files: {0} · Next: /{1}-preview', updated.files.length, NAME))
         return
       }
       if (command.kind === 'adopt' || command.kind === 'discoverAdoption') {
-        if (isolated || task && isOpenTask(task)) throw new Error('已有进行中任务；请从未绑定的源或目标对话接入。')
-        const inspect = <T>(run: () => Promise<T>) => withLoading(ctx, '正在检查外部 Worktree…', run)
+        if (isolated || task && isOpenTask(task)) throw new Error(tr('已有进行中任务；请从未绑定的源或目标对话接入。', 'A task is already active. Adopt from an unbound source or target conversation.'))
+        const inspect = <T>(run: () => Promise<T>) => withLoading(ctx, tr('正在检查外部 Worktree…', 'Checking external Worktree…'), run)
         if (command.kind === 'discoverAdoption') {
           const shown = await inspect(() => data.discoverAdoption(link))
           await registerAdoption(link, {
@@ -1229,62 +1249,62 @@ export default function extension(pi: ExtensionAPI) {
         } else {
           const shown = await inspect(() => data.inspectAdoption(link, command.request))
           const accepted = await offer({ kind: 'adopt', request: command.request, shown, token: randomUUID(), expires: Date.now() + confirmationTTL, session: link },
-            ['接入外部 Worktree？只登记，不改动两个目录。', ...adoptionDetails(shown),
-              ...commandFiles(shown.review.files, ctx.mode === 'rpc' && !command.text)].join('\n'), '接入 Worktree', command.text)
+            [tr('接入外部 Worktree？只登记，不改动两个目录。', 'Adopt this external Worktree? Registers it without changing either directory.'), ...adoptionDetails(shown),
+              ...commandFiles(shown.review.files, ctx.mode === 'rpc' && !command.text)].join('\n'), tr('接入 Worktree', 'Adopt Worktree'), command.text)
           if (accepted?.kind === 'adopt') await registerAdoption(accepted.session, accepted.request, accepted.shown)
         }
         return
       }
       const startRecovery = async (approved: Task, conflict: PreviewConflict) => {
-        if (!approved.external || !approved.review || !await data.isEditingSession(approved, link)) throw new Error('请在绑定的源 Worktree 对话中解决冲突。')
-        const recovery = await withLoading(ctx, '正在准备冲突处理…', () => data.beginConflictRecovery(approved.id, link, approved.review!.id, conflict.plan))
-        commandNotice(ctx, 'ok', '已准备独立冲突目录，未修改两个 checkout。', 'Worktree · 解决冲突中')
+        if (!approved.external || !approved.review || !await data.isEditingSession(approved, link)) throw new Error(tr('请在绑定的源 Worktree 对话中解决冲突。', 'Resolve conflicts from the linked source Worktree conversation.'))
+        const recovery = await withLoading(ctx, tr('正在准备冲突处理…', 'Preparing conflict recovery…'), () => data.beginConflictRecovery(approved.id, link, approved.review!.id, conflict.plan))
+        commandNotice(ctx, 'ok', tr('已准备独立冲突目录，未修改两个 checkout。', 'Prepared a separate conflict directory. Neither checkout was changed.'), tr('Worktree · 解决冲突中', 'Worktree · Resolving conflicts'))
         kickoff = () => scheduleConflictTurn(ctx, data, approved, link, recovery)
       }
       if (command.kind === 'recover') {
-        if (!task?.external || !task.recovery?.workspace) throw new Error('当前没有可继续的外部冲突处理。')
+        if (!task?.external || !task.recovery?.workspace) throw new Error(tr('当前没有可继续的外部冲突处理。', 'There is no external conflict resolution to resume.'))
         const recovery = task.recovery
         await data.resumeConflictRecovery(task.id, link, recovery)
-        commandNotice(ctx, 'ok', '正在继续解决冲突。', 'Worktree · 解决冲突中')
+        commandNotice(ctx, 'ok', tr('正在继续解决冲突。', 'Resuming conflict resolution.'), tr('Worktree · 解决冲突中', 'Worktree · Resolving conflicts'))
         kickoff = () => scheduleConflictTurn(ctx, data, task, link, recovery)
         return
       }
       if (command.kind === 'action') {
         if (!task || task.journal || (command.verb === 'preview' ? task.phase !== 'ready' :
             command.verb === 'discard' ? !((task.external || isolated) && ['ready', 'working'].includes(task.phase)) :
-              task.phase !== 'previewed')) throw new Error('当前任务阶段或对话不允许此操作；先查看 status。')
+              task.phase !== 'previewed')) throw new Error(tr('当前任务阶段或对话不允许此操作；先查看 status。', 'This task state or conversation does not allow that operation. Check status first.'))
         const act = commandActions[command.verb]
         const discardFingerprint = act === 'discard' && !task.external ? await data.discardFingerprint(task) : undefined
-        const accept = task.external && act === 'discard' ? '解除登记' : act === 'finalize' && task.external ? '提交' : confirmationCopy[act].button
+        const accept = task.external && act === 'discard' ? tr('解除登记', 'Unlink') : act === 'finalize' && task.external ? tr('提交', 'Commit') : confirmationCopy()[act].button
         approval = await offer({ kind: 'action', task, verb: command.verb, discardFingerprint, text: command.text, token: randomUUID(), expires: Date.now() + confirmationTTL, session: link },
           commandActionDetails(task, act, ctx.mode === 'rpc' && !command.text), accept, command.text)
         if (!approval) return
       } else if (command.kind !== 'confirm' || !approval || approval.token !== command.token || approval.expires <= Date.now() ||
-          !isBoundSession(ctx, approval.session)) throw new Error('确认码无效、已使用或已过期；请重新发起操作。')
+          !isBoundSession(ctx, approval.session)) throw new Error(tr('确认码无效、已使用或已过期；请重新发起操作。', 'The confirmation code is invalid, used, or expired. Start the operation again.'))
       if (approval.kind === 'adopt') {
         await registerAdoption(approval.session, approval.request, approval.shown)
         return
       }
       const approved = approval.task
-      if (!task || task.id !== approved.id || taskVersion(task) !== taskVersion(approved)) throw new Error('任务已变化；请重新发起操作。')
+      if (!task || task.id !== approved.id || taskVersion(task) !== taskVersion(approved)) throw new Error(tr('任务已变化；请重新发起操作。', 'The task changed. Start the operation again.'))
       if (approval.kind === 'recover') { await startRecovery(approved, approval.conflict); return }
       const useText = approval.text
       const act = commandActions[approval.verb]
       const execute = async (next: ExtensionContext) => {
         const owner = sessionLink(next)
-        if (!owner) throw new Error('确认会话已变化。')
+        if (!owner) throw new Error(tr('确认会话已变化。', 'The confirmation conversation changed.'))
         const result = await data.act(approved.id, act, { session: owner, phase: approved.phase,
           reviewId: approved.review?.id, previewId: approved.receipt?.previewId, discardFingerprint: approval.discardFingerprint })
-        const outcome = result.external && act === 'discard' ? '已解除登记。' : completed[act]
+        const outcome = result.external && act === 'discard' ? tr('已解除登记。', 'Worktree unlinked.') : completed()[act]
         commandNotice(next, 'ok', `${outcome}${result.commitOid ? ` · ${result.commitOid}` : ''}` +
-          (result.external ? ' 外部 Worktree 未修改或删除。' : result.cleanup?.status === 'retained' ?
-            ` Worktree 保留：${result.cleanup.reason ?? result.isolatedPath}` : result.cleanup?.status === 'done' ? ' Worktree 已清理。' : ''),
+          (result.external ? tr(' 外部 Worktree 未修改或删除。', ' The external Worktree was not modified or deleted.') : result.cleanup?.status === 'retained' ?
+            tf(' Worktree 保留：{0}', ' Worktree retained: {0}', result.cleanup.reason ?? result.isolatedPath) : result.cleanup?.status === 'done' ? tr(' Worktree 已清理。', ' Worktree cleaned up.') : ''),
           `Worktree · ${outcome}${result.commitOid ? ` · ${result.commitOid.slice(0, 12)}` : ''}`)
       }
       if (!approved.external && isolated && (act === 'finalize' || act === 'discard')) {
         await data.validateLocalIdentity(approved)
         const target = approved.localSession
-        if (pendingDelivery.has(target.file)) throw new Error('目标对话正有其他 Worktree 操作。')
+        if (pendingDelivery.has(target.file)) throw new Error(tr('目标对话正有其他 Worktree 操作。', 'The target conversation is busy with another Worktree operation.'))
         pendingDelivery.add(target.file)
         try { await move(target, execute) }
         finally { pendingDelivery.delete(target.file) }
@@ -1294,8 +1314,8 @@ export default function extension(pi: ExtensionAPI) {
           if (!(error instanceof PreviewConflict) || act !== 'preview' || !approved.external || !error.plan.cleanEntries ||
               !error.plan.committedConflictingFiles.length || !await data.isEditingSession(approved, link)) throw error
           const accepted = await offer({ kind: 'recover', task: approved, conflict: error, token: randomUUID(), expires: Date.now() + confirmationTTL, session: link },
-            ['预览冲突 · 项目目录未修改。', `提交冲突：${error.plan.committedConflictingFiles.length} 个文件。`,
-              '仅在独立目录解决；完成后重新验收。'].join('\n'), '让 Agent 解决冲突', useText)
+            [tr('预览冲突 · 项目目录未修改。', 'Preview conflict · Project folder unchanged.'), tf('提交冲突：{0} 个文件。', 'Files with committed conflicts: {0}.', error.plan.committedConflictingFiles.length),
+              tr('仅在独立目录解决；完成后重新验收。', 'Resolve in a separate directory and mark ready again.')].join('\n'), tr('让 Agent 解决冲突', 'Let Agent resolve conflicts'), useText)
           if (accepted?.kind === 'recover') await startRecovery(approved, error)
         }
       }
@@ -1307,22 +1327,25 @@ export default function extension(pi: ExtensionAPI) {
     }
   }
 
-  for (const [verb, usage, description] of standaloneCommands) {
-    pi.registerCommand(`${NAME}-${verb}`, {
-      description: `${description}${usage ? `（${usage.trim()}）` : ''}`,
-      async handler(args, ctx) {
-        if (ctx.hasUI) await runCommand(ctx, `${verb}${args.trim() ? ` ${args.trim()}` : ''}`)
-      },
-    })
+  function registerCommands() {
+    for (const [verb, usage, description] of standaloneCommands()) {
+      pi.registerCommand(`${NAME}-${verb}`, {
+        description: `${description}${usage ? ` ${usage.trim()}` : ''}`,
+        async handler(args, ctx) {
+          if (ctx.hasUI) await runCommand(ctx, `${verb}${args.trim() ? ` ${args.trim()}` : ''}`)
+        },
+      })
+    }
+    pi.registerCommand(NAME, workbenchCommand())
   }
 
-  pi.registerCommand(NAME, {
-    description: '打开 Worktree 工作台；加 help 查看命令',
-    getArgumentCompletions: prefix => {
-      const matches = standaloneCommands.filter(([verb]) => verb.startsWith(prefix))
+  const workbenchCommand = () => ({
+    description: tr('打开 Worktree 工作台；加 help 查看命令', 'Open the Worktree menu; use help to list commands'),
+    getArgumentCompletions: (prefix: string) => {
+      const matches = standaloneCommands().filter(([verb]) => verb.startsWith(prefix))
       return matches.length ? matches.map(([verb, , description]) => ({ value: verb, label: verb, description })) : null
     },
-    async handler(args, ctx) {
+    async handler(args: string, ctx: ExtensionCommandContext) {
       if (!ctx.hasUI) return
       if (args === 'refresh') {
         try { await refresh(ctx) } catch (error) { ctx.ui.notify(message(error), 'error') }
@@ -1346,18 +1369,18 @@ export default function extension(pi: ExtensionAPI) {
           if (args === 'resume') {
             const data = store!
             const prior = view.afterCommit && (await data.read()).tasks.find(task => task.id === view.priorId)
-            if (!prior || !prior.isolatedSession || prior.phase === 'delivered' || prior.phase === 'discarded') throw new Error('原 Worktree 已结束，不能恢复编辑。')
+            if (!prior || !prior.isolatedSession || prior.phase === 'delivered' || prior.phase === 'discarded') throw new Error(tr('原 Worktree 已结束，不能恢复编辑。', 'The original Worktree is finished and cannot be reopened for editing.'))
             await data.validateIsolatedIdentity(prior)
             target = prior.isolatedSession
           }
-          const moved = await switchTo(ctx, target, args === 'resume' ? '正在回到 Worktree…' : '正在返回原对话…', async next => {
+          const moved = await switchTo(ctx, target, args === 'resume' ? tr('正在回到 Worktree…', 'Returning to Worktree…') : tr('正在返回原对话…', 'Returning to original conversation…'), async next => {
             replaced = true
             if (isBoundSession(next, target)) {
               if (text) restoreDraft(next, text)
               if (viewFile) await rm(viewFile, { force: true }).catch(() => {})
             }
           })
-          if (moved.cancelled) throw new Error('Pi 取消了切换。')
+          if (moved.cancelled) throw new Error(tr('Pi 取消了切换。', 'Pi cancelled the switch.'))
         } catch (error) { if (!replaced) ctx.ui.notify(message(error), 'error') }
         finally { busy = false }
         return
@@ -1370,69 +1393,76 @@ export default function extension(pi: ExtensionAPI) {
       try {
         const { local, isolated, tasks, data, cwd } = await context(ctx)
         const task = currentTask(ctx, isolated, tasks)
-        if (!local && !isolated) throw new Error('请从有初始提交的 Git checkout 打开 Pi。')
+        if (!local && !isolated) throw new Error(tr('请从有初始提交的 Git checkout 打开 Pi。', 'Open Pi from a Git checkout with an initial commit.'))
         const choices: Choice<MenuAction>[] = [...deliveryChoices(task)]
         if (task?.phase === 'ready' && !task.external && task.review && !task.journal && !task.recovery) {
-          choices.push({ label: labels.commit_ready, value: 'commit_ready' })
+          choices.push({ label: labels().commit_ready, value: 'commit_ready' })
         }
-        if (task?.phase === 'ready' && !task.journal && !task.recovery && (task.review?.files.length ?? 0) > 1 && (task.isolatedSession || task.external)) choices.push(scopeChoice)
-        if (task?.phase === 'working' && task.recovery && !task.journal) choices.push(recoverChoice)
+        if (task?.phase === 'ready' && !task.journal && !task.recovery && (task.review?.files.length ?? 0) > 1 && (task.isolatedSession || task.external)) choices.push(scopeChoice())
+        if (task?.phase === 'working' && task.recovery && !task.journal) choices.push(recoverChoice())
         const details: string[] = []
         if (task?.journal || task?.phase === 'creating') {
-          details.push('操作已停止', `恢复记录：${data.statePath}`, `隔离目录：${task.isolatedPath}`)
+          details.push(tr('操作已停止', 'Operation stopped'), tf('恢复记录：{0}', 'Recovery record: {0}', data.statePath), tf('隔离目录：{0}', 'Isolated directory: {0}', task.isolatedPath))
         } else if (task?.cleanup?.status === 'retained') {
-          details.push(`已保留 · ${task.cleanup.reason ?? 'Worktree'}`)
+          details.push(tf('已保留 · {0}', 'Retained · {0}', task.cleanup.reason ?? 'Worktree'))
         } else if (task?.review) {
-          details.push(`${task.review.message} · ${task.review.files.length} 个文件`)
+          details.push(tf('{0} · {1} 个文件', '{0} · Files: {1}', task.review.message, task.review.files.length))
         }
         if (isolated && task) {
-          choices.push(task.phase === 'previewed' && !task.journal ? localCheck : { label: '返回原对话', value: 'return' })
+          choices.push(task.phase === 'previewed' && !task.journal ? localCheck() : { label: tr('返回原对话', 'Return to original conversation'), value: 'return' })
           if (!task.journal && ['working', 'ready'].includes(task.phase)) {
-            choices.push({ label: '标记待验收（手动）', value: 'mark' }, { label: labels.discard, value: 'discard', tone: 'danger' })
+            choices.push({ label: tr('标记待验收（手动）', 'Mark ready for review (manual)'), value: 'mark' }, { label: labels().discard, value: 'discard', tone: 'danger' })
           }
         } else if (local) {
           if (!task || !isOpenTask(task)) {
-            choices.push({ label: armed?.sessionId === ctx.sessionManager.getSessionId() ? '取消下次发送时创建' : '下次发送时新建 Worktree', value: 'arm' })
+            choices.push({ label: armed?.sessionId === ctx.sessionManager.getSessionId() ? tr('取消下次发送时创建', 'Cancel creation on next send') : tr('下次发送时新建 Worktree', 'Create a Worktree on the next send'), value: 'arm' })
           }
-          if (historyTasks(tasks).length) choices.push(historyChoice)
+          if (historyTasks(tasks).length) choices.push(historyChoice())
           if (task && isOpenTask(task) && !task.journal && task.phase !== 'creating') {
-            if (task.isolatedSession) choices.push({ ...resumeChoice, tone: choices.length ? undefined : 'primary' })
-            if (task.external && ['working', 'ready'].includes(task.phase)) choices.push({ label: '解除外部任务登记', value: 'discard' })
+            if (task.isolatedSession) choices.push({ ...resumeChoice(), tone: choices.length ? undefined : 'primary' })
+            if (task.external && ['working', 'ready'].includes(task.phase)) choices.push({ label: tr('解除外部任务登记', 'Unlink external task'), value: 'discard' })
             if (task.external && ['working', 'ready'].includes(task.phase) && await data.isEditingSession(task, task.localSession).catch(() => false)) {
-              choices.push({ label: '标记待验收（手动）', value: 'mark' })
+              choices.push({ label: tr('标记待验收（手动）', 'Mark ready for review (manual)'), value: 'mark' })
             }
           }
         }
         const retained = retainedTasks(tasks)
-        if (retained.length) choices.push(retainedChoice)
-        choices.push({ label: '关闭', value: 'close', tone: 'quiet' })
+        if (retained.length) choices.push(retainedChoice())
+        choices.push({ label: tr('显示语言', 'Display language'), value: 'language' }, { label: tr('关闭', 'Close'), value: 'close', tone: 'quiet' })
         if (intent && (intent.sessionId !== ctx.sessionManager.getSessionId() || intent.taskVersion !== taskVersion(task) ||
-            !choices.some(option => option.value === intent.choice))) throw new Error('任务状态已变化，请重新选择。')
+            !choices.some(option => option.value === intent.choice))) throw new Error(tr('任务状态已变化，请重新选择。', 'The task state changed. Make your selection again.'))
         const tone = phaseTone(task)
-        const choice = intent?.choice ?? await pick(ctx, 'Worktree · 更多', details, choices, {
+        const choice = intent?.choice ?? await pick(ctx, tr('Worktree · 更多', 'Worktree · More'), details, choices, {
           tone: tone === 'danger' || tone === 'warning' ? tone : undefined,
         })
         if (!choice || choice === 'close' || !ctx.isIdle()) return
-        if (choice === 'arm' && local) {
-          if (!sessionLink(ctx)) throw new Error('无持久化 Pi 会话，不能新建 Worktree。')
+        if (choice === 'language') {
+          const language = await pick<'zh' | 'en' | undefined>(ctx, tr('显示语言', 'Display language'), [], [
+            { label: `${getDisplayLanguage() === 'zh' ? '✓ ' : ''}简体中文`, value: 'zh' },
+            { label: `${getDisplayLanguage() === 'en' ? '✓ ' : ''}English`, value: 'en' },
+            { label: tr('取消', 'Cancel'), value: undefined, tone: 'quiet' },
+          ])
+          if (language && ctx.isIdle()) await setLanguage(ctx, language)
+        } else if (choice === 'arm' && local) {
+          if (!sessionLink(ctx)) throw new Error(tr('无持久化 Pi 会话，不能新建 Worktree。', 'A saved Pi session is required to create a Worktree.'))
           const id = ctx.sessionManager.getSessionId()
           armed = armed?.sessionId === id ? undefined : { sessionId: id }
         } else if (choice === 'history' && local) {
-          const prior = await pick<Task | undefined>(ctx, '打开历史对话', [
-            '可以继续提问；明确要求改动时才从项目目录当前 HEAD 新建 Worktree。',
+          const prior = await pick<Task | undefined>(ctx, tr('打开历史对话', 'Open conversation history'), [
+            tr('可以继续提问；明确要求改动时才从项目目录当前 HEAD 新建 Worktree。', 'You can ask follow-up questions here. An explicit edit request starts a new Worktree from the current project HEAD.'),
           ], [
-            ...historyTasks(tasks).map(item => ({ label: `${item.id.slice(0, 8)} · ${phases[item.phase]} · ${item.review?.message ?? 'Worktree'}`, value: item })),
-            { label: '取消', value: undefined },
+            ...historyTasks(tasks).map(item => ({ label: `${item.id.slice(0, 8)} · ${phases()[item.phase]} · ${item.review?.message ?? 'Worktree'}`, value: item })),
+            { label: tr('取消', 'Cancel'), value: undefined },
           ])
           if (!prior || !ctx.isIdle()) return
           await withSavedLocal(ctx, async current => {
             if (current !== ctx) switching = true
             try {
-              const { target } = await withLoading(current, '正在准备历史对话…', () => makeHistoryView(data, prior, sessionLink(current)!))
-              const moved = await switchTo(current, target, '正在打开历史对话…', async () => { switching = true })
+              const { target } = await withLoading(current, tr('正在准备历史对话…', 'Preparing conversation history…'), () => makeHistoryView(data, prior, sessionLink(current)!))
+              const moved = await switchTo(current, target, tr('正在打开历史对话…', 'Opening conversation history…'), async () => { switching = true })
               if (moved.cancelled) {
                 await rm(target.file, { force: true })
-                throw new Error('Pi 取消了打开历史对话。')
+                throw new Error(tr('Pi 取消了打开历史对话。', 'Pi cancelled opening the history view.'))
               }
             } catch (error) {
               if (current === ctx) throw error
@@ -1440,109 +1470,109 @@ export default function extension(pi: ExtensionAPI) {
             }
           })
         } else if (choice === 'return' && isolated) {
-          await withLoading(ctx, '正在检查原对话…', () => data.validateLocalIdentity(isolated))
-          const moved = await switchTo(ctx, isolated.localSession, '正在返回原对话…', async () => { switching = true })
-          if (moved.cancelled) throw new Error('Pi 取消了切换。')
+          await withLoading(ctx, tr('正在检查原对话…', 'Checking original conversation…'), () => data.validateLocalIdentity(isolated))
+          const moved = await switchTo(ctx, isolated.localSession, tr('正在返回原对话…', 'Returning to original conversation…'), async () => { switching = true })
+          if (moved.cancelled) throw new Error(tr('Pi 取消了切换。', 'Pi cancelled the switch.'))
         } else if (choice === 'retained' || (choice === 'resume' && task?.isolatedSession)) {
-          const target = choice === 'retained' ? await pick<Task | undefined>(ctx, '已保留的 Worktree', ['选择一个已结束任务的保留目录。'], [
+          const target = choice === 'retained' ? await pick<Task | undefined>(ctx, tr('已保留的 Worktree', 'Retained Worktrees'), [tr('选择一个已结束任务的保留目录。', 'Choose a retained directory from a finished task.')], [
             ...retained.map(item => ({ label: `${item.id.slice(0, 8)} · ${item.review?.message ?? 'Worktree'}`, value: item })),
-            { label: '取消', value: undefined },
+            { label: tr('取消', 'Cancel'), value: undefined },
           ]) : task
           if (!target || !ctx.isIdle()) return
           if (choice === 'retained') {
-            const next = await pick(ctx, '管理保留的 Worktree', [
-              `原因：${target.cleanup?.reason ?? '保留环境'}`, `目录：${target.isolatedPath}`,
+            const next = await pick(ctx, tr('管理保留的 Worktree', 'Manage retained Worktree'), [
+              tf('原因：{0}', 'Reason: {0}', target.cleanup?.reason ?? tr('保留环境', 'Retained environment')), tf('目录：{0}', 'Directory: {0}', target.isolatedPath),
             ], [
-              ...(target.isolatedSession ? [{ label: '检查保留目录', value: 'resume' }] : []),
-              { label: '检查并清理…', value: 'remove' }, { label: '关闭', value: 'close' },
+              ...(target.isolatedSession ? [{ label: tr('检查保留目录', 'Inspect retained directory'), value: 'resume' }] : []),
+              { label: tr('检查并清理…', 'Check and clean up…'), value: 'remove' }, { label: tr('关闭', 'Close'), value: 'close' },
             ])
             if (!ctx.isIdle()) return
-            if (next === 'remove') { await confirmRemoval(ctx, data, target, '确认：清理保留的 Worktree'); return }
+            if (next === 'remove') { await confirmRemoval(ctx, data, target, tr('确认：清理保留的 Worktree', 'Confirm retained Worktree cleanup')); return }
             if (next !== 'resume') return
           }
           if (!target.isolatedSession) return
-          await withLoading(ctx, '正在检查 Worktree…', () => data.validateIsolatedIdentity(target))
-          const moved = await switchTo(ctx, target.isolatedSession, '正在恢复 Worktree 会话…', async () => { switching = true })
-          if (moved.cancelled) throw new Error('Pi 取消了切换。')
+          await withLoading(ctx, tr('正在检查 Worktree…', 'Checking Worktree…'), () => data.validateIsolatedIdentity(target))
+          const moved = await switchTo(ctx, target.isolatedSession, tr('正在恢复 Worktree 会话…', 'Resuming Worktree conversation…'), async () => { switching = true })
+          if (moved.cancelled) throw new Error(tr('Pi 取消了切换。', 'Pi cancelled the switch.'))
         } else if (choice === 'recover' && task?.recovery) {
           if (task.external && task.recovery.workspace) {
             const link = sessionLink(ctx)
-            if (!link) throw new Error('找不到绑定的 Pi 会话。')
+            if (!link) throw new Error(tr('找不到绑定的 Pi 会话。', 'Could not find the linked Pi session.'))
             const recovery = task.recovery
             await data.resumeConflictRecovery(task.id, link, recovery)
             kickoff = () => scheduleConflictTurn(ctx, data, task, link, recovery)
             return
           }
           const target = task.isolatedSession
-          if (!target) throw new Error('找不到任务的 Worktree 会话。')
+          if (!target) throw new Error(tr('找不到任务的 Worktree 会话。', 'Could not find the task\'s Worktree session.'))
           const resume = async (next: ExtensionContext, send: (text: string) => unknown) => {
-            await withLoading(next, '正在检查冲突恢复状态…', async () => {
+            await withLoading(next, tr('正在检查冲突恢复状态…', 'Checking conflict recovery state…'), async () => {
               const latest = (await data.read()).tasks.find(item => item.id === task.id)
               if (!isBoundSession(next, target) || !next.isIdle() || latest?.phase !== 'working' || latest.journal ||
-                  JSON.stringify(latest.recovery) !== JSON.stringify(task.recovery)) throw new Error('冲突恢复状态已变化。')
+                  JSON.stringify(latest.recovery) !== JSON.stringify(task.recovery)) throw new Error(tr('冲突恢复状态已变化。', 'The conflict recovery state changed.'))
               await data.validateIsolatedIdentity(latest)
             })
             await send(conflictPrompt(task.recovery!))
           }
           if (isolated) await resume(ctx, text => pi.sendUserMessage(text))
           else {
-            await withLoading(ctx, '正在检查 Worktree…', () => data.validateIsolatedIdentity(task))
-            const moved = await switchTo(ctx, target, '正在恢复 Worktree 会话…', async next => {
+            await withLoading(ctx, tr('正在检查 Worktree…', 'Checking Worktree…'), () => data.validateIsolatedIdentity(task))
+            const moved = await switchTo(ctx, target, tr('正在恢复 Worktree 会话…', 'Resuming Worktree conversation…'), async next => {
               switching = true
               try { await resume(next, text => next.sendUserMessage(text)) }
               catch (error) { next.ui.notify(message(error), 'error') }
             })
-            if (moved.cancelled) throw new Error('Pi 取消了切换。')
+            if (moved.cancelled) throw new Error(tr('Pi 取消了切换。', 'Pi cancelled the switch.'))
           }
         } else if (choice === 'mark' && task) {
           const link = sessionLink(ctx)
-          if (!link || !editingSession(ctx, task)) throw new Error('只能在绑定的 Worktree 源对话中标记待验收。')
+          if (!link || !editingSession(ctx, task)) throw new Error(tr('只能在绑定的 Worktree 源对话中标记待验收。', 'Mark ready for review in the linked source Worktree conversation.'))
           if (task.external) await verifyExternalEditor(data, task, link)
-          const candidates = await withLoading(ctx, '正在扫描 Worktree 改动…', () => data.reviewCandidates(task))
+          const candidates = await withLoading(ctx, tr('正在扫描 Worktree 改动…', 'Scanning Worktree changes…'), () => data.reviewCandidates(task))
           const files = await chooseReviewFiles(ctx, candidates, false, task.review?.files)
           if (!files || !ctx.isIdle()) return
-          await withLoading(ctx, '正在标记待验收…', () =>
+          await withLoading(ctx, tr('正在标记待验收…', 'Marking ready for review…'), () =>
             data.markReady(task.id, link, task.review?.message ?? 'Worktree task changes', files, {
               body: task.review?.body, expectedReview: { id: task.review?.id },
             }))
-          ctx.ui.notify('已标记待验收；未修改项目目录。', 'info')
+          ctx.ui.notify(tr('已标记待验收；未修改项目目录。', 'Marked ready for review. The project folder was not changed.'), 'info')
         } else if (choice === 'scope' && task?.review && (task.isolatedSession || task.external)) {
           const files = await chooseReviewFiles(ctx, task.review.files, true)
           if (!files || files.length === task.review.files.length || !ctx.isIdle()) return
           const link = sessionLink(ctx)
-          if (!link) throw new Error('找不到绑定的 Pi 会话。')
+          if (!link) throw new Error(tr('找不到绑定的 Pi 会话。', 'Could not find the linked Pi session.'))
           const reviewId = task.review.id
-          await withLoading(ctx, '正在更新交付清单…', () => data.restrictReview(task.id, link, reviewId, files))
+          await withLoading(ctx, tr('正在更新交付清单…', 'Updating delivery scope…'), () => data.restrictReview(task.id, link, reviewId, files))
           await refresh(ctx)
-          ctx.ui.notify('已更新交付清单；未修改项目目录。', 'info')
-        } else if (task && choice in labels) {
+          ctx.ui.notify(tr('已更新交付清单；未修改项目目录。', 'Delivery scope updated. The project folder was not changed.'), 'info')
+        } else if (task && choice in labels()) {
           const act = choice as Action
-          if (act === 'discard' && !task.external && (!isolated || !isBoundSession(ctx, task.isolatedSession))) throw new Error('只能在任务的 Worktree 对话中放弃。')
+          if (act === 'discard' && !task.external && (!isolated || !isBoundSession(ctx, task.isolatedSession))) throw new Error(tr('只能在任务的 Worktree 对话中放弃。', 'Discard from the task\'s Worktree conversation.'))
           const discardFingerprint = act === 'discard' && !task.external
-            ? await withLoading(ctx, '正在检查可放弃的 Worktree…', () => data.discardFingerprint(task)) : undefined
-          const copy = task.external && act === 'discard' ? { title: '解除登记？', lead: '只解除登记，不修改源或项目目录。', button: '解除登记' } :
-            task.external && act === 'finalize' ? { ...confirmationCopy[act], button: '提交预览' } : confirmationCopy[act]
+            ? await withLoading(ctx, tr('正在检查可放弃的 Worktree…', 'Checking whether the Worktree can be discarded…'), () => data.discardFingerprint(task)) : undefined
+          const copy = task.external && act === 'discard' ? { title: tr('解除登记？', 'Unlink Worktree?'), lead: tr('只解除登记，不修改源或项目目录。', 'Only removes the registration. The source and project folders stay unchanged.'), button: tr('解除登记', 'Unlink') } :
+            task.external && act === 'finalize' ? { ...confirmationCopy()[act], button: tr('提交预览', 'Commit preview') } : confirmationCopy()[act]
           const commits = act === 'finalize' || act === 'commit_ready'
           const leavesWorktree = commits && !!isolated
           const partial = commits && !task.external && !!task.review?.partial
           const relevantFiles = (act === 'commit_ready' ? task.review?.files : task.receipt?.changedFiles ?? task.review?.files) ?? []
           const detail = [
-            ...(commits && task.review ? [`提交标题：${task.review.message.trim()}`] : []),
-            act === 'discard' ? '隔离 Worktree' : `项目目录${relevantFiles.length ? ` · ${relevantFiles.length} 个文件` : ''}`,
+            ...(commits && task.review ? [tf('提交标题：{0}', 'Commit title: {0}', task.review.message.trim())] : []),
+            act === 'discard' ? tr('隔离 Worktree', 'Isolated Worktree') : tf('项目目录{0}', 'Project folder{0}', relevantFiles.length ? tf(' · {0} 个文件', ' · Files: {0}', relevantFiles.length) : ''),
             act === 'discard' ? task.isolatedPath : task.local.root,
           ]
           if (act === 'discard') detail.unshift(copy.lead)
-          if (leavesWorktree) detail.push('提交后保留当前对话。')
+          if (leavesWorktree) detail.push(tr('提交后保留当前对话。', 'The current conversation stays open after committing.'))
           const externalPreview = !!task.external && act === 'preview'
-          if (externalPreview) detail.push(`目标分支：${task.localHeadRef}`, `起点：${task.baseOid}`, '来源：', task.isolatedPath)
-          if (task.external && commits) detail.push('外部 Worktree 由原工具管理，不会删除。')
-          if (partial) detail.push('清单外有改动，将保留 Worktree。')
-          if (commits && task.review?.body) detail.push('提交正文：', ...task.review.body.split('\n').map(line => line.replaceAll('\t', '    ')), '')
+          if (externalPreview) detail.push(tf('目标分支：{0}', 'Target branch: {0}', task.localHeadRef), tf('起点：{0}', 'Base: {0}', task.baseOid), tr('来源：', 'Source:'), task.isolatedPath)
+          if (task.external && commits) detail.push(tr('外部 Worktree 由原工具管理，不会删除。', 'The external host manages this Worktree. It will not be deleted.'))
+          if (partial) detail.push(tr('清单外有改动，将保留 Worktree。', 'There are changes outside the delivery scope, so the Worktree will be retained.'))
+          if (commits && task.review?.body) detail.push(tr('提交正文：', 'Commit body:'), ...task.review.body.split('\n').map(line => line.replaceAll('\t', '    ')), '')
           if (commits || externalPreview) detail.push(...relevantFiles.map(path => `• ${JSON.stringify(path)}`))
           const decision = await pick<'execute' | 'keep' | undefined>(ctx, copy.title, detail, [
-            { label: partial ? '提交并保留' : copy.button, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
-            ...(commits && !partial && !task.external ? [{ label: '提交并保留', value: 'keep' as const }] : []),
-            { label: '取消', value: undefined, tone: 'quiet' },
+            { label: partial ? tr('提交并保留', 'Commit and keep') : copy.button, value: 'execute', tone: act === 'discard' ? 'danger' : 'primary' },
+            ...(commits && !partial && !task.external ? [{ label: tr('提交并保留', 'Commit and keep'), value: 'keep' as const }] : []),
+            { label: tr('取消', 'Cancel'), value: undefined, tone: 'quiet' },
           ], { compactActions: true, lead: act === 'discard' ? undefined : copy.lead, requiredDetails: act === 'discard' ? detail.length : undefined,
             requireDetailViewport: commits || externalPreview, tone: act === 'discard' ? 'danger' : commits || act === 'rollback' ? 'warning' : undefined })
           if (!decision || !ctx.isIdle()) return
@@ -1554,30 +1584,30 @@ export default function extension(pi: ExtensionAPI) {
             const canRecover = (!!target && !task.review?.partial || externalRecovery) && !!task.review && !!plan.cleanEntries && plan.committedConflictingFiles.length > 0
             const committed = plan.committedConflictingFiles.length > 0
             const paths = plan.conflictingFiles.slice(0, 6).map(path => `• ${JSON.stringify(path)}`)
-            if (plan.conflictingFiles.length > paths.length) paths.push(`… 共 ${plan.conflictingFiles.length} 个冲突文件`)
-            const recover = await pick(ctx, committed ? '预览冲突 · 项目目录未修改' : '与项目原目录的未提交改动冲突', [
-              !committed ? '预览未写入任何文件。请先对比项目原目录与 Worktree 的改动。' :
-                canRecover ? `只在${externalRecovery ? '独立冲突目录' : ' Worktree'}合并项目目录的提交 ${plan.localHeadOid.slice(0, 12)}，生成新验收。` : '与项目目录的已提交改动冲突；这组冲突不能安全地自动交给 Agent。',
-              ...(committed && plan.dirtyConflict ? ['项目原目录的未提交改动不会带入 Worktree，仍需单独处理。'] : []),
+            if (plan.conflictingFiles.length > paths.length) paths.push(tf('… 共 {0} 个冲突文件', '… Conflict files: {0} total', plan.conflictingFiles.length))
+            const recover = await pick(ctx, committed ? tr('预览冲突 · 项目目录未修改', 'Preview conflict · Project folder unchanged') : tr('与项目原目录的未提交改动冲突', 'Conflict with uncommitted changes in the project folder'), [
+              !committed ? tr('预览未写入任何文件。请先对比项目原目录与 Worktree 的改动。', 'The preview did not write any files. Compare changes in the project folder and the Worktree first.') :
+                canRecover ? tf('只在{0}合并项目目录的提交 {1}，生成新验收。', 'Merge project commit {1} only in {0}, then create a new review.', externalRecovery ? tr('独立冲突目录', 'the separate conflict directory') : ' Worktree', plan.localHeadOid.slice(0, 12)) : tr('与项目目录的已提交改动冲突；这组冲突不能安全地自动交给 Agent。', 'The conflict comes from committed project changes and cannot safely be handed to the Agent automatically.'),
+              ...(committed && plan.dirtyConflict ? [tr('项目原目录的未提交改动不会带入 Worktree，仍需单独处理。', 'Uncommitted project changes are not brought into the Worktree and still need separate handling.')] : []),
               ...paths,
-            ], [...(canRecover ? [{ label: '让 Agent 解决冲突', value: 'recover' as const, tone: 'primary' as const }] : []),
-              { label: '关闭', value: 'close', tone: 'quiet' }], { tone: 'warning' })
+            ], [...(canRecover ? [{ label: tr('让 Agent 解决冲突', 'Let Agent resolve conflicts'), value: 'recover' as const, tone: 'primary' as const }] : []),
+              { label: tr('关闭', 'Close'), value: 'close', tone: 'quiet' }], { tone: 'warning' })
             if (recover !== 'recover' || !task.review || !ctx.isIdle()) return
             const reviewId = task.review.id
             if (externalRecovery && source) {
-              const recovery = await withLoading(ctx, '正在准备冲突处理…', () => data.beginConflictRecovery(task.id, source, reviewId, plan))
+              const recovery = await withLoading(ctx, tr('正在准备冲突处理…', 'Preparing conflict recovery…'), () => data.beginConflictRecovery(task.id, source, reviewId, plan))
               kickoff = () => scheduleConflictTurn(ctx, data, task, source, recovery)
               return
             }
             if (!target) return
             const begin = async (next: ExtensionContext, send: (text: string) => unknown) => {
-              if (!isBoundSession(next, target) || !next.isIdle()) throw new Error('未进入预期的空闲 Worktree 会话。')
-              const recovery = await withLoading(next, '正在准备冲突处理…', () => data.beginConflictRecovery(task.id, target, reviewId, plan))
+              if (!isBoundSession(next, target) || !next.isIdle()) throw new Error(tr('未进入预期的空闲 Worktree 会话。', 'Could not enter the expected idle Worktree conversation.'))
+              const recovery = await withLoading(next, tr('正在准备冲突处理…', 'Preparing conflict recovery…'), () => data.beginConflictRecovery(task.id, target, reviewId, plan))
               await send(conflictPrompt(recovery))
             }
             if (isolated) await begin(ctx, text => pi.sendUserMessage(text))
             else {
-              const moved = await switchTo(ctx, target, '正在进入 Worktree…', async next => {
+              const moved = await switchTo(ctx, target, tr('正在进入 Worktree…', 'Opening Worktree…'), async next => {
                 switching = true
                 try { await begin(next, text => next.sendUserMessage(text)) }
                 catch (error) { next.ui.notify(message(error), 'error') }
@@ -1585,13 +1615,13 @@ export default function extension(pi: ExtensionAPI) {
                   if (next.isIdle()) await next.sendUserMessage(`/${NAME} refresh`, { expandPromptTemplates: true }).catch(() => {})
                 }
               })
-              if (moved.cancelled) throw new Error('Pi 取消了切换；未开始处理冲突。')
+              if (moved.cancelled) throw new Error(tr('Pi 取消了切换；未开始处理冲突。', 'Pi cancelled the switch. Conflict resolution was not started.'))
             }
           }
           const execute = async (activeCtx: ExtensionContext) => {
-            const result = await withLoading(activeCtx, progress[act], async () => {
+            const result = await withLoading(activeCtx, progress()[act], async () => {
               if (decision === 'keep') {
-                if (!task.isolatedSession || task.isolatedSession.cwd !== task.isolatedPath) throw new Error('找不到可保留的 Worktree 会话，未提交。')
+                if (!task.isolatedSession || task.isolatedSession.cwd !== task.isolatedPath) throw new Error(tr('找不到可保留的 Worktree 会话，未提交。', 'No Worktree conversation to retain was found. Nothing was committed.'))
                 await validateSession(task.isolatedSession)
               }
               return data.act(task.id, act, {
@@ -1600,29 +1630,29 @@ export default function extension(pi: ExtensionAPI) {
               })
             }).catch(error => {
               if (act === 'commit_ready' && error instanceof PreviewConflict) {
-                throw new Error(`${error.message}。可通过「预览改动」查看冲突处理选项。`, { cause: error })
+                throw new Error(tf('{0}。可通过「预览改动」查看冲突处理选项。', '{0} Use “Preview changes” to see conflict resolution options.', error.message), { cause: error })
               }
               throw error
             })
             const oid = commits && result.commitOid ? ` · ${result.commitOid.slice(0, 12)}` : ''
-            const followUp = act === 'preview' && isolated ? '可点「打开项目目录检查」。' : ''
+            const followUp = act === 'preview' && isolated ? tr('可点「打开项目目录检查」。', ' Click “Inspect project folder” to check the changes.') : ''
             const cleanup = result.cleanup?.status === 'retained'
-              ? ` Worktree 已保留：${result.isolatedPath}${result.cleanup.reason ? `（${result.cleanup.reason}）` : ''}`
-              : result.cleanup?.status === 'done' ? ' Worktree 已清理。' : ''
-            activeCtx.ui.notify(`${completed[act]}${oid}${followUp}${cleanup}`,
+              ? tf(' Worktree 已保留：{0}{1}', ' Worktree retained: {0}{1}', result.isolatedPath, result.cleanup.reason ? `（${result.cleanup.reason}）` : '')
+              : result.cleanup?.status === 'done' ? tr(' Worktree 已清理。', ' Worktree cleaned up.') : ''
+            activeCtx.ui.notify(`${completed()[act]}${oid}${followUp}${cleanup}`,
               result.cleanup?.status === 'retained' && !result.cleanup.requested ? 'warning' : 'info')
             if (result.cleanup?.canForce && !partial && activeCtx.isIdle()) {
-              try { await confirmRemoval(activeCtx, data, result, '未能安全清理 Worktree') }
-              catch (error) { activeCtx.ui.notify(`Worktree 清理已停止：${message(error)}`, 'warning') }
+              try { await confirmRemoval(activeCtx, data, result, tr('未能安全清理 Worktree', 'Could not safely clean up the Worktree')) }
+              catch (error) { activeCtx.ui.notify(tf('Worktree 清理已停止：{0}', 'Worktree cleanup stopped: {0}', message(error)), 'warning') }
             }
           }
           if (act === 'discard' && !task.external) {
             const text = ctx.ui.getEditorText()
-            await withLoading(ctx, '正在检查原对话…', () => data.validateLocalIdentity(task))
-            const moved = await switchTo(ctx, task.localSession, '正在返回原对话…', async next => {
+            await withLoading(ctx, tr('正在检查原对话…', 'Checking original conversation…'), () => data.validateLocalIdentity(task))
+            const moved = await switchTo(ctx, task.localSession, tr('正在返回原对话…', 'Returning to original conversation…'), async next => {
               switching = true
               if (!isBoundSession(next, task.localSession) || !next.isIdle()) {
-                next.ui.notify('未进入预期的原对话，任务未放弃。', 'error')
+                next.ui.notify(tr('未进入预期的原对话，任务未放弃。', 'Could not enter the expected original conversation. The task was not discarded.'), 'error')
                 return
               }
               if (text) restoreDraft(next, text)
@@ -1630,39 +1660,39 @@ export default function extension(pi: ExtensionAPI) {
               catch (error) { next.ui.notify(message(error), 'error') }
               finally { await next.sendUserMessage(`/${NAME} refresh`, { expandPromptTemplates: true }).catch(() => {}) }
             })
-            if (moved.cancelled) throw new Error('Pi 取消了切换，任务未放弃。')
+            if (moved.cancelled) throw new Error(tr('Pi 取消了切换，任务未放弃。', 'Pi cancelled the switch. The task was not discarded.'))
           } else if (leavesWorktree) {
             // Move off the old cwd before cleanup, but keep the task transcript on
             // screen. This view blocks tools and prompt delivery until handoff.
             const leaf = ctx.sessionManager.getLeafId()
-            const { target, source, proof } = await withLoading(ctx, '正在保留任务对话…', async () => {
+            const { target, source, proof } = await withLoading(ctx, tr('正在保留任务对话…', 'Preserving task conversation…'), async () => {
               await data.validateLocal(task)
               await validateSession(task.localSession)
               return makeHistoryView(data, task, task.localSession, { leaf })
             })
             pendingDelivery.add(target.file)
             try {
-              const moved = await switchTo(ctx, target, '正在切换提交环境…', async next => {
+              const moved = await switchTo(ctx, target, tr('正在切换提交环境…', 'Switching to commit context…'), async next => {
                 switching = true
                 try {
                   const nextCwd = await realpath(next.cwd)
                   const inProject = nextCwd === task.local.root || nextCwd.startsWith(task.local.root + '/')
                   if (!inProject || !isBoundSession(next, target) || !next.isIdle()) {
-                    throw new Error('未进入预期的任务对话，未提交。')
+                    throw new Error(tr('未进入预期的任务对话，未提交。', 'Could not enter the expected task conversation. Nothing was committed.'))
                   }
-                  if (!matchesHistory(await readHistory(source), proof)) throw new Error('任务对话已变化，未提交。')
+                  if (!matchesHistory(await readHistory(source), proof)) throw new Error(tr('任务对话已变化，未提交。', 'The task conversation changed. Nothing was committed.'))
                   await execute(next)
                 } catch (error) {
                   next.ui.notify(message(error), 'error')
                 } finally {
                   pendingDelivery.delete(target.file)
                   try { await next.sendUserMessage(`/${NAME} refresh`, { expandPromptTemplates: true }) }
-                  catch (error) { next.ui.notify(`无法刷新工作台：${message(error)}`, 'warning') }
+                  catch (error) { next.ui.notify(tf('无法刷新工作台：{0}', 'Could not refresh the Worktree menu: {0}', message(error)), 'warning') }
                 }
               })
               if (moved.cancelled) {
                 await rm(target.file, { force: true })
-                throw new Error('Pi 取消了切换，未提交。')
+                throw new Error(tr('Pi 取消了切换，未提交。', 'Pi cancelled the switch. Nothing was committed.'))
               }
             } finally { pendingDelivery.delete(target.file) }
           } else {
@@ -1684,4 +1714,5 @@ export default function extension(pi: ExtensionAPI) {
       }
     },
   })
+  registerCommands()
 }

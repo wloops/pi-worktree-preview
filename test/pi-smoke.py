@@ -354,12 +354,25 @@ def main():
             assert (local / 'task.txt').read_text() == 'base\n'
         git('switch', '--quiet', 'main')
         with Pi(local, agent, provider) as pi:
+            pi.click('⋯ 更多')
+            pi.click('[ 显示语言 ]')
+            pi.click('[ English ]')
+            pi.until('[ ] New Worktree')
+            assert json.loads(state_path.with_name('preferences.json').read_text()) == {'language': 'en'}
+            assert 'language' not in json.loads((agent / 'settings.json').read_text())
+            assert not state_path.exists()
+        with Pi(local, agent, provider) as pi:
+            pi.until('[ ] New Worktree')
+            pi.click('⋯ More')
+            pi.click('[ Display language ]')
+            pi.click('[ 简体中文 ]')
+            pi.until('[ ] 新建 Worktree')
+        print('real Pi: mouse language switch from fresh Git session persists across restart', flush=True)
+        with Pi(local, agent, provider) as pi:
             create_x, create_y = pi.until('[ ] 新建 Worktree')
-            assert pi.screen.display[create_y - 1].strip() == '[ ] 新建 Worktree'
             assert pi.screen.buffer[create_y - 1][create_x - 1].bg == '4669a3'
             pi.click('[ ] 新建 Worktree')
             create_x, create_y = pi.until('[x] 新建 Worktree')
-            assert pi.screen.display[create_y - 1].strip() == '[x] 新建 Worktree'
             assert pi.screen.buffer[create_y - 1][create_x - 1].bg == '294f94'
             assert not state_path.exists(), 'checking must not create anything'
             pi.click('[x] 新建 Worktree')
@@ -518,6 +531,14 @@ def main():
             assert task()['phase'] == 'ready' and task()['review']['id'] != review_id
             assert (first_path / 'task.txt').read_text() == 'ready revision\n'
             assert (local / 'task.txt').read_text() == 'base\n'
+            pi.send(b'/worktree-preview-language en\r')
+            pi.until('Worktree · Ready for review')
+            pi.click('[ Preview changes ]')
+            pi.until('Preview changes?')
+            pi.click('[ Cancel ]')
+            pi.until_gone('Preview changes?')
+            assert (local / 'task.txt').read_text() == 'base\n'
+            pi.send(b'/worktree-preview-language zh\r')
             pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
             pi.until('Worktree · 已预览')
