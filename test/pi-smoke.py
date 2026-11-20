@@ -126,7 +126,13 @@ export default function(pi) {
             'Revision blocked by Local drift.' : 'Revision stopped.') : externalRevision ? [tool('read', {path:'../task.txt'})] : [edit()]; break;
           default: content = say(last.isError ? "Review failed." : privateRecovery ? "Conflict resolved in private workspace." : recover ? "Conflict resolved in Worktree." : revision || externalRevision ? "Revision ready." : "Worktree ready.");
         }
-      } else if (privateRecovery && existsSync(pauseRecovery)) content = say('Conflict recovery paused.');
+      } else if ((privateRecovery || recover) && (declared.some(tool => tool.name === 'worktree_begin_revision') ||
+          !declared.some(tool => tool.name === 'worktree_ready_for_review') ||
+          !context.messages.findLast(message => message.role === 'system' && message.sections?.worktree_preview)
+            ?.sections.worktree_preview.includes('Conflict recovery is already authorized'))) {
+        content = say('Unexpected ordinary revision tool or guidance during conflict recovery.');
+      }
+      else if ((privateRecovery || recover) && existsSync(pauseRecovery)) content = say('Conflict recovery paused.');
       else if (privateRecovery) content = [tool('bash', {command: `cd ${shellQuote(JSON.parse(privateRecovery[1]))} &&
         test -n "$(git ls-files -u -- task.txt)" && echo 'resolved independently' > task.txt && git add -- task.txt`})];
       else if (recover) content = [tool('bash', {command: `git add -- task.txt && git commit -m checkpoint &&
@@ -910,6 +916,15 @@ def main():
             pi.until('Worktree ready.', 40)
             previous = task()['review']['id']
             (local / 'task.txt').write_text('committed upstream\n')
+            pi.click('[ 预览改动 ]')
+            pi.click('[ 预览 ]')
+            pi.until('与项目原目录的未提交改动冲突')
+            pi.until('预览未写入任何文件。')
+            assert '调整交付清单' not in pi.dump() and '让 Agent 解决冲突' not in pi.dump(), pi.dump()
+            assert (local / 'task.txt').read_text() == 'committed upstream\n'
+            assert task()['review']['id'] == previous and not task().get('journal')
+            pi.click('[ 关闭 ]')
+            pi.until_gone('与项目原目录的未提交改动冲突')
             git('commit', '-am', 'upstream')
             head = git('rev-parse', 'HEAD')
             (local / 'untracked.txt').write_text('private\n')
@@ -924,7 +939,15 @@ def main():
             pi.until('原对话 · Worktree 待验收')
             pi.click('[ 预览改动 ]')
             pi.click('[ 预览 ]')
+            pause = provider.with_name('pause-recovery')
+            pause.touch()
             pi.click('[ 让 Agent 解决冲突 ]')
+            pi.until('Conflict recovery paused.', 45)
+            pi.until('[ 让 Agent 继续解决冲突 ]')
+            assert task()['phase'] == 'working' and task()['recovery']['localHeadOid'] == head
+            assert (Path(task()['isolatedPath']) / 'task.txt').read_text() == 'task edit\n'
+            pause.unlink()
+            pi.click('[ 让 Agent 继续解决冲突 ]')
             pi.until('Conflict resolved in Worktree.', 45)
             assert task()['phase'] == 'ready'
             assert task()['review']['id'] != previous
@@ -959,7 +982,12 @@ def main():
                 pi.click('[ 预览改动 ]')
                 pi.click('[ 预览 ]')
                 if broad:
-                    pi.until('预览冲突 · 项目目录未修改')
+                    pi.until('与项目原目录的未提交改动冲突')
+                    assert '调整交付清单' not in pi.dump() and '让 Agent 解决冲突' not in pi.dump(), pi.dump()
+                    pi.click('[ 关闭 ]')
+                    pi.until_gone('与项目原目录的未提交改动冲突')
+                    assert task()['review']['id'] == original['id']
+                    pi.click('⋯ 更多')
                     pi.click('[ 调整交付清单 ]')
                     pi.click('[ [x] ".pi/loops.json" ]')
                     pi.until('[ [ ] ".pi/loops.json" ]')

@@ -787,17 +787,19 @@ export default function extension(pi: ExtensionAPI) {
     const candidate = state && editingTask(ctx, state)
     const task = candidate && await isWorkflowEditor(ctx, state.data, candidate) ? candidate : undefined
     const canWork = !!task && !task.journal && !incomingHoldFailed && ['working', 'ready', 'previewed'].includes(task.phase)
-    if (canWork) tools.push(TOOL, REVISE)
+    const recovery = task?.recovery
+    if (canWork) tools.push(TOOL)
+    if (canWork && !recovery) tools.push(REVISE)
     else {
-      // Pi restores the live loadout when selectedTools equals the base list.
-      // Drop former workflow tools there too, including after external delivery.
+      // Pi can restore the live loadout between turns. Keep tools that do
+      // not apply to this phase out of that loadout as well as this prompt.
       const active = pi.getActiveTools()
-      const regular = active.filter(name => !workflowTools.has(name))
-      if (regular.length !== active.length) pi.setActiveTools(regular)
+      const applicable = active.filter(name => !workflowTools.has(name) || (canWork && name === TOOL))
+      if (applicable.length !== active.length) pi.setActiveTools(applicable)
     }
     if (!task) return
-    const guidance = canWork && task.recovery?.workspace
-      ? `For requested conflict work, resolve only unmerged paths in the independent directory and stage the results. Keep auto-merged files unchanged. Verify the result and call ${TOOL} with the full changed-file list relative to ${task.recovery.localHeadOid}. For discussion, do not edit.`
+    const guidance = canWork && recovery
+      ? `Conflict recovery is already authorized; no revision or further approval is needed. For conflict work, ${recovery.workspace ? 'resolve only unmerged paths in the independent directory and stage the results, without committing' : 'use the existing checkpoint or merge if present; otherwise follow the conflict request to checkpoint the reviewed changes and merge the pinned commit in this Worktree. Resolve only unmerged paths and complete the merge'}. Keep auto-merged files unchanged. Verify the result and call ${TOOL} with the full task file list relative to ${recovery.localHeadOid}. Do not preview. For discussion, do not edit.`
       : canWork && task.external
       ? `Status: ${task.phase}. For requested edits in ready or previewed state, call ${REVISE} alone and wait for success; on cancellation stop. If already working, continue directly. After editing and testing, call ${TOOL} alone with the exact paths for the current task, including earlier changes still intended for delivery and any newly relevant paths. Exclude unrelated files. For discussion, leave the review unchanged.`
       : canWork
@@ -904,6 +906,9 @@ export default function extension(pi: ExtensionAPI) {
       const task = state && editingTask(ctx, state)
       const link = sessionLink(ctx)
       if (!state || !task || !link || !await isWorkflowEditor(ctx, state.data, task)) return result(false, noWorkflow)
+      if (task.recovery && !task.journal && !incomingHoldFailed) {
+        return result(true, '已在解决冲突，不需要开始返修。请按当前请求继续处理冲突，不要再次调用此工具。')
+      }
       if (busy || revisionStopped) return result(false, '不能开始返修。请勿编辑，也不要在本轮重试。')
       busy = true
       revising = true
@@ -1547,28 +1552,18 @@ export default function extension(pi: ExtensionAPI) {
             const source = sessionLink(ctx)
             const externalRecovery = !!task.external && !!source && await data.isEditingSession(task, source)
             const canRecover = (!!target && !task.review?.partial || externalRecovery) && !!task.review && !!plan.cleanEntries && plan.committedConflictingFiles.length > 0
-            const canNarrow = (!!target || !!task.external) && !!task.review && task.review.files.length > 1 && !task.recovery
+            const committed = plan.committedConflictingFiles.length > 0
             const paths = plan.conflictingFiles.slice(0, 6).map(path => `• ${JSON.stringify(path)}`)
             if (plan.conflictingFiles.length > paths.length) paths.push(`… 共 ${plan.conflictingFiles.length} 个冲突文件`)
-            const recover = await pick(ctx, '预览冲突 · 项目目录未修改', [
-              !plan.committedConflictingFiles.length ? '冲突文件若不属于任务，可调整交付清单；否则请先处理项目目录的未提交改动。' :
-                canRecover ? `只在${externalRecovery ? '独立冲突目录' : ' Worktree'}合并项目目录的提交 ${plan.localHeadOid.slice(0, 12)}，生成新验收。` : '这组冲突不能安全地自动交给 Agent。',
-              ...(canRecover && plan.dirtyConflict ? ['项目目录的未提交改动不会带入 Worktree。'] : []),
+            const recover = await pick(ctx, committed ? '预览冲突 · 项目目录未修改' : '与项目原目录的未提交改动冲突', [
+              !committed ? '预览未写入任何文件。请先对比项目原目录与 Worktree 的改动。' :
+                canRecover ? `只在${externalRecovery ? '独立冲突目录' : ' Worktree'}合并项目目录的提交 ${plan.localHeadOid.slice(0, 12)}，生成新验收。` : '与项目目录的已提交改动冲突；这组冲突不能安全地自动交给 Agent。',
+              ...(committed && plan.dirtyConflict ? ['项目原目录的未提交改动不会带入 Worktree，仍需单独处理。'] : []),
               ...paths,
             ], [...(canRecover ? [{ label: '让 Agent 解决冲突', value: 'recover' as const, tone: 'primary' as const }] : []),
-              ...(canNarrow ? [scopeChoice] : []), { label: '关闭', value: 'close', tone: 'quiet' }], { tone: 'warning' })
-            if (!recover || recover === 'close' || !task.review || !ctx.isIdle()) return
+              { label: '关闭', value: 'close', tone: 'quiet' }], { tone: 'warning' })
+            if (recover !== 'recover' || !task.review || !ctx.isIdle()) return
             const reviewId = task.review.id
-            if (recover === 'scope') {
-              const files = await chooseReviewFiles(ctx, task.review.files, true)
-              if (!files || files.length === task.review.files.length || !ctx.isIdle()) return
-              const link = sessionLink(ctx)
-              if (!link) throw new Error('找不到绑定的 Pi 会话。')
-              await withLoading(ctx, '正在更新交付清单…', () => data.restrictReview(task.id, link, reviewId, files))
-              await refresh(ctx)
-              ctx.ui.notify('已更新交付清单；请重新点击预览。', 'info')
-              return
-            }
             if (externalRecovery && source) {
               const recovery = await withLoading(ctx, '正在准备冲突处理…', () => data.beginConflictRecovery(task.id, source, reviewId, plan))
               kickoff = () => scheduleConflictTurn(ctx, data, task, source, recovery)
