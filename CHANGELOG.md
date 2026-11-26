@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.2.5]
+
+- 新建 Worktree 前可在工具栏选择基准分支。可选择其最新提交已包含在当前 `HEAD` 中的本地分支；默认仍从当前 `HEAD` 创建，交付目标仍是原 checkout。
+
 ## [0.2.4]
 
 - 新增简体中文和 English 显示语言切换，支持「⋯ 更多」和 `/worktree-preview-language`，偏好会保存，不改变对话或 Git 提交语言。
