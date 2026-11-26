@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { link, lstat, mkdir, mkdtemp, open, realpath, rm } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { MAX_COMMIT_BODY } from './commit-message.ts'
-import { checkout, PreviewConflict, shortSessionName, TaskStore, type Action, type AdoptionInspection, type AdoptionRequest, type SessionLink, type Task } from './store.ts'
+import { checkout, currentBranch, PreviewConflict, shortSessionName, TaskStore, worktreeBaseBranches, type Action, type AdoptionInspection, type AdoptionRequest, type SessionLink, type Task } from './store.ts'
 import { commandActions, parseWorktreeCommand, type ActionVerb } from './commands.ts'
 import { clean, pick, toolbar, withLoading, type Choice, type ToolbarChoice } from './ui.ts'
 
@@ -45,7 +45,8 @@ const progress = (): Record<Action, string> => ({
   preview: tr('正在写入预览改动…', 'Writing preview changes…'), rollback: tr('正在撤回预览…', 'Undoing preview…'), finalize: tr('正在提交预览…', 'Committing preview…'),
   commit_ready: tr('正在直接提交…', 'Committing directly…'), discard: tr('正在放弃任务并检查清理…', 'Discarding task and checking cleanup…'),
 })
-type MenuAction = Action | 'arm' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'scope' | 'recover' | 'language' | 'close'
+const branchName = (ref: string) => ref.slice('refs/heads/'.length)
+type MenuAction = Action | 'arm' | 'base' | 'resume' | 'history' | 'retained' | 'return' | 'mark' | 'scope' | 'recover' | 'language' | 'close'
 const phases = () => ({ creating: tr('创建中断', 'Creation interrupted'), working: tr('进行中', 'In progress'), ready: tr('待验收', 'Ready for review'), previewed: tr('已预览', 'Preview active'), delivered: tr('已交付', 'Delivered'), discarded: tr('已放弃', 'Discarded') })
 const message = (e: unknown) => clean(e instanceof Error ? e.message : String(e))
 function taskSummary(text: string) {
@@ -429,7 +430,7 @@ function restoreDraft(ctx: ExtensionContext, text: string) {
 
 type Armed = { sessionId: string }
 type Prompt = Pick<InputEvent, 'text' | 'images'> & Armed
-type Draft = Prompt & { token: string; inherited?: FollowUpHistory }
+type Draft = Prompt & { token: string; inherited?: FollowUpHistory; baseBranch?: string }
 type ClickIntent = { token: string; sessionId: string; taskVersion: ReturnType<typeof taskVersion>; choice: MenuAction }
 type Confirmation = { token: string; expires: number; session: SessionLink } & (
   | { kind: 'adopt'; request: AdoptionRequest; shown: AdoptionInspection }
@@ -506,6 +507,8 @@ export default function extension(pi: ExtensionAPI) {
   let store: TaskStore | undefined
   let busy = false
   let armed: Armed | undefined
+  let selectedBase: { sessionId: string; ref: string } | undefined
+  const baseFor = (sessionId: string) => selectedBase?.sessionId === sessionId ? selectedBase.ref : undefined
   let historyView: HistoryView | null | undefined
   let historyCanFollowUp = false
   let pendingHistoryPrompt: Prompt | undefined
@@ -626,10 +629,18 @@ export default function extension(pi: ExtensionAPI) {
     const showCreate = !!state.local && (!active || !isOpenTask(active))
     const id = ctx.sessionManager.getSessionId()
     const selected = () => armed?.sessionId === id
+    const defaultBase = showCreate && state.local ? await currentBranch(state.local.root) : undefined
+    const baseLabel = () => {
+      const ref = baseFor(id) ?? defaultBase
+      return ref ? branchName(ref) : 'HEAD'
+    }
     installToolbar<MenuAction | 'menu'>(ctx, () => ({
       status: state.isolated || active ? { label: phaseLabel(!!state.isolated, active), tone: phaseTone(active) } : undefined,
       buttons: [
-        ...(showCreate ? [{ label: tf('[{0}] 新建 Worktree', '[{0}] New Worktree', selected() ? 'x' : ' '), value: 'arm' as const, tone: 'primary' as const, checked: selected() }] : []),
+        ...(showCreate ? [
+          { label: tf('[{0}] 新建 Worktree', '[{0}] New Worktree', selected() ? 'x' : ' '), value: 'arm' as const, tone: 'primary' as const, checked: selected() },
+          { label: tf(' 基于 {0} ▾ ', ' Based on {0} ▾ ', baseLabel()), value: 'base' as const },
+        ] : []),
         ...direct.map(({ label, ...choice }) => ({ ...choice, label: `[ ${label} ]` })),
         ...(historyTasks(state.tasks).length ? [{ label: tr('[ 任务历史 ]', '[ Task history ]'), value: 'history' as const }] : []),
         { label: tr(' ⋯ 更多 ', ' ⋯ More '), value: 'menu' as const, trailing: true },
@@ -751,7 +762,7 @@ export default function extension(pi: ExtensionAPI) {
       return { action: 'continue' }
     }
     const token = randomUUID()
-    draft = { ...prompt, token }
+    draft = { ...prompt, token, baseBranch: baseFor(sessionId) }
     // Only commands can replace a session. Wait for input preflight to unwind and
     // pass just a nonce to the command, never the message text or attachments.
     setImmediate(() => { if (draft?.token === token) pi.sendUserMessage(`/${NAME} ${token}`, { expandPromptTemplates: true }) })
@@ -995,7 +1006,7 @@ export default function extension(pi: ExtensionAPI) {
     },
   })
 
-  async function sendInNewWorktree(ctx: ExtensionCommandContext, { text, images, sessionId, inherited }: Draft) {
+  async function sendInNewWorktree(ctx: ExtensionCommandContext, { text, images, sessionId, inherited, baseBranch }: Draft) {
     let replaced = false
     const view = historyView
     const summary = taskSummary(text)
@@ -1020,12 +1031,12 @@ export default function extension(pi: ExtensionAPI) {
               : createChildSession(path, task.localSession, localBranch, sm => {
                 sm.appendSessionInfo(name)
                 if (localBranch.length) sm.appendCustomMessageEntry(`${NAME}-local-context`, [
-                  `New isolated task from the source checkout's HEAD at creation (${task.baseOid}).`,
+                  `New isolated task from ${baseBranch ?? "the source checkout's HEAD"} at creation (${task.baseOid}).`,
                   'Only conversation history was inherited, not uncommitted changes or workspace state.',
                   'Use prior discussion to understand the new request. Treat earlier tool output and paths as historical; check the new cwd and work only there.',
                 ].join(' '), false)
               })
-          }, view?.priorId)
+          }, view?.priorId, baseBranch)
         })
         const target = created.isolatedSession!
         if (!view && current === ctx && summary && !ctx.sessionManager.getSessionName()) {
@@ -1416,6 +1427,7 @@ export default function extension(pi: ExtensionAPI) {
         } else if (local) {
           if (!task || !isOpenTask(task)) {
             choices.push({ label: armed?.sessionId === ctx.sessionManager.getSessionId() ? tr('取消下次发送时创建', 'Cancel creation on next send') : tr('下次发送时新建 Worktree', 'Create a Worktree on the next send'), value: 'arm' })
+            if (intent?.choice === 'base') choices.push({ label: tr('选择基准分支', 'Choose a base branch'), value: 'base' })
           }
           if (historyTasks(tasks).length) choices.push(historyChoice())
           if (task && isOpenTask(task) && !task.journal && task.phase !== 'creating') {
@@ -1443,6 +1455,21 @@ export default function extension(pi: ExtensionAPI) {
             { label: tr('取消', 'Cancel'), value: undefined, tone: 'quiet' },
           ])
           if (language && ctx.isIdle()) await setLanguage(ctx, language)
+        } else if (choice === 'base' && local) {
+          const id = ctx.sessionManager.getSessionId()
+          const [current, branches] = await Promise.all([currentBranch(local.root), worktreeBaseBranches(local.root)])
+          if (!current) throw new Error(tr('请先切换到本地分支。', 'Switch to a local branch first.'))
+          const selected = baseFor(id)
+          const next = await pick<string | null | undefined>(ctx, tr('选择 Worktree 基准分支', 'Choose the Worktree base branch'), [
+            tf('交付目标仍是当前分支 {0}。这里只列出其提交已包含在当前 HEAD 中的本地分支。', 'Delivery stays on {0}. Only local branches whose tips are contained in the current HEAD are listed.', branchName(current)),
+          ], [
+            { label: `${selected === undefined ? '✓ ' : ''}${tf('当前分支（{0}）', 'Current branch ({0})', branchName(current))}`, value: null },
+            ...branches.filter(ref => ref !== current).map(ref => ({ label: `${selected === ref ? '✓ ' : ''}${branchName(ref)}`, value: ref })),
+            { label: tr('取消', 'Cancel'), value: undefined, tone: 'quiet' },
+          ])
+          if (next !== undefined && ctx.isIdle() && ctx.sessionManager.getSessionId() === id) {
+            selectedBase = next === null ? undefined : { sessionId: id, ref: next }
+          }
         } else if (choice === 'arm' && local) {
           if (!sessionLink(ctx)) throw new Error(tr('无持久化 Pi 会话，不能新建 Worktree。', 'A saved Pi session is required to create a Worktree.'))
           const id = ctx.sessionManager.getSessionId()

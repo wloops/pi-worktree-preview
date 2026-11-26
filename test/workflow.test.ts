@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { checkout, PreviewConflict, TaskStore, type Task } from '../src/store.ts'
+import { checkout, PreviewConflict, TaskStore, worktreeBaseBranches, type Task } from '../src/store.ts'
 import { createSessionCheckoutApplyEngine, runGit } from '../src/engine.ts'
 
 const git = async (cwd: string, ...args: string[]) => (await runGit(cwd, args)).stdout.toString()
@@ -41,6 +41,38 @@ async function fixture(t: TestContext, engine?: typeof createSessionCheckoutAppl
     files ?? await store.reviewCandidates(await latest()), { body })
   return { dir, local, isolated, store, base, latest, act, ready, task }
 }
+
+test('an explicit local base creates from that branch and still delivers to the current branch', async t => {
+  const f = await fixture(t)
+  await git(f.local, 'branch', 'older')
+  await writeFile(join(f.local, 'local-only.txt'), 'local change\n')
+  await git(f.local, 'add', 'local-only.txt')
+  await git(f.local, 'commit', '-m', 'advance main')
+  await git(f.local, 'branch', 'gone')
+  await git(f.local, 'branch', '-D', 'gone')
+  const main = await git(f.local, 'rev-parse', 'HEAD')
+  await git(f.isolated, 'commit', '--allow-empty', '-m', 'diverge')
+  await git(f.local, 'update-ref', 'refs/heads/ahead', (await git(f.isolated, 'rev-parse', 'HEAD')).trim())
+  assert.deepEqual(await worktreeBaseBranches(f.local), ['refs/heads/main', 'refs/heads/older'])
+  const session = { ...f.task.localSession, id: 'with-base' }
+  const createSession = async (cwd: string) => ({ cwd, id: 'new-isolated', file: join(f.dir, 'with-base.jsonl') })
+  for (const ref of ['refs/heads/gone', 'refs/heads/ahead', 'HEAD']) {
+    await assert.rejects(f.store.create(await checkout(f.local), session, createSession, undefined, ref), /所选基准分支/)
+  }
+  assert.equal((await f.store.read()).tasks.length, 1)
+  const task = await f.store.create(await checkout(f.local), session, createSession, undefined, 'refs/heads/older')
+  assert.equal(task.baseOid, f.base.trim())
+  assert.equal(task.localHeadRef, 'refs/heads/main')
+  assert.equal(await git(task.isolatedPath, 'rev-parse', 'HEAD'), f.base)
+  assert.equal(await exists(join(task.isolatedPath, 'local-only.txt')), false)
+  await writeFile(join(task.isolatedPath, 'task.txt'), 'from older\n')
+  const review = await f.store.markReady(task.id, task.isolatedSession!, 'Task from older', ['task.txt'])
+  await f.store.act(task.id, 'commit_ready', { phase: 'ready', reviewId: review.id })
+  assert.equal(await content(f.local, 'task.txt'), 'from older\n')
+  assert.equal(await content(f.local, 'local-only.txt'), 'local change\n')
+  assert.equal(await git(f.local, 'rev-parse', 'HEAD^'), main)
+  assert.equal(await git(f.local, 'rev-parse', 'older'), f.base)
+})
 
 test('automatic external adoption registers a frozen full scope and can narrow it before preview', async t => {
   const f = await fixture(t)

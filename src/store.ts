@@ -99,10 +99,15 @@ async function assertOrdinary(local: Checkout) {
   }
 }
 
-async function normalRef(root: string) {
+export async function currentBranch(root: string): Promise<string | undefined> {
   const result = await runGit(root, ['symbolic-ref', '--quiet', 'HEAD'], { allowedExitCodes: [0, 1] })
   const ref = result.stdout.toString('utf8').trim()
-  if (!ref.startsWith('refs/heads/')) throw new Error(tr('Local 必须位于普通 Git 分支。', 'Local must be on a normal Git branch.'))
+  return ref.startsWith('refs/heads/') ? ref : undefined
+}
+
+async function normalRef(root: string) {
+  const ref = await currentBranch(root)
+  if (!ref) throw new Error(tr('Local 必须位于普通 Git 分支。', 'Local must be on a normal Git branch.'))
   return ref
 }
 
@@ -133,6 +138,9 @@ export class PreviewConflict extends Error {
 }
 async function isAncestor(root: string, older: string, newer: string) {
   return (await runGit(root, ['merge-base', '--is-ancestor', older, newer], { allowedExitCodes: [0, 1] })).exitCode === 0
+}
+export async function worktreeBaseBranches(root: string) {
+  return (await out(root, ['for-each-ref', '--merged=HEAD', '--format=%(refname)', 'refs/heads/'])).split('\n').filter(Boolean)
 }
 function engineError(result: { error: { message: string } }): never { throw new Error(result.error.message) }
 
@@ -278,7 +286,7 @@ export class TaskStore {
     })
   }
 
-  async create(local: Checkout, localSession: SessionLink, createSession: (cwd: string, task: Task, prior?: Task) => Promise<SessionLink>, followUpOf?: string): Promise<Task> {
+  async create(local: Checkout, localSession: SessionLink, createSession: (cwd: string, task: Task, prior?: Task) => Promise<SessionLink>, followUpOf?: string, baseBranch?: string): Promise<Task> {
     return this.locked(async (state, save) => {
       if (!same(await checkout(local.root), local)) throw new Error(tr('Local 身份已经变化。', 'The Local checkout identity has changed.'))
       if (state.tasks.some(t => t.external && t.isolated && (!terminal(t) || t.journal) && (t.isolated.root === local.root || t.isolated.gitDir === local.gitDir))) {
@@ -294,8 +302,18 @@ export class TaskStore {
       }
       await assertOrdinary(local)
       const localHeadRef = await normalRef(local.root)
-      const baseOid = await out(local.root, ['rev-parse', '--verify', 'HEAD^{commit}'])
-      if (!oid.test(baseOid)) throw new Error(tr('缺少初始 Git 提交。', 'An initial Git commit is required.'))
+      const localHeadOid = await out(local.root, ['rev-parse', '--verify', 'HEAD^{commit}'])
+      if (!oid.test(localHeadOid)) throw new Error(tr('缺少初始 Git 提交。', 'An initial Git commit is required.'))
+      let baseOid = localHeadOid
+      if (baseBranch !== undefined) {
+        const ref = baseBranch.startsWith('refs/heads/')
+          ? await runGit(local.root, ['show-ref', '--verify', '--hash', '--', baseBranch], { allowedExitCodes: [0, 1, 128] })
+          : undefined
+        baseOid = ref?.stdout.toString('utf8').trim() ?? ''
+        if (!oid.test(baseOid) || !await isAncestor(local.root, baseOid, localHeadOid)) {
+          throw new Error(tr('所选基准分支已不存在，或其最新提交不在当前分支中；请重新选择。', 'The selected base branch is missing or its tip is not in the current branch. Select a base again.'))
+        }
+      }
       const id = randomUUID()
       const isolatedPath = join(this.worktrees, id)
       if (isolatedPath.startsWith(local.root + '/') || isolatedPath === local.root) throw new Error(tr('Pi 数据目录不能位于当前仓库内。', 'The Pi data directory must not be inside the current repository.'))

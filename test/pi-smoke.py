@@ -358,6 +358,7 @@ def main():
             pi.click('[ 显示语言 ]')
             pi.click('[ English ]')
             pi.until('[ ] New Worktree')
+            pi.until('Based on main')
             assert json.loads(state_path.with_name('preferences.json').read_text()) == {'language': 'en'}
             assert 'language' not in json.loads((agent / 'settings.json').read_text())
             assert not state_path.exists()
@@ -371,6 +372,10 @@ def main():
         with Pi(local, agent, provider) as pi:
             create_x, create_y = pi.until('[ ] 新建 Worktree')
             assert pi.screen.buffer[create_y - 1][create_x - 1].bg == '4669a3'
+            git('branch', 'smoke-base')
+            pi.click('基于 main')
+            pi.click('[ smoke-base ]')
+            pi.until('基于 smoke-base')
             pi.click('[ ] 新建 Worktree')
             create_x, create_y = pi.until('[x] 新建 Worktree')
             assert pi.screen.buffer[create_y - 1][create_x - 1].bg == '294f94'
@@ -378,6 +383,7 @@ def main():
             pi.click('[x] 新建 Worktree')
             create_x, create_y = pi.until('[ ] 新建 Worktree')
             assert pi.screen.buffer[create_y - 1][create_x - 1].bg == '4669a3'
+            pi.until('基于 smoke-base')
             pi.send(b'Local only.\r')
             pi.until('Acknowledged without edits.')
             assert not state_path.exists(), 'unchecked send must stay in Local'
@@ -401,6 +407,7 @@ def main():
             pi.send(b'\r')
             pi.until('Worktree · 待验收', 40)
             pi.until('Worktree ready.')
+            assert '基于 ' not in pi.dump()
             first_path = Path(task()['isolatedPath'])
             assert first_path.is_dir()
             child = task()['isolatedSession']['file']
